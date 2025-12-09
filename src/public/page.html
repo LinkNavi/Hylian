@@ -1,0 +1,29 @@
+
+{% extends "base.html" %}
+
+{% block title %}Hylian Page — {{ user.name | upper }}{% endblock %}
+
+{% block header %}
+<h1>Custom Header for {{ user.name }}</h1>
+{% endblock %}
+
+{% block content %}
+<p>Welcome, {{ user.name }}!</p>
+
+{% if user.isAdmin %}
+<p>You have admin privileges.</p>
+{% else %}
+<p>You are a regular user.</p>
+{% endif %}
+
+<h3>Your items (user.items):</h3>
+<ul>
+{% for it in user.items %}
+  <li>{{ it | escape }}</li>
+{% endfor %}
+</ul>
+{% endblock %}
+
+{% block footer %}
+<p>&copy; 2025 Hylian Engine</p>
+{% endblock %}

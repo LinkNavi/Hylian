@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Default Title{% endblock %}</title>
+</head>
+<body>
+  <header>
+    {% block navbar %}
+    <!-- default navbar -->
+    <nav>
+      <p>Guest</p>
+    </nav>
+    {% endblock %}
+  </header>
+
+  <main>
+    {% block content %}
+    <p>Default content.</p>
+    {% endblock %}
+  </main>
+
+  <footer>
+    {% block footer %}
+    <p>Default footer</p>
+    {% endblock %}
+  </footer>
+</body>
+</html>
