@@ -34,6 +34,7 @@
 "const"             { return CONST; }
 "static"            { return STATIC; }
 "extern"            { return EXTERN; }
+"void"              { return VOID; }
 
 "int"               { return INT; }
 "str"            { return STRING; }
@@ -53,7 +54,10 @@
 "?"                 { return QUESTION; }
 "="                 { return ASSIGN; }
 ":="                { return DECLARE_ASSIGN; }
-
+">"                 { return GT; }
+"<"                 { return LT; }
+"+"                 { return PLUS; }
+"-"                 { return MINUS; }
 "<="                { return LE; }
 "=="                { return EQ; }
 "!="                { return NE; }

@@ -58,7 +58,7 @@ void list_add(NodeList* l, ASTNode* node) {
 %token LBRACE RBRACE LPAREN RPAREN SEMICOLON COMMA DOT QUESTION
 %token ASSIGN DECLARE_ASSIGN LE EQ NE
 %token CCPINCLUDE
-
+%token VOID GT LT PLUS MINUS
 %token <str> IDENTIFIER STRING_LITERAL
 %token <num> NUMBER
 
@@ -68,7 +68,7 @@ void list_add(NodeList* l, ASTNode* node) {
 %type <field_node> field_decl
 %type <type_node> type
 %type <node> expr stmt return_stmt var_decl member_decl
-%type <node_list> class_body stmt_list
+%type <node_list> class_body stmt_list param_list params
 
 %%
 
@@ -200,23 +200,67 @@ field_decl:
     ;
 
 method_decl:
-    type IDENTIFIER LPAREN RPAREN LBRACE stmt_list RBRACE  {
+    type IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE  {
         $$ = make_method($1, $2);
-        NodeList* stmts = (NodeList*)$6;
-        $$->body = stmts->items;
-        $$->body_count = stmts->count;
-        free(stmts);
-        printf("  Method: %s %s() with %d statements\n", $1.name, $2, $$->body_count);
-    }
-    | type QUESTION IDENTIFIER LPAREN RPAREN LBRACE stmt_list RBRACE  {
-        Type t = $1;
-        t.nullable = 1;
-        $$ = make_method(t, $3);
+        
+        // Add params
+        if ($4) {
+            NodeList* param_list = (NodeList*)$4;
+            $$->params = param_list->items;
+            $$->param_count = param_list->count;
+            free(param_list);
+        }
+        
+        // Add body
         NodeList* stmts = (NodeList*)$7;
         $$->body = stmts->items;
         $$->body_count = stmts->count;
         free(stmts);
-        printf("  Method: %s? %s() with %d statements\n", $1.name, $3, $$->body_count);
+        
+        printf("  Method: %s %s(%d params) with %d statements\n", 
+               $1.name, $2, $$->param_count, $$->body_count);
+    }
+    | type QUESTION IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE  {
+        Type t = $1;
+        t.nullable = 1;
+        $$ = make_method(t, $3);
+        
+        // Add params
+        if ($5) {
+            NodeList* param_list = (NodeList*)$5;
+            $$->params = param_list->items;
+            $$->param_count = param_list->count;
+            free(param_list);
+        }
+        
+        // Add body
+        NodeList* stmts = (NodeList*)$8;
+        $$->body = stmts->items;
+        $$->body_count = stmts->count;
+        free(stmts);
+        
+        printf("  Method: %s? %s(%d params) with %d statements\n", 
+               $1.name, $3, $$->param_count, $$->body_count);
+    }
+    ;
+
+param_list:
+    /* empty */        { $$ = NULL; }
+    | params           { $$ = $1; }
+    ;
+
+params:
+    type IDENTIFIER    { 
+        NodeList* list = list_new();
+        ASTNode* param = (ASTNode*)make_var_decl($1, $2, NULL);
+        list_add(list, param);
+        $$ = list;
+    }
+    | params COMMA type IDENTIFIER  { 
+        NodeList* list = (NodeList*)$1;
+        ASTNode* param = (ASTNode*)make_var_decl($3, $4, NULL);
+        list_add(list, param);
+        $$ = list;
     }
     ;
 
@@ -224,6 +268,7 @@ type:
     INT        { $$.name = strdup("int"); $$.nullable = 0; }
     | STRING   { $$.name = strdup("str"); $$.nullable = 0; }
     | ERROR    { $$.name = strdup("Error"); $$.nullable = 0; }
+    | VOID     { $$.name = strdup("void"); $$.nullable = 0; }
     | IDENTIFIER { $$.name = $1; $$.nullable = 0; }
     ;
 
@@ -328,6 +373,18 @@ expr:
     }
     | LPAREN expr RPAREN  {
         $$ = $2;
+    }
+    | expr GT expr  {
+        $$ = (ASTNode*)make_binary_op(">", $1, $3);
+    }
+    | expr LT expr  {
+        $$ = (ASTNode*)make_binary_op("<", $1, $3);
+    }
+    | expr PLUS expr  {
+        $$ = (ASTNode*)make_binary_op("+", $1, $3);
+    }
+    | expr MINUS expr  {
+        $$ = (ASTNode*)make_binary_op("-", $1, $3);
     }
     ;
 
