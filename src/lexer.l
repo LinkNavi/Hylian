@@ -23,6 +23,7 @@
 "for"               { return FOR; }
 "in"                { return IN; }
 "break"             { return BREAK; }
+"ccpinclude"	    { return CCPINCLUDE; }
 "continue"          { return CONTINUE; }
 "switch"            { return SWITCH; }
 "case"              { return CASE; }
