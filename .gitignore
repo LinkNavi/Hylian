@@ -1,0 +1,8 @@
+*.o
+*.out
+lex.yy.c
+parser.tab.c
+parser.tab.h
+hylian
+test_lexer
+*.hy
