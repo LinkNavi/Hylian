@@ -1,9 +1,0 @@
-
-<nav>
-  <span>Logged in as: {{ user.name | default("Guest") | escape }}</span>
-  {% if user.isAdmin %}
-    <span> — Admin</span>
-  {% endif %}
-  <span> | Items: {{ user.items | length }}</span>
-  <a href="/logout">Logout</a>
-</nav>
