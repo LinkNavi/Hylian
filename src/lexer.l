@@ -1,5 +1,14 @@
 %{
 #include "parser.tab.h"
+#include <string.h>
+#include <stdlib.h>
+
+/* Check if a raw string body (between outer quotes) contains {{ }} interpolation */
+static int has_interpolation(const char *s) {
+    for (int i = 0; s[i]; i++)
+        if (s[i] == '{' && s[i+1] == '{') return 1;
+    return 0;
+}
 %}
 
 %option noyywrap
@@ -19,12 +28,14 @@
 "return"            { return RETURN; }
 "new"               { return NEW; }
 "nil"               { return NIL; }
+"true"              { return TRUE_LIT; }
+"false"             { return FALSE_LIT; }
 "while"             { return WHILE; }
 "for"               { return FOR; }
 "in"                { return IN; }
 "break"             { return BREAK; }
-"ccpinclude"	    { return CCPINCLUDE; }
 "continue"          { return CONTINUE; }
+"ccpinclude"        { return CCPINCLUDE; }
 "switch"            { return SWITCH; }
 "case"              { return CASE; }
 "default"           { return DEFAULT; }
@@ -35,33 +46,64 @@
 "static"            { return STATIC; }
 "extern"            { return EXTERN; }
 "void"              { return VOID; }
+"bool"              { return BOOL; }
 
 "int"               { return INT; }
-"str"            { return STRING; }
+"str"               { return STRING; }
 "Error"             { return ERROR; }
 
+"array"   { return ARRAY; }
+"multi"   { return MULTI; }
+"any"     { return ANY_KW; }
 [a-zA-Z_][a-zA-Z0-9_]*  { yylval.str = strdup(yytext); return IDENTIFIER; }
-[0-9]+                  { yylval.num = atoi(yytext); return NUMBER; }
-\"([^\\\"]|\\.)*\"      { yylval.str = strdup(yytext); return STRING_LITERAL; }
+[0-9]+\.[0-9]+           { yylval.str = strdup(yytext); return FLOAT_LITERAL; }
+[0-9]+                   { yylval.num = atoi(yytext); return NUMBER; }
+\"([^\\\"]|\\.)*\"       {
+    /* yytext includes the surrounding quotes */
+    if (has_interpolation(yytext + 1)) {
+        yylval.str = strdup(yytext);
+        return INTERP_STRING;
+    }
+    yylval.str = strdup(yytext);
+    return STRING_LITERAL;
+}
 
 "{"                 { return LBRACE; }
 "}"                 { return RBRACE; }
 "("                 { return LPAREN; }
 ")"                 { return RPAREN; }
+"["                 { return LBRACKET; }
+"]"                 { return RBRACKET; }
 ";"                 { return SEMICOLON; }
 ","                 { return COMMA; }
 "."                 { return DOT; }
 "?"                 { return QUESTION; }
+"++"                { return INC; }
+"--"                { return DEC; }
+"+="                { return PLUS_ASSIGN; }
+"-="                { return MINUS_ASSIGN; }
+"*="                { return STAR_ASSIGN; }
+"/="                { return SLASH_ASSIGN; }
+"%="                { return MOD_ASSIGN; }
 "="                 { return ASSIGN; }
 ":="                { return DECLARE_ASSIGN; }
+">="                { return GE; }
+"<="                { return LE; }
+"=="                { return EQ; }
+"!="                { return NE; }
+"&&"                { return AND; }
+"||"                { return OR; }
+"!"                 { return NOT; }
 ">"                 { return GT; }
 "<"                 { return LT; }
 "+"                 { return PLUS; }
 "-"                 { return MINUS; }
-"<="                { return LE; }
-"=="                { return EQ; }
-"!="                { return NE; }
+"*"                 { return STAR; }
+"/"                 { return SLASH; }
+"%"                 { return MOD; }
 
+"|"                 { return PIPE; }
+"$"                 { /* swallow stray $ (legacy prefix, no longer needed) */ }
 .                   { printf("Unknown char: %s\n", yytext); }
 
 %%

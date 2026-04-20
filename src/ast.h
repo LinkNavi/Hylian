@@ -4,152 +4,281 @@
 typedef enum {
     NODE_PROGRAM,
     NODE_INCLUDE,
- NODE_CPP_INCLUDE,
+    NODE_CPP_INCLUDE,
     NODE_CLASS,
     NODE_METHOD,
+    NODE_FUNC,
     NODE_FIELD,
     NODE_VAR_DECL,
     NODE_RETURN,
     NODE_BINARY_OP,
+    NODE_UNARY_OP,
     NODE_LITERAL,
     NODE_IDENTIFIER,
     NODE_MEMBER_ACCESS,
+    NODE_MEMBER_ASSIGN,
     NODE_METHOD_CALL,
+    NODE_FUNC_CALL,
+    NODE_NEW,
     NODE_IF,
     NODE_WHILE,
+    NODE_FOR,
+    NODE_BREAK,
+    NODE_CONTINUE,
     NODE_ASSIGN,
+    NODE_COMPOUND_ASSIGN,
+    NODE_DEFER,
+    NODE_INTERP_STRING,
+    NODE_ARRAY_LITERAL,
+    NODE_INDEX,
+    NODE_INDEX_ASSIGN,
 } NodeType;
 
-typedef struct ASTNode {
-  NodeType type;
-} ASTNode;
+typedef struct ASTNode { NodeType type; } ASTNode;
 
-typedef struct {
-  char *name;
-  int nullable;
+typedef enum {
+    TYPE_SIMPLE,   /* int, str, bool, void, Error, ClassName */
+    TYPE_ARRAY,    /* array<T> or array<T, N> */
+    TYPE_MULTI,    /* multi<A | B | ...> or multi<any> with optional N */
+} TypeKind;
+
+typedef struct Type {
+    TypeKind kind;
+    int nullable;
+    /* TYPE_SIMPLE */
+    char *name;
+    /* TYPE_ARRAY / TYPE_MULTI */
+    struct Type *elem_types;  /* array of element types */
+    int elem_type_count;
+    int is_any;               /* multi<any> */
+    int fixed_size;           /* 0 = flexible, >0 = fixed */
 } Type;
 
 typedef struct {
-  ASTNode base;
-  char **paths;
-  int path_count;
+    ASTNode base;
+    char **paths;
+    int path_count;
 } IncludeNode;
 
 typedef struct {
-  ASTNode base;
-  Type field_type;
-  char *name;
-  int is_public;
+    ASTNode base;
+    Type field_type;
+    char *name;
+    int is_public;
 } FieldNode;
 
 typedef struct {
-  ASTNode base;
-  Type return_type;
-  char *name;
-  ASTNode **params;
-  int param_count;
-  ASTNode **body;
-  int body_count;
+    ASTNode base;
+    Type return_type;
+    char *name;
+    ASTNode **params;
+    int param_count;
+    ASTNode **body;
+    int body_count;
 } MethodNode;
 
 typedef struct {
-  ASTNode base;
-  ASTNode *condition;
-  ASTNode **then_body;
-  int then_count;
-  ASTNode **else_body;
-  int else_count;
+    ASTNode base;
+    Type return_type;
+    char *name;
+    ASTNode **params;
+    int param_count;
+    ASTNode **body;
+    int body_count;
+} FuncNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode *condition;
+    ASTNode **then_body;
+    int then_count;
+    ASTNode **else_body;
+    int else_count;
 } IfNode;
 
 typedef struct {
-  ASTNode base;
-  ASTNode *condition;
-  ASTNode **body;
-  int body_count;
+    ASTNode base;
+    ASTNode *condition;
+    ASTNode **body;
+    int body_count;
 } WhileNode;
 
 typedef struct {
-  ASTNode base;
-  Type var_type;
-  char *var_name;
-  ASTNode *initializer;
+    ASTNode base;
+    ASTNode *init;
+    ASTNode *condition;
+    ASTNode *post;
+    ASTNode **body;
+    int body_count;
+} ForNode;
+
+typedef struct {
+    ASTNode base;
+    Type var_type;
+    char *var_name;
+    ASTNode *initializer;
 } VarDeclNode;
 
 typedef struct {
-  ASTNode base;
-  char *var_name;
-  ASTNode *value;
+    ASTNode base;
+    char *var_name;
+    ASTNode *value;
 } AssignNode;
 
 typedef struct {
-  ASTNode base;
-  char *op; // "<=", "==", "!=", etc
-  ASTNode *left;
-  ASTNode *right;
+    ASTNode base;
+    char *op;
+    char *var_name;
+    ASTNode *value;
+} CompoundAssignNode;
+
+typedef struct {
+    ASTNode base;
+    char *op;
+    ASTNode *left;
+    ASTNode *right;
 } BinaryOpNode;
 
 typedef struct {
-  ASTNode base;
-  ASTNode *object;
-  char *member;
+    ASTNode base;
+    char *op;
+    ASTNode *operand;
+    int postfix;
+} UnaryOpNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode *object;
+    char *member;
 } MemberAccessNode;
 
 typedef struct {
-  ASTNode base;
-  ASTNode *object;
-  char *method;
-  ASTNode **args;
-  int arg_count;
-} MethodCallNode;
+    ASTNode base;
+    ASTNode *object; /* NULL = this/implicit */
+    char *member;
+    ASTNode *value;
+} MemberAssignNode;
+
 typedef struct {
-  ASTNode base;
-  char *name;
-  int is_public;
-  FieldNode **fields;
-  int field_count;
-  MethodNode **methods;
-  int method_count;
+    ASTNode base;
+    ASTNode *object;
+    char *method;
+    ASTNode **args;
+    int arg_count;
+} MethodCallNode;
+
+typedef struct {
+    ASTNode base;
+    char *name;
+    ASTNode **args;
+    int arg_count;
+} FuncCallNode;
+
+typedef struct {
+    ASTNode base;
+    char *class_name;
+    ASTNode **args;
+    int arg_count;
+} NewNode;
+
+typedef struct {
+    ASTNode base;
+    char *name;
+    int is_public;
+    FieldNode **fields;
+    int field_count;
+    MethodNode **methods;
+    int method_count;
+    ASTNode **ctor_params;
+    int ctor_param_count;
+    ASTNode **ctor_body;
+    int ctor_body_count;
+    int has_ctor;
 } ClassNode;
 
 typedef struct {
-  ASTNode base;
-  ASTNode **declarations;
-  int decl_count;
+    ASTNode base;
+    ASTNode **declarations;
+    int decl_count;
 } ProgramNode;
 
 typedef struct {
-  ASTNode base;
-  char *value;
-  enum { LIT_INT, LIT_STRING, LIT_NIL } lit_type;
+    ASTNode base;
+    char *value;
+    enum { LIT_INT, LIT_STRING, LIT_NIL, LIT_BOOL, LIT_FLOAT } lit_type;
 } LiteralNode;
 
+typedef struct { ASTNode base; char *name; } IdentifierNode;
+
+/* Each segment of an interpolated string: either a literal piece or an expr source */
 typedef struct {
-  ASTNode base;
-  char *name;
-} IdentifierNode;
+    int is_expr;   /* 0 = literal text, 1 = expression source */
+    char *text;    /* literal text (no quotes) OR raw expression source */
+} InterpSegment;
+
 typedef struct {
     ASTNode base;
-    char* header;  // The C++ header to include (e.g., "vector", "iostream")
-} CppIncludeNode;
-typedef struct {
-  ASTNode base;
-  ASTNode *value;
-} ReturnNode;
+    InterpSegment *segments;
+    int seg_count;
+} InterpStringNode;
 
-// Constructor functions
+typedef struct { ASTNode base; char *header; } CppIncludeNode;
+typedef struct { ASTNode base; ASTNode *value; } ReturnNode;
+typedef struct { ASTNode base; ASTNode *expr; } DeferNode;
+typedef struct { ASTNode base; } BreakNode;
+typedef struct { ASTNode base; } ContinueNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode **elements;
+    int elem_count;
+} ArrayLiteralNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode *object;
+    ASTNode *index;
+} IndexNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode *object;
+    ASTNode *index;
+    ASTNode *value;
+} IndexAssignNode;
+
 ProgramNode *make_program();
 ClassNode *make_class(char *name, int is_public);
 MethodNode *make_method(Type return_type, char *name);
+FuncNode *make_func(Type return_type, char *name);
 FieldNode *make_field(Type field_type, char *name, int is_public);
 LiteralNode *make_literal(char *value, int lit_type);
 IdentifierNode *make_identifier(char *name);
 ReturnNode *make_return(ASTNode *value);
-IfNode* make_if(ASTNode* condition);
-WhileNode* make_while(ASTNode* condition);
-VarDeclNode* make_var_decl(Type type, char* name, ASTNode* init);
-AssignNode* make_assign(char* name, ASTNode* value);
-BinaryOpNode* make_binary_op(char* op, ASTNode* left, ASTNode* right);
-CppIncludeNode* make_cpp_include(char* header);
-MemberAccessNode* make_member_access(ASTNode* obj, char* member);
-MethodCallNode* make_method_call(ASTNode* obj, char* method);
+IfNode *make_if(ASTNode *condition);
+WhileNode *make_while(ASTNode *condition);
+ForNode *make_for(ASTNode *init, ASTNode *condition, ASTNode *post);
+VarDeclNode *make_var_decl(Type type, char *name, ASTNode *init);
+AssignNode *make_assign(char *name, ASTNode *value);
+CompoundAssignNode *make_compound_assign(char *op, char *name, ASTNode *value);
+BinaryOpNode *make_binary_op(char *op, ASTNode *left, ASTNode *right);
+UnaryOpNode *make_unary_op(char *op, ASTNode *operand, int postfix);
+CppIncludeNode *make_cpp_include(char *header);
+MemberAccessNode *make_member_access(ASTNode *obj, char *member);
+MemberAssignNode *make_member_assign(ASTNode *obj, char *member, ASTNode *value);
+MethodCallNode *make_method_call(ASTNode *obj, char *method);
+FuncCallNode *make_func_call(char *name);
+NewNode *make_new(char *class_name);
+InterpStringNode *make_interp_string(const char *raw); /* raw = full string with quotes */
+DeferNode *make_defer(ASTNode *expr);
+BreakNode *make_break();
+ContinueNode *make_continue();
+
+ArrayLiteralNode *make_array_literal(ASTNode **elems, int count);
+IndexNode *make_index(ASTNode *object, ASTNode *index);
+IndexAssignNode *make_index_assign(ASTNode *object, ASTNode *index, ASTNode *value);
+Type make_simple_type(char *name, int nullable);
+Type make_array_type(Type elem, int fixed_size);
+Type make_multi_type(Type *elems, int count, int is_any, int fixed_size);
+
 #endif

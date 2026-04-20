@@ -1,48 +1,64 @@
-include(
-"core/string",
-"core/io",
-"core/errors", // just needed for panics
-"Game/EnemySpawner", // in the same folder as this file, Game is the project name, no idea how i'd set project names yet 
-"Game/Enemies/Goomba", // goomba class in the Enemies folder, includes are reletive to the project root, not the file
-)
-
-public class Player{
-	Private String name;
-	Private Int32 Health;
-
-	Int32 getHealth(){
-		return Health;
-	}
-
-	(Error?) setHealth(Int32: newHealth){
-		if (newHealth.type() != Int32){
-			return Err("not an Int32"); //obviously it'd error when you try to pass a non Int32 to the func but just trying to show how errors would work
-		}
-		Health = newHealth;
-	}
-
-// pretend like get and sets are there for the name as well, im lazy
-
+include {
+    core.string,
+    core.io,
+    core.errors,
+    Game.EnemySpawner,
+    Game.Enemies.Goomba,
 }
 
-(Error?) main(){ // ? just means that it might not return an error, no idea how i'd impl this
+public class Player {
+    private str name;
+    private int health;
 
-Player p;
-Goomba g;
+    int getHealth() {
+        return health;
+    }
 
-Error err = p.setName("Bob");
-
-if (err){
-panic(err.message());
-}
-err = p.setHealth(100);
-
-if (err){
-panic(err.message());
-}
-
-if (p.getHealth() <= 0){
-print("you ded"); //comes from core/io
+    Error? setHealth(int newHealth) {
+        if (newHealth < 0) {
+            return Err("health cannot be negative");
+        }
+        health = newHealth;
+        return nil;
+    }
 }
 
+Error? main() {
+    Player p = new Player();
+    Goomba g = new Goomba();
+
+    err := p.setName("Bob");
+    if (err) {
+        panic(err.message());
+    }
+
+    err = p.setHealth(100);
+    if (err) {
+        panic(err.message());
+    }
+
+    if (p.getHealth() <= 0) {
+        print("you ded");
+    }
+
+    // typed array - flexible size, maps to std::vector<Enemy>
+    array<Enemy> enemies = [g, otherEnemy];
+
+    // typed array - fixed size, maps to std::array<Enemy, 5>
+    array<Enemy, 5> fiveEnemies = [g, g, g, g, g];
+
+    // multi - union types, flexible size, maps to std::vector<std::variant<str, int>>
+    multi<str | int> objects = ["hello", 42, "world"];
+
+    // multi - union types, fixed size, maps to std::array<std::variant<str, int>, 3>
+    multi<str | int, 3> threeThings = ["hello", 42, "world"];
+
+    // multi<any> - any type, flexible size, maps to std::vector<std::any>
+    multi<any> stuff = ["hello", 42, true, 3.14];
+
+    // indexing works on both
+    int first = enemies[0];
+    enemies[1] = g;
+
+    return nil;
 }
