@@ -103,6 +103,7 @@ static int has_interpolation(const char *s) {
 "%"                 { return MOD; }
 
 "|"                 { return PIPE; }
+"&"                 { return AMP; }
 "$"                 { /* swallow stray $ (legacy prefix, no longer needed) */ }
 .                   { printf("Unknown char: %s\n", yytext); }
 

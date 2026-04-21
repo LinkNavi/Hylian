@@ -23,6 +23,7 @@ typedef enum {
     NODE_IF,
     NODE_WHILE,
     NODE_FOR,
+    NODE_FOR_IN,
     NODE_BREAK,
     NODE_CONTINUE,
     NODE_ASSIGN,
@@ -114,6 +115,15 @@ typedef struct {
 
 typedef struct {
     ASTNode base;
+    char *var_name;      /* loop variable name, e.g. "item" */
+    int   use_ref;       /* 1 = auto&, 0 = auto (copy) */
+    ASTNode *collection; /* the expression being iterated */
+    ASTNode **body;
+    int body_count;
+} ForInNode;
+
+typedef struct {
+    ASTNode base;
     Type var_type;
     char *var_name;
     ASTNode *initializer;
@@ -200,6 +210,10 @@ typedef struct {
     ASTNode base;
     ASTNode **declarations;
     int decl_count;
+    char **includes;
+    int include_count;
+    char **cpp_includes;
+    int cpp_include_count;
 } ProgramNode;
 
 typedef struct {
@@ -258,6 +272,7 @@ ReturnNode *make_return(ASTNode *value);
 IfNode *make_if(ASTNode *condition);
 WhileNode *make_while(ASTNode *condition);
 ForNode *make_for(ASTNode *init, ASTNode *condition, ASTNode *post);
+ForInNode *make_for_in(char *var_name, int use_ref, ASTNode *collection);
 VarDeclNode *make_var_decl(Type type, char *name, ASTNode *init);
 AssignNode *make_assign(char *name, ASTNode *value);
 CompoundAssignNode *make_compound_assign(char *op, char *name, ASTNode *value);

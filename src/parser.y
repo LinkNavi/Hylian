@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ast.h"
-#include "codegen.h"
+
 
 extern int yylex();
 extern int yylineno;
@@ -70,7 +70,7 @@ void typelist_add(TypeList* l, Type t) {
 
 %token INCLUDE CLASS PUBLIC PRIVATE IF ELSE RETURN NEW NIL TRUE_LIT FALSE_LIT
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
-%token DEFER MATCH UNSAFE CONST STATIC EXTERN
+%token DEFER MATCH UNSAFE CONST STATIC EXTERN AMP
 %token INT STRING ERROR BOOL
 %token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET SEMICOLON COMMA DOT QUESTION
 %token ASSIGN DECLARE_ASSIGN
@@ -91,7 +91,8 @@ void typelist_add(TypeList* l, Type t) {
 %type <field_node> field_decl
 %type <type_node> type
 %type <node> expr stmt return_stmt var_decl member_decl for_init
-%type <node_list> class_body stmt_list param_list params arg_list args union_types
+%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list
+%type <node> include_path
 
 
 /* Operator precedence, lowest to highest */
@@ -126,23 +127,69 @@ program:
     ;
 
 include_stmt:
-    INCLUDE LBRACE include_list RBRACE
-    | INCLUDE LBRACE include_list RBRACE SEMICOLON
+    INCLUDE LBRACE include_list RBRACE {
+        NodeList* l = (NodeList*)$3;
+        for (int i = 0; i < l->count; i++) {
+            IdentifierNode* path = (IdentifierNode*)l->items[i];
+            root->includes = realloc(root->includes, (root->include_count+1)*sizeof(char*));
+            root->includes[root->include_count++] = path->name;
+        }
+        free(l->items); free(l);
+    }
+    | INCLUDE LBRACE include_list RBRACE SEMICOLON {
+        NodeList* l = (NodeList*)$3;
+        for (int i = 0; i < l->count; i++) {
+            IdentifierNode* path = (IdentifierNode*)l->items[i];
+            root->includes = realloc(root->includes, (root->include_count+1)*sizeof(char*));
+            root->includes[root->include_count++] = path->name;
+        }
+        free(l->items); free(l);
+    }
     ;
 
 ccpinclude_stmt:
-    CCPINCLUDE STRING_LITERAL SEMICOLON { }
-    | CCPINCLUDE STRING_LITERAL { }
+    CCPINCLUDE STRING_LITERAL SEMICOLON {
+        /* strip surrounding quotes from the string literal */
+        int len = strlen($2);
+        char *stripped = malloc(len - 1);
+        strncpy(stripped, $2 + 1, len - 2);
+        stripped[len - 2] = '\0';
+        root->cpp_includes = realloc(root->cpp_includes, (root->cpp_include_count+1)*sizeof(char*));
+        root->cpp_includes[root->cpp_include_count++] = stripped;
+        free($2);
+    }
+    | CCPINCLUDE STRING_LITERAL {
+        int len = strlen($2);
+        char *stripped = malloc(len - 1);
+        strncpy(stripped, $2 + 1, len - 2);
+        stripped[len - 2] = '\0';
+        root->cpp_includes = realloc(root->cpp_includes, (root->cpp_include_count+1)*sizeof(char*));
+        root->cpp_includes[root->cpp_include_count++] = stripped;
+        free($2);
+    }
     ;
 
 include_list:
-    include_path
-    | include_list COMMA include_path
+    include_path                                { NodeList* l=list_new(); list_add(l,$1); $$=l; }
+    | include_list COMMA include_path           { NodeList* l=(NodeList*)$1; list_add(l,$3); $$=l; }
+    | include_list COMMA                        { $$ = $1; }
     ;
 
 include_path:
-    IDENTIFIER
-    | include_path DOT IDENTIFIER
+    IDENTIFIER {
+        /* build path string incrementally using an IdentifierNode to carry it */
+        $$ = (ASTNode*)make_identifier($1);
+    }
+    | include_path DOT IDENTIFIER {
+        /* append .IDENTIFIER to the accumulated path string */
+        IdentifierNode* prev = (IdentifierNode*)$1;
+        int len = strlen(prev->name) + 1 + strlen($3) + 1;
+        char* combined = malloc(len);
+        snprintf(combined, len, "%s.%s", prev->name, $3);
+        free(prev->name);
+        prev->name = combined;
+        $$ = (ASTNode*)prev;
+    }
     ;
 
 class_decl:
@@ -410,6 +457,20 @@ stmt:
         NodeList* sl=(NodeList*)$9; fn->body=sl->items; fn->body_count=sl->count; free(sl);
         $$ = (ASTNode*)fn;
     }
+    /* for-in: for (item in collection) */
+    | FOR LPAREN IDENTIFIER IN expr RPAREN LBRACE stmt_list RBRACE {
+        ForInNode* fn = make_for_in($3, 0, $5);
+        NodeList* sl=(NodeList*)$8; fn->body=sl->items; fn->body_count=sl->count; free(sl);
+        free($3);
+        $$ = (ASTNode*)fn;
+    }
+    /* for-in by reference: for (&item in collection) */
+    | FOR LPAREN AMP IDENTIFIER IN expr RPAREN LBRACE stmt_list RBRACE {
+        ForInNode* fn = make_for_in($4, 1, $6);
+        NodeList* sl=(NodeList*)$9; fn->body=sl->items; fn->body_count=sl->count; free(sl);
+        free($4);
+        $$ = (ASTNode*)fn;
+    }
     ;
 
 for_init:
@@ -422,6 +483,14 @@ for_init:
 var_decl:
     type IDENTIFIER ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_var_decl($1, $2, $4); }
     | type IDENTIFIER SEMICOLON           { $$ = (ASTNode*)make_var_decl($1, $2, NULL); }
+    | type QUESTION IDENTIFIER ASSIGN expr SEMICOLON {
+        Type t = $1; t.nullable = 1;
+        $$ = (ASTNode*)make_var_decl(t, $3, $5);
+    }
+    | type QUESTION IDENTIFIER SEMICOLON {
+        Type t = $1; t.nullable = 1;
+        $$ = (ASTNode*)make_var_decl(t, $3, NULL);
+    }
     ;
 
 return_stmt:
@@ -494,16 +563,3 @@ expr:
     ;
 
 %%
-
-void yyerror(const char* s) {
-    fprintf(stderr, "Error line %d: %s\n", yylineno, s);
-}
-
-int main() {
-    int result = yyparse();
-    if (result == 0 && root) {
-        FILE* out = fopen("output.cpp", "w");
-        if (out) { codegen(root, out); fclose(out); printf("Generated output.cpp\n"); }
-    }
-    return result;
-}

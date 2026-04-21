@@ -14,7 +14,7 @@ echo "=== Building Hylian Compiler ==="
 cd src
 bison -d parser.y
 flex lexer.l
-gcc lex.yy.c parser.tab.c ast.c codegen.c -o ../hylian
+gcc lex.yy.c parser.tab.c ast.c codegen_asm.c compiler.c -o ../hylian
 cd ..
 echo -e "${GREEN}✓ Build successful${NC}\n"
 
@@ -480,7 +480,183 @@ else
 fi
 echo ""
 
+# Test 18: for-in loop (copy iteration)
+echo "=== Test 18: for-in loop (copy) ==="
+cat > test_forin1.hy << 'EOF'
+include {
+    std.io,
+}
+
+Error? main() {
+    array<int> nums = [1, 2, 3];
+    for (n in nums) {
+        println(n);
+    }
+    return nil;
+}
+EOF
+
+./hylian < test_forin1.hy > /dev/null
+if g++ -std=c++17 output.cpp -o test_forin1_bin -I. 2>/dev/null; then
+    output=$(./test_forin1_bin)
+    expected="1
+2
+3"
+    if [ "$output" = "$expected" ]; then
+        echo -e "${GREEN}✓ Test 18 passed${NC}"
+    else
+        echo -e "${RED}✗ Test 18 failed: got '$output'${NC}"
+        exit 1
+    fi
+else
+    echo -e "${RED}✗ Test 18 failed to compile${NC}"
+    cat output.cpp
+    exit 1
+fi
+echo ""
+
+# Test 19: for-in loop (reference iteration)
+echo "=== Test 19: for-in loop (reference) ==="
+cat > test_forin2.hy << 'EOF'
+include {
+    std.io,
+}
+
+Error? main() {
+    array<int> nums = [10, 20, 30];
+    for (&n in nums) {
+        n = n + 5;
+    }
+    for (n in nums) {
+        println(n);
+    }
+    return nil;
+}
+EOF
+
+./hylian < test_forin2.hy > /dev/null
+if g++ -std=c++17 output.cpp -o test_forin2_bin -I. 2>/dev/null; then
+    output=$(./test_forin2_bin)
+    expected="15
+25
+35"
+    if [ "$output" = "$expected" ]; then
+        echo -e "${GREEN}✓ Test 19 passed${NC}"
+    else
+        echo -e "${RED}✗ Test 19 failed: got '$output'${NC}"
+        exit 1
+    fi
+else
+    echo -e "${RED}✗ Test 19 failed to compile${NC}"
+    cat output.cpp
+    exit 1
+fi
+echo ""
+
+# Test 20: for-in loop (strings with interpolation)
+echo "=== Test 20: for-in loop (strings) ==="
+cat > test_forin3.hy << 'EOF'
+include {
+    std.io,
+}
+
+Error? main() {
+    array<str> names = ["Alice", "Bob", "Carol"];
+    for (name in names) {
+        println("hello {{name}}!");
+    }
+    return nil;
+}
+EOF
+
+./hylian < test_forin3.hy > /dev/null
+if g++ -std=c++17 output.cpp -o test_forin3_bin -I. 2>/dev/null; then
+    output=$(./test_forin3_bin)
+    expected="hello Alice!
+hello Bob!
+hello Carol!"
+    if [ "$output" = "$expected" ]; then
+        echo -e "${GREEN}✓ Test 20 passed${NC}"
+    else
+        echo -e "${RED}✗ Test 20 failed: got '$output'${NC}"
+        exit 1
+    fi
+else
+    echo -e "${RED}✗ Test 20 failed to compile${NC}"
+    cat output.cpp
+    exit 1
+fi
+echo ""
+
+# Test 21: Multi-file relative imports
+echo "=== Test 21: Multi-file relative imports ==="
+mkdir -p test_imports/Game
+cat > test_imports/Game/Player.hy << 'EOF'
+public class Player {
+    Player(str n, int h) {
+        name = n;
+        health = h;
+    }
+    private str name;
+    private int health;
+
+    int getHealth() { return health; }
+    str getName() { return name; }
+}
+EOF
+
+cat > test_imports/Game/Enemy.hy << 'EOF'
+public class Enemy {
+    Enemy(str n, int d) {
+        name = n;
+        damage = d;
+    }
+    private str name;
+    private int damage;
+
+    int getDamage() { return damage; }
+    str getName() { return name; }
+}
+EOF
+
+cat > test_imports/main.hy << 'EOF'
+include {
+    std.io,
+    Game.Player,
+    Game.Enemy,
+}
+
+Error? main() {
+    Player p = new Player("Bob", 100);
+    Enemy e = new Enemy("Goomba", 10);
+    println("{{p.getName()}} vs {{e.getName()}}");
+    println("HP: {{p.getHealth()}}");
+    println("DMG: {{e.getDamage()}}");
+    return nil;
+}
+EOF
+
+./hylian test_imports/main.hy -o test_imports/output.cpp > /dev/null
+if g++ -std=c++17 test_imports/output.cpp -o test_imports/game_bin -I. 2>/dev/null; then
+    output=$(./test_imports/game_bin)
+    expected="Bob vs Goomba
+HP: 100
+DMG: 10"
+    if [ "$output" = "$expected" ]; then
+        echo -e "${GREEN}✓ Test 21 passed${NC}"
+    else
+        echo -e "${RED}✗ Test 21 failed: got '$output'${NC}"
+        exit 1
+    fi
+else
+    echo -e "${RED}✗ Test 21 failed to compile${NC}"
+    cat test_imports/output.cpp
+    exit 1
+fi
+echo ""
+
 # Cleanup
-rm -f test_*.hy output.cpp output.o test_main_bin test_interp3_run.cpp test_interp3_bin
+rm -f test_*.hy output.cpp output.o test_main_bin test_interp3_run.cpp test_interp3_bin test_forin1_bin test_forin2_bin test_forin3_bin
+rm -rf test_imports
 
 echo -e "${GREEN}=== All Tests Passed! ===${NC}"

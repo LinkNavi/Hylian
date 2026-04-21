@@ -67,6 +67,8 @@ ProgramNode *make_program() {
     ProgramNode *n = malloc(sizeof(ProgramNode));
     n->base.type = NODE_PROGRAM;
     n->declarations = NULL; n->decl_count = 0;
+    n->includes = NULL; n->include_count = 0;
+    n->cpp_includes = NULL; n->cpp_include_count = 0;
     return n;
 }
 
@@ -145,6 +147,16 @@ ForNode *make_for(ASTNode *init, ASTNode *condition, ASTNode *post) {
     ForNode *n = malloc(sizeof(ForNode));
     n->base.type = NODE_FOR;
     n->init = init; n->condition = condition; n->post = post;
+    n->body = NULL; n->body_count = 0;
+    return n;
+}
+
+ForInNode *make_for_in(char *var_name, int use_ref, ASTNode *collection) {
+    ForInNode *n = malloc(sizeof(ForInNode));
+    n->base.type = NODE_FOR_IN;
+    n->var_name = strdup(var_name);
+    n->use_ref = use_ref;
+    n->collection = collection;
     n->body = NULL; n->body_count = 0;
     return n;
 }
