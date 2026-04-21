@@ -4,6 +4,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ─── Target ─────────────────────────────────────────────────────────────────── */
+
+static const char *current_target = "linux";
+
+/* Returns the symbol name with a leading underscore on macOS, plain otherwise. */
+static const char *sym(const char *name) {
+    static char buf[128];
+    if (strcmp(current_target, "macos") == 0) {
+        buf[0] = '_';
+        strncpy(buf + 1, name, sizeof(buf) - 2);
+        buf[sizeof(buf) - 1] = '\0';
+        return buf;
+    }
+    return name;
+}
+
 /* ─── String constant table ─────────────────────────────────────────────────── */
 
 #define MAX_STR_CONSTS 1024
@@ -217,7 +233,7 @@ static void emit_print_arg(ASTNode *arg, FILE *out, const char *fn_name) {
     fprintf(out, "    mov rdi, rax\n");
     fprintf(out, "    mov rsi, rsp\n");
     fprintf(out, "    mov rdx, 32\n");
-    fprintf(out, "    call hylian_int_to_str\n");
+    fprintf(out, "    call %s\n", sym("hylian_int_to_str"));
     /* rax = length, rsp = buffer */
     fprintf(out, "    mov rsi, rax\n");
     fprintf(out, "    mov rdi, rsp\n");
@@ -403,15 +419,15 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
                     fprintf(out, "    mov rdi, rax\n");
                     fprintf(out, "    mov rsi, rsp\n");
                     fprintf(out, "    mov rdx, 32\n");
-                    fprintf(out, "    call hylian_int_to_str\n");
+                    fprintf(out, "    call %s\n", sym("hylian_int_to_str"));
                     fprintf(out, "    mov rsi, rax\n");
                     fprintf(out, "    mov rdi, rsp\n");
                 }
 
                 if (is_print)
-                    fprintf(out, "    call hylian_print\n");
+                    fprintf(out, "    call %s\n", sym("hylian_print"));
                 else
-                    fprintf(out, "    call hylian_println\n");
+                    fprintf(out, "    call %s\n", sym("hylian_println"));
 
                 if (need_stack_cleanup)
                     fprintf(out, "    add rsp, 32\n");
@@ -421,9 +437,9 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
                 fprintf(out, "    lea rdi, [rel %s]\n", lbl);
                 fprintf(out, "    mov rsi, 0\n");
                 if (is_print)
-                    fprintf(out, "    call hylian_print\n");
+                    fprintf(out, "    call %s\n", sym("hylian_print"));
                 else
-                    fprintf(out, "    call hylian_println\n");
+                    fprintf(out, "    call %s\n", sym("hylian_println"));
             }
             break;
         }
@@ -738,7 +754,8 @@ static void emit_function(const char *name, ASTNode **params, int param_count,
 
 /* ─── Top-level codegen entry ────────────────────────────────────────────────── */
 
-void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename) {
+void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const char *target) {
+    current_target = target ? target : "linux";
     /* Reset global state */
     str_const_count = 0;
     _label_counter  = 0;
@@ -809,9 +826,29 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename) {
     fprintf(out, "bits 64\n");
     fprintf(out, "default rel\n");
     fprintf(out, "\n");
-    fprintf(out, "extern hylian_print\n");
-    fprintf(out, "extern hylian_println\n");
-    fprintf(out, "extern hylian_int_to_str\n");
+
+    /* Target comment block with assemble/link instructions */
+    if (strcmp(current_target, "macos") == 0) {
+        fprintf(out, "; Target: macos\n");
+        fprintf(out, "; Assemble: nasm -f macho64 <file>.asm -o <file>.o\n");
+        fprintf(out, "; Runtime:  nasm -f macho64 runtime/std/io_macos.asm -o io.o\n");
+        fprintf(out, "; Link:     gcc <file>.o io.o -o <program>\n");
+    } else if (strcmp(current_target, "windows") == 0) {
+        fprintf(out, "; Target: windows\n");
+        fprintf(out, "; Assemble: nasm -f win64 <file>.asm -o <file>.o\n");
+        fprintf(out, "; Runtime:  nasm -f win64 runtime/std/io_windows.asm -o io.o\n");
+        fprintf(out, "; Link:     gcc <file>.o io.o -o <program>.exe\n");
+    } else {
+        fprintf(out, "; Target: linux\n");
+        fprintf(out, "; Assemble: nasm -f elf64 <file>.asm -o <file>.o\n");
+        fprintf(out, "; Runtime:  nasm -f elf64 runtime/std/io_linux.asm -o io.o\n");
+        fprintf(out, "; Link:     gcc <file>.o io.o -o <program> -no-pie\n");
+    }
+    fprintf(out, "\n");
+
+    fprintf(out, "extern %s\n", sym("hylian_print"));
+    fprintf(out, "extern %s\n", sym("hylian_println"));
+    fprintf(out, "extern %s\n", sym("hylian_int_to_str"));
     fprintf(out, "\n");
 
     /* .data section */

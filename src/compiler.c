@@ -4,6 +4,7 @@
 
 #include "ast.h"
 #include "codegen_asm.h"
+#include <string.h>
 
 /* ─── External parser interface ─────────────────────────────────────────────── */
 
@@ -186,21 +187,31 @@ int main(int argc, char **argv) {
     const char *input_file  = NULL;
     const char *output_file = NULL;
     const char *src_dir     = ".";
+    const char *target      = "linux";
 
     /* Parse arguments:
          hylian <input.hy>
          hylian <input.hy> -o <output.asm>
-         hylian <input.hy> -o <output.asm> --src-dir <dir> */
+         hylian <input.hy> -o <output.asm> --src-dir <dir>
+         hylian <input.hy> --target <linux|macos|windows> */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--src-dir") == 0 && i + 1 < argc) {
             src_dir = argv[++i];
+        } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            target = argv[++i];
+            if (strcmp(target, "linux") != 0 &&
+                strcmp(target, "macos") != 0 &&
+                strcmp(target, "windows") != 0) {
+                fprintf(stderr, "hylian: unknown target '%s' (must be linux, macos, or windows)\n", target);
+                return 1;
+            }
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
         } else {
             fprintf(stderr, "hylian: unknown option '%s'\n", argv[i]);
-            fprintf(stderr, "usage: hylian [input.hy] [-o output] [-S|--asm] [--src-dir dir]\n");
+            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows]\n");
             return 1;
         }
     }
@@ -211,7 +222,7 @@ int main(int argc, char **argv) {
 
     if (!input_file) {
         fprintf(stderr, "hylian: no input file specified\n");
-        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir]\n");
+        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows]\n");
         return 1;
     }
 
@@ -229,7 +240,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    codegen_asm(program, out, input_file);
+    codegen_asm(program, out, input_file, target);
     fclose(out);
     printf("Generated %s\n", output_file);
     return 0;
