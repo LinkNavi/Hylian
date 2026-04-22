@@ -1,0 +1,41 @@
+// Hylian standard library interface — std.errors
+// Auto-generated from errors_linux.asm
+//
+// Usage:
+//   include {
+//       std.errors,
+//   }
+
+module std.errors
+
+// The Error type — represents a recoverable failure.
+// Returned by functions that can fail as Error?
+// nil means success, non-nil means failure.
+//
+// Memory layout (16 bytes):
+//   offset  0:  str     message   — heap-allocated, null-terminated
+//   offset  8:  int     code      — reserved, currently always 0
+class Error {
+    // The human-readable error message.
+    fn message() -> str
+
+    // The numeric error code (reserved for future use, currently 0).
+    fn code() -> int
+}
+
+// Create a new Error with the given message.
+// Returns an Error? — assign to a nullable variable to check it.
+//
+// Example:
+//   return Err("something went wrong");
+fn Err(msg: str) -> Error?
+
+// Print "panic: <msg>" to stderr and exit with code 1.
+// Does not return.
+//
+// Example:
+//   Error? err = do_thing();
+//   if (err) {
+//       panic(err.message());
+//   }
+fn panic(msg: str)

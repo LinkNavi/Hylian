@@ -1,0 +1,27 @@
+// Hylian standard library interface — std.io
+// Auto-generated from io_linux.asm
+//
+// Usage:
+//   include {
+//       std.io,
+//   }
+
+module std.io
+
+// Print a string to stdout without a trailing newline.
+fn print(msg: str)
+
+// Print a string to stdout followed by a newline.
+fn println(msg: str)
+
+// Read a line from stdin. Returns the line without the trailing newline.
+// Returns an empty string on EOF.
+fn read_line() -> str
+
+// Convert an integer to its decimal string representation.
+fn int_to_str(n: int) -> str
+
+// Parse a decimal string into an integer.
+// Skips leading whitespace. Handles optional +/- sign.
+// Returns 0 for empty or whitespace-only input.
+fn str_to_int(s: str) -> int

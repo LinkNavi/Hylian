@@ -1,0 +1,58 @@
+// Hylian standard library interface — std.system.filesystem
+// Auto-generated from system/filesystem_linux.c
+//
+// Usage:
+//   include {
+//       std.system.filesystem,
+//   }
+
+module std.system.filesystem
+
+// Read the entire contents of a file into buf.
+// Returns the number of bytes read, or -1 on error (file not found, etc.).
+//
+// Example:
+//   array<int, 4096> buf;
+//   int n = fs_read("data.txt", buf);
+fn file_read(path: str, buf: str) -> int
+
+// Write buf to a file, creating it if it doesn't exist and truncating if it does.
+// Returns the number of bytes written, or -1 on error.
+//
+// Example:
+//   int n = fs_write("out.txt", "hello world");
+fn file_write(path: str, buf: str) -> int
+
+// Append buf to the end of a file, creating it if it doesn't exist.
+// Returns the number of bytes written, or -1 on error.
+//
+// Example:
+//   fs_append("log.txt", "new entry\n");
+fn file_append(path: str, buf: str) -> int
+
+// Check whether a file exists at the given path.
+// Returns 1 if it exists, 0 if it does not.
+//
+// Example:
+//   if (fs_exists("config.hy")) {
+//       // ...
+//   }
+fn file_exists(path: str) -> int
+
+// Get the size of a file in bytes.
+// Returns the file size, or -1 if the file does not exist or cannot be opened.
+//
+// Example:
+//   int size = fs_size("data.bin");
+fn file_size(path: str) -> int
+
+// Create a directory at the given path (mode 0755).
+// Returns 0 on success, -1 if the directory could not be created
+// (e.g. already exists, permission denied).
+//
+// Example:
+//   Error? err = fs_mkdir("build");
+//   if (err) {
+//       panic(err.message());
+//   }
+fn mkdir(path: str) -> int

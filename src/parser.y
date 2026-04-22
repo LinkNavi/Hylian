@@ -72,6 +72,7 @@ void typelist_add(TypeList* l, Type t) {
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
 %token DEFER MATCH UNSAFE CONST STATIC EXTERN AMP
 %token INT STRING ERROR BOOL
+%token <str> ASM_BLOCK
 %token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET SEMICOLON COMMA DOT QUESTION
 %token ASSIGN DECLARE_ASSIGN
 %token INC DEC
@@ -402,6 +403,12 @@ stmt:
     | return_stmt
     | BREAK SEMICOLON    { $$ = (ASTNode*)make_break(); }
     | CONTINUE SEMICOLON { $$ = (ASTNode*)make_continue(); }
+    | ASM_BLOCK {
+        AsmBlockNode *ab = malloc(sizeof(AsmBlockNode));
+        ab->base.type = NODE_ASM_BLOCK;
+        ab->body = $1;
+        $$ = (ASTNode*)ab;
+    }
     | DEFER expr SEMICOLON { $$ = (ASTNode*)make_defer($2); }
     | expr SEMICOLON { $$ = $1; }
     /* := declare-assign (type inferred as auto) */

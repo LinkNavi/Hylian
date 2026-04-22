@@ -9,6 +9,8 @@ static int has_interpolation(const char *s) {
         if (s[i] == '{' && s[i+1] == '{') return 1;
     return 0;
 }
+
+
 %}
 
 %option noyywrap
@@ -19,6 +21,24 @@ static int has_interpolation(const char *s) {
 [ \t\r\n]+          { /* skip whitespace */ }
 "//".*              { /* skip single-line comments */ }
 
+"asm{"              {
+    int capacity = 256;
+    int len = 0;
+    char *buf = malloc(capacity);
+    int c;
+    while ((c = input()) != EOF) {
+        if (c == '}') break;
+        if (len + 2 >= capacity) {
+            capacity *= 2;
+            buf = realloc(buf, capacity);
+        }
+        buf[len++] = (char)c;
+        if (c == '\n') yylineno++;
+    }
+    buf[len] = '\0';
+    yylval.str = buf;
+    return ASM_BLOCK;
+}
 "include"           { return INCLUDE; }
 "class"             { return CLASS; }
 "public"            { return PUBLIC; }

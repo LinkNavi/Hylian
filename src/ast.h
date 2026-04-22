@@ -33,6 +33,7 @@ typedef enum {
     NODE_ARRAY_LITERAL,
     NODE_INDEX,
     NODE_INDEX_ASSIGN,
+    NODE_ASM_BLOCK,
 } NodeType;
 
 typedef struct ASTNode { NodeType type; } ASTNode;
@@ -241,6 +242,7 @@ typedef struct { ASTNode base; ASTNode *value; } ReturnNode;
 typedef struct { ASTNode base; ASTNode *expr; } DeferNode;
 typedef struct { ASTNode base; } BreakNode;
 typedef struct { ASTNode base; } ContinueNode;
+typedef struct { ASTNode base; char *body; } AsmBlockNode;
 
 typedef struct {
     ASTNode base;

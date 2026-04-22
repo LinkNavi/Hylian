@@ -5,15 +5,22 @@ include {
     Game.EnemySpawner,
     Game.Enemies.Goomba,
 }
-
 public class Player {
     private str name;
     private int health;
-
+    str getName() {
+        return name;
+    }
     int getHealth() {
         return health;
     }
-
+    Error? setName(str newName) {
+        if (newName.length() == 0) {
+            return Err("name cannot be empty");
+        }
+        name = newName;
+        return nil;
+    }
     Error? setHealth(int newHealth) {
         if (newHealth < 0) {
             return Err("health cannot be negative");
@@ -22,43 +29,26 @@ public class Player {
         return nil;
     }
 }
-
 Error? main() {
     Player p = new Player();
     Goomba g = new Goomba();
-
-    err := p.setName("Bob");
+    Error? err = p.setName("Bob");
     if (err) {
         panic(err.message());
     }
-
     err = p.setHealth(100);
     if (err) {
         panic(err.message());
     }
-
     if (p.getHealth() <= 0) {
         print("you ded");
     }
-
-    // typed array - flexible size, maps to std::vector<Enemy>
-    array<Enemy> enemies = [g, otherEnemy];
-
-    // typed array - fixed size, maps to std::array<Enemy, 5>
+    array<Enemy> enemies = [g];
     array<Enemy, 5> fiveEnemies = [g, g, g, g, g];
-
-    // multi - union types, flexible size, maps to std::vector<std::variant<str, int>>
     multi<str | int> objects = ["hello", 42, "world"];
-
-    // multi - union types, fixed size, maps to std::array<std::variant<str, int>, 3>
     multi<str | int, 3> threeThings = ["hello", 42, "world"];
-
-    // multi<any> - any type, flexible size, maps to std::vector<std::any>
     multi<any> stuff = ["hello", 42, true, 3.14];
-
-    // indexing works on both
-    int first = enemies[0];
+    Enemy first = enemies[0];
     enemies[1] = g;
-
     return nil;
 }
