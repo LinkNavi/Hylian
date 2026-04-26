@@ -351,14 +351,79 @@ def parse_config(path):
 # ── Runtime resolution ────────────────────────────────────────────────────────
 
 HYLIAN_ROOT = os.path.dirname(os.path.abspath(__file__))
-RUNTIME_DIR = os.path.join(HYLIAN_ROOT, "runtime", "std")
+
+
+# Locate the stdlib runtime directory.
+# Priority:
+#   1. HYLIAN_LIB environment variable  (set by the installed `linkle` wrapper)
+#   2. <prefix>/lib/hylian              (heuristic: binary lives in <prefix>/bin)
+#   3. Repo root fallback               (running directly from source checkout)
+def _find_runtime_dir():
+    # 1. Explicit env override
+    env_lib = os.environ.get("HYLIAN_LIB")
+    if env_lib:
+        candidate = os.path.join(env_lib, "std")
+        if os.path.isdir(candidate):
+            return candidate
+        # HYLIAN_LIB might already point at the std dir itself
+        if os.path.isdir(env_lib):
+            return env_lib
+
+    # 2. Installed layout: linkle.py lives at <prefix>/lib/hylian/linkle.py
+    #    so <prefix>/lib/hylian/std is right next door.
+    installed_std = os.path.join(HYLIAN_ROOT, "std")
+    if os.path.isdir(installed_std):
+        return installed_std
+
+    # 3. Source-checkout fallback: linkle.py is at the repo root,
+    #    runtime is at runtime/std relative to that.
+    repo_std = os.path.join(HYLIAN_ROOT, "runtime", "std")
+    return repo_std  # may not exist yet, caller will error appropriately
+
+
+RUNTIME_DIR = _find_runtime_dir()
+
+
+def _find_hylian_bin():
+    """
+    Locate the hylian compiler binary.
+    Priority:
+      1. Same directory as this script         (source checkout: ./hylian)
+      2. Installed layout sibling bin dir      (<prefix>/bin/hylian next to
+                                                <prefix>/lib/hylian/linkle.py)
+      3. Anywhere on PATH
+    Returns the full path string, or raises BuildError if not found.
+    """
+    # 1. Next to this script (source checkout)
+    local = os.path.join(HYLIAN_ROOT, "hylian")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+
+    # 2. Installed: <prefix>/lib/hylian/linkle.py → <prefix>/bin/hylian
+    # HYLIAN_ROOT is e.g. /usr/local/lib/hylian, so go up two levels → /usr/local
+    installed = os.path.join(HYLIAN_ROOT, "..", "..", "bin", "hylian")
+    installed = os.path.normpath(installed)
+    if os.path.isfile(installed) and os.access(installed, os.X_OK):
+        return installed
+
+    # 3. PATH
+    found = shutil.which("hylian")
+    if found:
+        return found
+
+    raise BuildError(
+        "hylian compiler not found.\n"
+        "  • From a source checkout: run ./build.sh first\n"
+        "  • After installing:        ensure the install prefix bin/ is in PATH"
+    )
 
 
 def _runtime_obj(stem_rel, target, verbose):
     """
-    Given a stem relative to RUNTIME_DIR (e.g. "io_linux"),
-    return a path to a usable .o file, building it if necessary.
-    Raises RuntimeError if nothing can be found.
+    Given a stem relative to RUNTIME_DIR (e.g. "io"),
+    return a path to a usable .o file, building it from .c source if
+    necessary (source checkout only).  Raises RuntimeError if nothing
+    can be found.
     """
     stem = os.path.join(RUNTIME_DIR, stem_rel)
 
@@ -366,32 +431,48 @@ def _runtime_obj(stem_rel, target, verbose):
     c_path = stem + ".c"
     asm_path = stem + ".asm"
 
-    # Pre-built .o
+    # Pre-built .o — always preferred (installed layout has only .o)
     if os.path.exists(obj_path):
         if _is_fresh(obj_path, c_path) and _is_fresh(obj_path, asm_path):
-            dim(f"pre-built  {os.path.relpath(obj_path)}")
+            try:
+                rel = os.path.relpath(obj_path)
+            except ValueError:
+                rel = obj_path
+            dim(f"pre-built  {rel}")
             return obj_path
 
-    # Compile from C
+    # Compile from C (source checkout fallback)
     if os.path.exists(c_path):
+        try:
+            rel = os.path.relpath(c_path)
+        except ValueError:
+            rel = c_path
         _run(
             ["gcc", "-O2", "-c", c_path, "-o", obj_path],
             verbose,
-            label=f"CC   {os.path.relpath(c_path)}",
+            label=f"CC   {rel}",
         )
         return obj_path
 
-    # Assemble from ASM
+    # Assemble from ASM (rare fallback)
     if os.path.exists(asm_path):
+        try:
+            rel = os.path.relpath(asm_path)
+        except ValueError:
+            rel = asm_path
         fmt = NASM_FORMATS.get(target, "elf64")
         _run(
             ["nasm", "-f", fmt, asm_path, "-o", obj_path],
             verbose,
-            label=f"ASM  {os.path.relpath(asm_path)}",
+            label=f"ASM  {rel}",
         )
         return obj_path
 
-    raise RuntimeError(f"runtime module not found: {stem_rel} (.o / .c / .asm)")
+    raise RuntimeError(
+        f"runtime module not found: {stem_rel}\n"
+        f"  Looked in: {RUNTIME_DIR}\n"
+        f"  Run ./build.sh (source) or ./install.sh to populate runtime objects."
+    )
 
 
 def _is_fresh(obj, src):
@@ -516,11 +597,7 @@ def _scan_includes(hy_file):
 def cmd_build(cfg, target, verbose, project_root):
     step(f"Building {cfg.project_name} v{cfg.project_version}")
 
-    hylian_bin = os.path.join(HYLIAN_ROOT, "hylian")
-    if not os.path.exists(hylian_bin):
-        raise BuildError(
-            f"hylian compiler not found at {hylian_bin}\nRun: cd src && bison -d parser.y && flex lexer.l && gcc lex.yy.c parser.tab.c ast.c codegen_asm.c compiler.c -o ../hylian"
-        )
+    hylian_bin = _find_hylian_bin()
 
     src_dir = os.path.join(project_root, cfg.build_src)
     out_dir = os.path.join(project_root, cfg.build_out)

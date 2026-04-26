@@ -739,6 +739,21 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
                     fprintf(out, "    mov rdi, rax\n");
                     fprintf(out, "    mov rsi, r15\n");
                     need_stack_cleanup = 544;
+                } else if ((arg->type == NODE_METHOD_CALL &&
+                            strcmp(((MethodCallNode *)arg)->method, "message") == 0) ||
+                           (arg->type == NODE_IDENTIFIER &&
+                            (locals_type(((IdentifierNode *)arg)->name)) &&
+                            strcmp(locals_type(((IdentifierNode *)arg)->name), "str") == 0)) {
+                    /* str pointer result (method call returning str e.g. .message(), or str local):
+                       use strlen to get length, then call hylian_println directly */
+                    emit_expr(arg, out, fn_name);
+                    /* rax = char* pointer */
+                    fprintf(out, "    push rax\n");
+                    fprintf(out, "    mov rdi, rax\n");
+                    fprintf(out, "    call %s\n", sym("strlen"));
+                    fprintf(out, "    mov rsi, rax\n");
+                    fprintf(out, "    pop rdi\n");
+                    need_stack_cleanup = 0;
                 } else {
                     /* Integer or other expression: convert to string */
                     emit_expr(arg, out, fn_name);
@@ -990,26 +1005,38 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
                 const char *varname = seg->text;
                 int off = locals_find(varname);
                 if (off >= 0) {
-                    fprintf(out, "    ; interp expr: %s\n", varname);
+                    const char *vtype = locals_type(varname);
+                    int is_str = (vtype && strcmp(vtype, "str") == 0);
+                    fprintf(out, "    ; interp expr: %s (type: %s)\n", varname, vtype ? vtype : "int");
                     fprintf(out, "    mov rax, [rbp - %d]\n", off);
-                    /* Convert integer to string into a 32-byte scratch area
-                       above our 512-byte buffer (i.e. at r13+512).
-                       We temporarily save r14 on the stack, use the scratch
-                       area, then restore r14. */
-                    fprintf(out, "    push r14\n");
-                    fprintf(out, "    sub rsp, 32\n");
-                    fprintf(out, "    mov rdi, rax\n");
-                    fprintf(out, "    mov rsi, rsp\n");
-                    fprintf(out, "    mov rdx, 32\n");
-                    fprintf(out, "    call %s\n", sym("hylian_int_to_str"));
-                    /* rax = length written into scratch buffer */
-                    fprintf(out, "    mov rcx, rax\n");
-                    fprintf(out, "    mov rsi, rsp\n");
-                    fprintf(out, "    add rsp, 32\n");
-                    fprintf(out, "    pop r14\n");
-                    fprintf(out, "    mov rdi, r14\n");
-                    fprintf(out, "    rep movsb\n");
-                    fprintf(out, "    mov r14, rdi\n");
+                    if (is_str) {
+                        /* rax = char* pointer — get its length with strlen, then copy */
+                        fprintf(out, "    push r14\n");
+                        fprintf(out, "    mov rdi, rax\n");
+                        fprintf(out, "    call %s\n", sym("strlen"));
+                        fprintf(out, "    mov rcx, rax\n");
+                        fprintf(out, "    pop r14\n");
+                        fprintf(out, "    mov rsi, [rbp - %d]\n", off);
+                        fprintf(out, "    mov rdi, r14\n");
+                        fprintf(out, "    rep movsb\n");
+                        fprintf(out, "    mov r14, rdi\n");
+                    } else {
+                        /* integer — convert to string into a 32-byte scratch area */
+                        fprintf(out, "    push r14\n");
+                        fprintf(out, "    sub rsp, 32\n");
+                        fprintf(out, "    mov rdi, rax\n");
+                        fprintf(out, "    mov rsi, rsp\n");
+                        fprintf(out, "    mov rdx, 32\n");
+                        fprintf(out, "    call %s\n", sym("hylian_int_to_str"));
+                        /* rax = length written into scratch buffer */
+                        fprintf(out, "    mov rcx, rax\n");
+                        fprintf(out, "    mov rsi, rsp\n");
+                        fprintf(out, "    add rsp, 32\n");
+                        fprintf(out, "    pop r14\n");
+                        fprintf(out, "    mov rdi, r14\n");
+                        fprintf(out, "    rep movsb\n");
+                        fprintf(out, "    mov r14, rdi\n");
+                    }
                 } else {
                     fprintf(out, "    ; interp expr '%s' not found as local — skipped\n", varname);
                 }
@@ -1559,13 +1586,15 @@ static void emit_function(const char *name, ASTNode **params, int param_count,
     for (int i = 0; i < nparams; i++) {
         ASTNode *p = params[i];
         const char *pname = NULL;
+        const char *ptype = NULL;
         if (p->type == NODE_VAR_DECL) {
             pname = ((VarDeclNode *)p)->var_name;
+            ptype = ((VarDeclNode *)p)->var_type.name;
         } else if (p->type == NODE_IDENTIFIER) {
             pname = ((IdentifierNode *)p)->name;
         }
         if (pname) {
-            int off = locals_alloc(pname);
+            int off = locals_alloc_typed(pname, ptype);
             fprintf(out, "    mov [rbp - %d], %s\n", off, arg_regs[i]);
         }
     }

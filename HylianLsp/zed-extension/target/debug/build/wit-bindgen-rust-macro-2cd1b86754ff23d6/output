@@ -1,0 +1,2 @@
+cargo:rerun-if-changed=build.rs
+cargo:rustc-env=DEBUG_OUTPUT_DIR=/home/link/Programming/Hylian/HylianLsp/zed-extension/target/debug/build/wit-bindgen-rust-macro-2cd1b86754ff23d6/out

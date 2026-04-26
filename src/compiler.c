@@ -14,9 +14,8 @@ extern void yyrestart(FILE *f);
 extern int  yylineno;
 extern ProgramNode *root;
 
-void yyerror(const char *s) {
-    fprintf(stderr, "Error line %d: %s\n", yylineno, s);
-}
+/* Defined and owned by parser.y — set before each yyparse() call */
+extern const char *current_parse_file;
 
 /* ─── Visited-file set (avoid compiling the same file twice) ─────────────────── */
 
@@ -123,6 +122,7 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
     root = NULL;
     yyrestart(f);
     yylineno = 1;
+    current_parse_file = filepath;
     int parse_result = yyparse();
     fclose(f);
 
@@ -241,7 +241,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    typecheck(program);
+    typecheck(program, input_file);
     codegen_asm(program, out, input_file, target);
     fclose(out);
     printf("Generated %s\n", output_file);

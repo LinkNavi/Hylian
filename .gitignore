@@ -6,3 +6,4 @@ parser.tab.h
 hylian
 test_lexer
 *.hy
+Docs/book/

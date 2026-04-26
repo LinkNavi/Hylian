@@ -1,0 +1,15 @@
+id = "hylian"
+name = "Hylian"
+version = "0.1.0"
+schema_version = 1
+authors = ["Hylian Contributors"]
+description = "Language support for the Hylian programming language, including syntax highlighting and LSP integration."
+repository = "https://github.com/your-username/hylian"
+
+[language_servers.hylian-lsp]
+name = "Hylian LSP"
+languages = ["Hylian"]
+
+[grammars.hylian]
+repository = "https://github.com/your-username/tree-sitter-hylian"
+rev = "main"

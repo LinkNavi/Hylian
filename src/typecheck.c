@@ -1,8 +1,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include "ast.h"
 #include "typecheck.h"
+
+/* ─── Diagnostics ───────────────────────────────────────────────────────────── */
+static const char *current_tc_file = "<unknown>";
+
+static void tc_error(int line, const char *fmt, ...) {
+    va_list ap;
+    fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;31merror:\033[0m ", current_tc_file, line);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+}
+
+static void tc_warn(int line, const char *fmt, ...) {
+    va_list ap;
+    fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;33mwarning:\033[0m ", current_tc_file, line);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+}
 
 /* ─── Scope / symbol table ──────────────────────────────────────────────────── */
 
@@ -88,6 +110,26 @@ static Type unknown_type(void) {
     return make_simple_type(NULL, 0);
 }
 
+/* ─── Type name helper ──────────────────────────────────────────────────────── */
+
+static const char *type_name(Type t) {
+    static char buf[256];
+    if (t.kind == TYPE_ARRAY) {
+        if (t.elem_type_count > 0 && t.elem_types[0].name)
+            snprintf(buf, sizeof(buf), "array<%s>", t.elem_types[0].name);
+        else
+            snprintf(buf, sizeof(buf), "array<unknown>");
+        return buf;
+    }
+    if (t.kind == TYPE_MULTI) {
+        if (t.is_any) return "multi<any>";
+        snprintf(buf, sizeof(buf), "multi<...>");
+        return buf;
+    }
+    if (t.name) return t.name;
+    return "unknown";
+}
+
 /* ─── Forward declarations ──────────────────────────────────────────────────── */
 
 static Type infer_expr(ASTNode *node);
@@ -117,7 +159,11 @@ static Type infer_expr(ASTNode *node) {
     case NODE_IDENTIFIER: {
         IdentifierNode *id = (IdentifierNode *)node;
         Type *t = scope_lookup(id->name);
-        if (t) result = *t;
+        if (t) {
+            result = *t;
+        } else {
+            tc_error(0, "undefined variable '%s'", id->name);
+        }
         break;
     }
 
@@ -133,6 +179,13 @@ static Type infer_expr(ASTNode *node) {
             strcmp(op, "&&") == 0 || strcmp(op, "||") == 0) {
             result = make_simple_type("bool", 0);
         } else {
+            /* Warn on arithmetic applied directly to a boolean */
+            if (left.name && strcmp(left.name, "bool") == 0 &&
+                (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+                 strcmp(op, "*") == 0 || strcmp(op, "/") == 0 ||
+                 strcmp(op, "%") == 0)) {
+                tc_warn(0, "arithmetic on boolean value with operator '%s'", op);
+            }
             result = left;
         }
         break;
@@ -159,14 +212,28 @@ static Type infer_expr(ASTNode *node) {
         /* Infer all args first */
         for (int i = 0; i < fc->arg_count; i++)
             infer_expr(fc->args[i]);
-        /* Special cases */
+        /* Special built-ins that are not registered in the func table */
         if (fc->name && strcmp(fc->name, "Err") == 0) {
             result = make_simple_type("Error", 0);
         } else if (fc->name && strcmp(fc->name, "panic") == 0) {
             result = make_simple_type("void", 0);
+        } else if (fc->name && strcmp(fc->name, "print") == 0) {
+            result = make_simple_type("void", 0);
+        } else if (fc->name && strcmp(fc->name, "len") == 0) {
+            result = make_simple_type("int", 0);
+        } else if (fc->name && strcmp(fc->name, "push") == 0) {
+            result = make_simple_type("void", 0);
+        } else if (fc->name && strcmp(fc->name, "pop") == 0) {
+            result = unknown_type();
+        } else if (fc->name && strcmp(fc->name, "exit") == 0) {
+            result = make_simple_type("void", 0);
         } else if (fc->name) {
             FuncInfo *fi = func_lookup(fc->name);
-            if (fi) result = fi->return_type;
+            if (fi) {
+                result = fi->return_type;
+            } else {
+                tc_error(0, "call to undefined function '%s'", fc->name);
+            }
         }
         break;
     }
@@ -186,7 +253,22 @@ static Type infer_expr(ASTNode *node) {
             char mangled[256];
             snprintf(mangled, sizeof(mangled), "%s__%s", obj_type.name, mc->method);
             FuncInfo *fi = func_lookup(mangled);
-            if (fi) result = fi->return_type;
+            if (fi) {
+                result = fi->return_type;
+            } else {
+                tc_error(0, "no method '%s' on type '%s'", mc->method,
+                         obj_type.name ? obj_type.name : "unknown");
+            }
+        } else if (mc->method && obj_type.kind == TYPE_ARRAY) {
+            /* Built-in array methods */
+            if (strcmp(mc->method, "push") == 0 || strcmp(mc->method, "pop") == 0 ||
+                strcmp(mc->method, "len")  == 0 || strcmp(mc->method, "cap")  == 0) {
+                result = make_simple_type("int", 0);
+            } else {
+                tc_error(0, "no method '%s' on type '%s'", mc->method, type_name(obj_type));
+            }
+        } else if (mc->method && !obj_type.name) {
+            tc_error(0, "no method '%s' on type 'unknown'", mc->method);
         }
         break;
     }
@@ -215,7 +297,11 @@ static Type infer_expr(ASTNode *node) {
                     result = make_simple_type("int", 0);
             } else {
                 FieldEntry *fe = field_lookup(obj_type.name, ma->member);
-                if (fe) result = fe->field_type;
+                if (fe) {
+                    result = fe->field_type;
+                } else {
+                    tc_error(0, "no field '%s' on type '%s'", ma->member, obj_type.name);
+                }
             }
         }
         break;
@@ -287,9 +373,16 @@ static void infer_stmt(ASTNode *node) {
 
     case NODE_VAR_DECL: {
         VarDeclNode *vd = (VarDeclNode *)node;
+        Type init_type = unknown_type();
         if (vd->initializer)
-            infer_expr(vd->initializer);
+            init_type = infer_expr(vd->initializer);
         Type decl_type = vd->var_type;
+        /* Warn when 'auto' type cannot be resolved from the initializer */
+        if (decl_type.name && strcmp(decl_type.name, "auto") == 0 &&
+            (!init_type.name || strcmp(init_type.name, "unknown") == 0) &&
+            init_type.kind == TYPE_SIMPLE && !init_type.name) {
+            tc_warn(0, "cannot infer type for '%s' from initializer", vd->var_name);
+        }
         scope_define(vd->var_name, decl_type);
         node->resolved_type = decl_type;
         break;
@@ -450,7 +543,9 @@ static void register_field(const char *class_name, const char *fname, Type ftype
 
 /* ─── Main typecheck entry ──────────────────────────────────────────────────── */
 
-void typecheck(ProgramNode *program) {
+void typecheck(ProgramNode *program, const char *filename) {
+    current_tc_file = filename ? filename : "<unknown>";
+
     /* Reset state */
     sym_count   = 0;
     scope_depth = 0;

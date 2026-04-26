@@ -4,20 +4,52 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netdb.h>
+
+// ── Platform abstraction ──────────────────────────────────────────────────────
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+   typedef SOCKET hylian_sock_t;
+#  define HYLIAN_INVALID_SOCK INVALID_SOCKET
+#  define hylian_sock_close(s) closesocket(s)
+#  define hylian_sock_errno() WSAGetLastError()
+   static int _wsa_init = 0;
+   static void _ensure_wsa(void) {
+       if (_wsa_init) return;
+       WSADATA wd; WSAStartup(MAKEWORD(2,2), &wd); _wsa_init = 1;
+   }
+#  ifdef _MSC_VER
+     typedef SSIZE_T ssize_t;
+#  endif
+#else
+#  include <sys/types.h>
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+   typedef int hylian_sock_t;
+#  define HYLIAN_INVALID_SOCK (-1)
+#  define hylian_sock_close(s) close(s)
+#  define hylian_sock_errno() errno
+#  define _ensure_wsa() /* nothing */
+#endif
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/opensslv.h>
 
 // ── Internal connection table ─────────────────────────────────────────────────
 
 #define MAX_HTTPS_CONNS 64
 
 typedef struct {
-    int        fd;   /* underlying TCP socket, -1 = slot free */
-    SSL_CTX   *ctx;
-    SSL       *ssl;
+    hylian_sock_t  fd;   /* underlying TCP socket, HYLIAN_INVALID_SOCK = slot free */
+    SSL_CTX       *ctx;
+    SSL           *ssl;
 } HttpsConn;
 
 static HttpsConn _conns[MAX_HTTPS_CONNS];
@@ -25,16 +57,18 @@ static int       _conns_init = 0;
 
 static void _init_conns(void) {
     if (_conns_init) return;
-    for (int i = 0; i < MAX_HTTPS_CONNS; i++) _conns[i].fd = -1;
+    for (int i = 0; i < MAX_HTTPS_CONNS; i++) _conns[i].fd = HYLIAN_INVALID_SOCK;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
+#endif
     _conns_init = 1;
 }
 
 static int _alloc_slot(void) {
     for (int i = 0; i < MAX_HTTPS_CONNS; i++)
-        if (_conns[i].fd == -1) return i;
+        if (_conns[i].fd == HYLIAN_INVALID_SOCK) return i;
     return -1;
 }
 
@@ -49,6 +83,7 @@ int64_t hylian_net_https_connect(char *host, int64_t host_len,
     if (!host || host_len <= 0 || host_len > 253 || port < 1 || port > 65535)
         return -1;
 
+    _ensure_wsa();
     _init_conns();
 
     int slot = _alloc_slot();
@@ -73,25 +108,29 @@ int64_t hylian_net_https_connect(char *host, int64_t host_len,
     if (getaddrinfo(host_tmp, port_tmp, &hints, &results) != 0 || !results)
         return -1;
 
-    int fd = -1;
+    hylian_sock_t fd = HYLIAN_INVALID_SOCK;
     for (struct addrinfo *rp = results; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0)
+        if (fd == HYLIAN_INVALID_SOCK)
             continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+        if (connect(fd, rp->ai_addr, (socklen_t)rp->ai_addrlen) == 0)
             break;
-        close(fd);
-        fd = -1;
+        hylian_sock_close(fd);
+        fd = HYLIAN_INVALID_SOCK;
     }
     freeaddrinfo(results);
 
-    if (fd < 0)
+    if (fd == HYLIAN_INVALID_SOCK)
         return -1;
 
     // Set up TLS over the connected socket.
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+#else
+    SSL_CTX *ctx = SSL_CTX_new(SSLv23_client_method());
+#endif
     if (!ctx) {
-        close(fd);
+        hylian_sock_close(fd);
         return -1;
     }
 
@@ -105,11 +144,11 @@ int64_t hylian_net_https_connect(char *host, int64_t host_len,
     SSL *ssl = SSL_new(ctx);
     if (!ssl) {
         SSL_CTX_free(ctx);
-        close(fd);
+        hylian_sock_close(fd);
         return -1;
     }
 
-    SSL_set_fd(ssl, fd);
+    SSL_set_fd(ssl, (int)fd);
 
     // Set SNI hostname so servers can select the right certificate.
     SSL_set_tlsext_host_name(ssl, host_tmp);
@@ -117,7 +156,7 @@ int64_t hylian_net_https_connect(char *host, int64_t host_len,
     if (SSL_connect(ssl) != 1) {
         SSL_free(ssl);
         SSL_CTX_free(ctx);
-        close(fd);
+        hylian_sock_close(fd);
         return -1;
     }
 
@@ -138,7 +177,7 @@ int64_t hylian_net_https_send(int64_t handle, char *buf, int64_t len) {
         return -1;
 
     HttpsConn *c = &_conns[(int)handle];
-    if (c->fd < 0 || !c->ssl)
+    if (c->fd == HYLIAN_INVALID_SOCK || !c->ssl)
         return -1;
 
     int n = SSL_write(c->ssl, buf, (int)len);
@@ -158,7 +197,7 @@ int64_t hylian_net_https_recv(int64_t handle, char *buf, int64_t buf_len) {
         return -1;
 
     HttpsConn *c = &_conns[(int)handle];
-    if (c->fd < 0 || !c->ssl)
+    if (c->fd == HYLIAN_INVALID_SOCK || !c->ssl)
         return -1;
 
     int n = SSL_read(c->ssl, buf, (int)buf_len);
@@ -178,17 +217,17 @@ int64_t hylian_net_https_close(int64_t handle) {
         return -1;
 
     HttpsConn *c = &_conns[(int)handle];
-    if (c->fd < 0)
+    if (c->fd == HYLIAN_INVALID_SOCK)
         return -1;
 
     SSL_shutdown(c->ssl);
     SSL_free(c->ssl);
     SSL_CTX_free(c->ctx);
-    close(c->fd);
+    hylian_sock_close(c->fd);
 
     c->ssl = NULL;
     c->ctx = NULL;
-    c->fd  = -1;
+    c->fd  = HYLIAN_INVALID_SOCK;
 
     return 0;
 }

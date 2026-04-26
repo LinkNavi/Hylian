@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+extern const char *current_parse_file;
+
 /* Check if a raw string body (between outer quotes) contains {{ }} interpolation */
 static int has_interpolation(const char *s) {
     for (int i = 0; s[i]; i++)
@@ -125,6 +127,6 @@ static int has_interpolation(const char *s) {
 "|"                 { return PIPE; }
 "&"                 { return AMP; }
 "$"                 { /* swallow stray $ (legacy prefix, no longer needed) */ }
-.                   { printf("Unknown char: %s\n", yytext); }
+.                   { fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;31merror:\033[0m unexpected character '%s'\n", current_parse_file, yylineno, yytext); }
 
 %%

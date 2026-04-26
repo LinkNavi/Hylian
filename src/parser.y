@@ -4,10 +4,58 @@
 #include <string.h>
 #include "ast.h"
 
-
 extern int yylex();
 extern int yylineno;
-void yyerror(const char* s);
+
+/* Set this to the current source file path before calling yyparse() */
+const char *current_parse_file = "<unknown>";
+
+void yyerror(const char *s) {
+    /* Bold red "error:" label */
+    fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;31merror:\033[0m %s\n",
+            current_parse_file, yylineno, s);
+
+    /* Hint logic — inspect the Bison-generated message for common patterns */
+    const char *hint = NULL;
+
+    if (strstr(s, "unexpected '}'") || strstr(s, "unexpected RBRACE")) {
+        hint = "check for a missing \033[1;36m;\033[0m before the closing \033[1;36m}\033[0m";
+    } else if (strstr(s, "unexpected '{'") || strstr(s, "unexpected LBRACE")) {
+        hint = "check for a missing \033[1;36m;\033[0m or mismatched braces";
+    } else if (strstr(s, "unexpected IDENTIFIER")) {
+        hint = "an identifier appeared where it wasn't expected — did you forget a \033[1;36m:\033[0m type annotation, a \033[1;36m,\033[0m, or a \033[1;36m;\033[0m?";
+    } else if (strstr(s, "unexpected ';'") || strstr(s, "unexpected SEMICOLON")) {
+        hint = "extra or misplaced \033[1;36m;\033[0m — check for an empty statement or a stray semicolon";
+    } else if (strstr(s, "unexpected '('") || strstr(s, "unexpected LPAREN")) {
+        hint = "unexpected \033[1;36m(\033[0m — did you forget the function name or a type annotation?";
+    } else if (strstr(s, "unexpected ')'") || strstr(s, "unexpected RPAREN")) {
+        hint = "unexpected \033[1;36m)\033[0m — check for mismatched parentheses or a missing argument";
+    } else if (strstr(s, "unexpected ','") || strstr(s, "unexpected COMMA")) {
+        hint = "unexpected \033[1;36m,\033[0m — check for a trailing comma or a missing expression";
+    } else if (strstr(s, "unexpected $end") || strstr(s, "unexpected end of input") || strstr(s, "unexpected end of file")) {
+        hint = "the file ended unexpectedly — check for unclosed \033[1;36m{\033[0m blocks or a missing \033[1;36m}\033[0m";
+    } else if (strstr(s, "unexpected ASSIGN") || strstr(s, "unexpected '='")) {
+        hint = "unexpected \033[1;36m=\033[0m — did you mean \033[1;36m:=\033[0m for declaration-assignment, or is a type missing?";
+    } else if (strstr(s, "unexpected RETURN")) {
+        hint = "misplaced \033[1;36mreturn\033[0m — is it outside a function body?";
+    } else if (strstr(s, "unexpected IF") || strstr(s, "unexpected WHILE") || strstr(s, "unexpected FOR")) {
+        hint = "control-flow keyword in an unexpected position — check surrounding braces and semicolons";
+    } else if (strstr(s, "unexpected NEW")) {
+        hint = "unexpected \033[1;36mnew\033[0m — did you forget an \033[1;36m=\033[0m or \033[1;36m:=\033[0m before it?";
+    } else if (strstr(s, "unexpected CLASS")) {
+        hint = "unexpected \033[1;36mclass\033[0m — class declarations must appear at the top level";
+    } else if (strstr(s, "unexpected PIPE") || strstr(s, "unexpected '|'")) {
+        hint = "unexpected \033[1;36m|\033[0m — pipe types are only valid inside \033[1;36mmulti<...>\033[0m";
+    } else if (strstr(s, "unexpected NUMBER") || strstr(s, "unexpected STRING_LITERAL")) {
+        hint = "a literal appeared where it wasn't expected — check for a missing operator or \033[1;36m;\033[0m";
+    } else if (strstr(s, "syntax error")) {
+        hint = "double-check the statement for missing semicolons, mismatched brackets, or incorrect type syntax";
+    }
+
+    if (hint) {
+        fprintf(stderr, "  \033[1;33mhint:\033[0m %s\n", hint);
+    }
+}
 
 ProgramNode* root = NULL;
 
@@ -55,6 +103,8 @@ void typelist_add(TypeList* l, Type t) {
 
 %code requires { #include "ast.h" }
 
+%define parse.error verbose
+
 %union {
     char* str;
     int num;
@@ -91,7 +141,7 @@ void typelist_add(TypeList* l, Type t) {
 %type <func_node> func_decl
 %type <field_node> field_decl
 %type <type_node> type
-%type <node> expr stmt return_stmt var_decl member_decl for_init
+%type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
 %type <node_list> class_body stmt_list param_list params arg_list args union_types include_list
 %type <node> include_path
 
@@ -203,8 +253,15 @@ class_decl:
                 $$->fields = realloc($$->fields, ($$->field_count+1)*sizeof(FieldNode*));
                 $$->fields[$$->field_count++] = (FieldNode*)m;
             } else if (m->type == NODE_METHOD) {
-                $$->methods = realloc($$->methods, ($$->method_count+1)*sizeof(MethodNode*));
-                $$->methods[$$->method_count++] = (MethodNode*)m;
+                MethodNode* mn = (MethodNode*)m;
+                if (mn->return_type.name && strcmp(mn->return_type.name, "__ctor__") == 0) {
+                    $$->ctor_params = mn->params; $$->ctor_param_count = mn->param_count;
+                    $$->ctor_body = mn->body; $$->ctor_body_count = mn->body_count;
+                    $$->has_ctor = 1;
+                } else {
+                    $$->methods = realloc($$->methods, ($$->method_count+1)*sizeof(MethodNode*));
+                    $$->methods[$$->method_count++] = mn;
+                }
             }
         }
         free(body->items); free(body);
@@ -218,8 +275,15 @@ class_decl:
                 $$->fields = realloc($$->fields, ($$->field_count+1)*sizeof(FieldNode*));
                 $$->fields[$$->field_count++] = (FieldNode*)m;
             } else if (m->type == NODE_METHOD) {
-                $$->methods = realloc($$->methods, ($$->method_count+1)*sizeof(MethodNode*));
-                $$->methods[$$->method_count++] = (MethodNode*)m;
+                MethodNode* mn = (MethodNode*)m;
+                if (mn->return_type.name && strcmp(mn->return_type.name, "__ctor__") == 0) {
+                    $$->ctor_params = mn->params; $$->ctor_param_count = mn->param_count;
+                    $$->ctor_body = mn->body; $$->ctor_body_count = mn->body_count;
+                    $$->has_ctor = 1;
+                } else {
+                    $$->methods = realloc($$->methods, ($$->method_count+1)*sizeof(MethodNode*));
+                    $$->methods[$$->method_count++] = mn;
+                }
             }
         }
         free(body->items); free(body);
@@ -285,16 +349,34 @@ func_decl:
         if ($5) { NodeList* pl=(NodeList*)$5; $$->params=pl->items; $$->param_count=pl->count; free(pl); }
         NodeList* sl=(NodeList*)$8; $$->body=sl->items; $$->body_count=sl->count; free(sl);
     }
+    /* error recovery: a bad function signature — skip to the closing brace */
+    | error LBRACE stmt_list RBRACE {
+        $$ = make_func(make_simple_type("void", 0), "<error>");
+        yyerrok;
+    }
     ;
 
 class_body:
-    member_decl { NodeList* l=list_new(); list_add(l,$1); $$=l; }
-    | class_body member_decl { NodeList* l=(NodeList*)$1; list_add(l,$2); $$=l; }
+    member_decl { NodeList* l=list_new(); if ($1) list_add(l,$1); $$=l; }
+    | class_body member_decl { NodeList* l=(NodeList*)$1; if ($2) list_add(l,$2); $$=l; }
     ;
 
 member_decl:
     field_decl  { $$ = (ASTNode*)$1; }
     | method_decl { $$ = (ASTNode*)$1; }
+    | ctor_decl { $$ = (ASTNode*)$1; }
+    /* error recovery: skip a malformed member up to the next '}' or ';' */
+    | error SEMICOLON { $$ = NULL; yyerrok; }
+    ;
+
+ctor_decl:
+    IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
+        Type void_t; memset(&void_t, 0, sizeof(void_t)); void_t.kind = TYPE_SIMPLE; void_t.name = strdup("__ctor__");
+        MethodNode* mn = make_method(void_t, $1);
+        if ($3) { NodeList* pl=(NodeList*)$3; mn->params=pl->items; mn->param_count=pl->count; free(pl); }
+        NodeList* sl=(NodeList*)$6; mn->body=sl->items; mn->body_count=sl->count; free(sl);
+        $$ = (ASTNode*)mn;
+    }
     ;
 
 field_decl:
@@ -401,6 +483,8 @@ stmt_list:
 stmt:
     var_decl
     | return_stmt
+    /* error recovery: skip a malformed statement up to the next ';' */
+    | error SEMICOLON { $$ = NULL; yyerrok; }
     | BREAK SEMICOLON    { $$ = (ASTNode*)make_break(); }
     | CONTINUE SEMICOLON { $$ = (ASTNode*)make_continue(); }
     | ASM_BLOCK {
@@ -461,7 +545,7 @@ stmt:
         $$ = (ASTNode*)wn;
     }
     /* for */
-    | FOR LPAREN for_init SEMICOLON expr SEMICOLON expr RPAREN LBRACE stmt_list RBRACE {
+    | FOR LPAREN for_init SEMICOLON expr SEMICOLON for_init RPAREN LBRACE stmt_list RBRACE {
         ForNode* fn = make_for($3, $5, $7);
         NodeList* sl=(NodeList*)$10; fn->body=sl->items; fn->body_count=sl->count; free(sl);
         $$ = (ASTNode*)fn;

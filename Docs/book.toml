@@ -1,0 +1,20 @@
+[book]
+title = "Hylian"
+description = "The Hylian programming language — reference and standard library documentation"
+authors = []
+language = "en"
+src = "."
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = ""
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
