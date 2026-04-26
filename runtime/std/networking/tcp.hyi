@@ -1,0 +1,113 @@
+// Hylian standard library interface — std.networking.tcp
+// Hylian runtime TCP networking interface
+//
+// Provides a low-level, fd-based TCP networking API for both clients and servers.
+// All network I/O is built around integer file descriptors (fds): connect or
+// accept returns an fd, which is then passed to send/recv/close and the various
+// socket-option helpers.
+//
+// Usage:
+//   include {
+//       std.networking.tcp,
+//   }
+
+module std.networking.tcp
+
+// Connect to a remote host and port over TCP.
+// host may be an IPv4 address, IPv6 address, or a hostname (resolved via DNS).
+// Returns a socket fd (>= 0) on success, or -1 on error.
+//
+// Example:
+//   int fd = tcp_connect("example.com", 80);
+//   if (fd < 0) {
+//       panic("could not connect");
+//   }
+fn tcp_connect(host: str, port: int) -> int
+
+// Start a TCP server listening on all interfaces at the given port.
+// backlog controls the maximum number of pending (not yet accepted) connections.
+// Returns a listener fd (>= 0) on success, or -1 on error.
+// SO_REUSEADDR is set automatically so the port can be reused immediately after
+// the server exits.
+//
+// Example:
+//   int listener = tcp_listen(8080, 128);
+//   if (listener < 0) {
+//       panic("could not bind port 8080");
+//   }
+fn tcp_listen(port: int, backlog: int) -> int
+
+// Accept the next incoming connection on a listener fd created by tcp_listen.
+// Blocks until a client connects (unless the listener is set non-blocking).
+// Returns a new client socket fd (>= 0) on success, or -1 on error.
+//
+// Example:
+//   int client = tcp_accept(listener);
+//   if (client < 0) {
+//       panic("accept failed");
+//   }
+fn tcp_accept(listener_fd: int) -> int
+
+// Send up to len bytes from buf on the socket fd.
+// Returns the number of bytes actually sent (which may be less than len),
+// or -1 on error.
+//
+// Example:
+//   int sent = tcp_send(fd, "hello", 5);
+//   if (sent < 0) {
+//       panic("send failed");
+//   }
+fn tcp_send(fd: int, buf: str, len: int) -> int
+
+// Receive up to buf_len bytes from the socket fd into buf.
+// Returns the number of bytes received, 0 if the remote end closed the
+// connection cleanly, or -1 on error.
+//
+// Example:
+//   array<int, 1024> buf;
+//   int n = tcp_recv(fd, buf, 1024);
+//   if (n < 0) {
+//       panic("recv failed");
+//   }
+fn tcp_recv(fd: int, buf: str, buf_len: int) -> int
+
+// Close a socket fd and release its resources.
+// Should be called on both client fds (from tcp_connect / tcp_accept) and
+// listener fds (from tcp_listen) when they are no longer needed.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   tcp_close(fd);
+fn tcp_close(fd: int) -> int
+
+// Set a socket to non-blocking (nonblocking = 1) or blocking (nonblocking = 0) mode.
+// In non-blocking mode, tcp_send, tcp_recv, and tcp_accept return -1 immediately
+// instead of waiting when the operation cannot complete right away.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   tcp_set_nonblocking(fd, 1); // make non-blocking
+//   tcp_set_nonblocking(fd, 0); // restore blocking
+fn tcp_set_nonblocking(fd: int, nonblocking: int) -> int
+
+// Set or clear SO_REUSEADDR on a socket (enable = 1 to set, 0 to clear).
+// When set, the port used by this socket can be rebound immediately after the
+// socket is closed — useful for servers that restart frequently.
+// tcp_listen sets this automatically; this function is provided for manual
+// socket management.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   tcp_set_reuseaddr(fd, 1);
+fn tcp_set_reuseaddr(fd: int, enable: int) -> int
+
+// Set a send or receive timeout on a socket.
+// which: 0 = receive timeout, 1 = send timeout.
+// ms: timeout in milliseconds; 0 disables the timeout.
+// If an operation exceeds the timeout it returns -1 (errno = EAGAIN/EWOULDBLOCK).
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   tcp_set_timeout(fd, 0, 5000); // 5-second receive timeout
+//   tcp_set_timeout(fd, 1, 5000); // 5-second send timeout
+fn tcp_set_timeout(fd: int, which: int, ms: int) -> int

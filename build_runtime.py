@@ -2,17 +2,13 @@
 """
 build_runtime.py — Hylian runtime build script
 
-Scans the runtime/ directory for:
-  - .c  files -> compiles to .o via gcc -O2 -c
-  - .asm files -> assembles to .o via nasm (if no .o already exists)
-
-If a .c and .asm file share the same stem, the .c takes priority.
+Scans the runtime/ directory tree for .c files and compiles each one to a
+corresponding .o object file using gcc.
 
 Usage:
-  python3 build_runtime.py [--target linux|macos|windows] [--force] [--verbose]
+  python3 build_runtime.py [--force] [--verbose] [--clean]
 
 Options:
-  --target   Platform to build for (default: linux)
   --force    Recompile all files even if .o is up to date
   --verbose  Print each command before running it
   --clean    Remove all generated .o files
@@ -20,17 +16,10 @@ Options:
 
 import argparse
 import os
-import platform
 import subprocess
 import sys
 
-# ── Format mappings ───────────────────────────────────────────────────────────
-
-NASM_FORMATS = {
-    "linux": "elf64",
-    "macos": "macho64",
-    "windows": "win64",
-}
+# ── Build flags ───────────────────────────────────────────────────────────────
 
 GCC_FLAGS = ["-O2", "-c"]
 
@@ -69,27 +58,17 @@ def obj_path(src):
 # ── Discovery ─────────────────────────────────────────────────────────────────
 
 
-def find_sources(runtime_dir):
+def find_c_sources(runtime_dir):
     """
-    Walk the runtime directory and return two dicts:
-      c_files   : { stem_path -> full .c path }
-      asm_files : { stem_path -> full .asm path }
-
-    stem_path is the path without extension, used to detect conflicts.
+    Walk the runtime directory and return a list of all .c source paths,
+    sorted alphabetically.
     """
-    c_files = {}
-    asm_files = {}
-
+    sources = []
     for dirpath, _, filenames in os.walk(runtime_dir):
-        for fname in filenames:
-            full = os.path.join(dirpath, fname)
-            stem, ext = os.path.splitext(full)
-            if ext == ".c":
-                c_files[stem] = full
-            elif ext == ".asm":
-                asm_files[stem] = full
-
-    return c_files, asm_files
+        for fname in sorted(filenames):
+            if fname.endswith(".c"):
+                sources.append(os.path.join(dirpath, fname))
+    return sources
 
 
 # ── Build ─────────────────────────────────────────────────────────────────────
@@ -104,20 +83,6 @@ def build_c(src, force, verbose):
 
     print(f"  CC  {os.path.relpath(src)}")
     cmd = ["gcc"] + GCC_FLAGS + [src, "-o", out]
-    ok = run(cmd, verbose)
-    return ok, True
-
-
-def build_asm(src, target, force, verbose):
-    out = obj_path(src)
-    if not force and not is_stale(src, out):
-        if verbose:
-            print(f"  up-to-date: {os.path.relpath(out)}")
-        return True, False
-
-    fmt = NASM_FORMATS.get(target, "elf64")
-    print(f"  ASM {os.path.relpath(src)}")
-    cmd = ["nasm", "-f", fmt, src, "-o", out]
     ok = run(cmd, verbose)
     return ok, True
 
@@ -141,23 +106,8 @@ def clean(runtime_dir, verbose):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
-def detect_target():
-    s = platform.system().lower()
-    if s == "darwin":
-        return "macos"
-    if s == "windows":
-        return "windows"
-    return "linux"
-
-
 def main():
     parser = argparse.ArgumentParser(description="Build Hylian runtime objects")
-    parser.add_argument(
-        "--target",
-        choices=["linux", "macos", "windows"],
-        default=detect_target(),
-        help="Target platform (default: auto-detected)",
-    )
     parser.add_argument(
         "--force",
         action="store_true",
@@ -184,19 +134,15 @@ def main():
         clean(RUNTIME_DIR, args.verbose)
         return
 
-    print(f"Building Hylian runtime (target={args.target})")
+    print("Building Hylian runtime")
 
-    c_files, asm_files = find_sources(RUNTIME_DIR)
-
-    # C files that have a .o already pre-built should be shown as skipped
-    # unless --force is set.
+    sources = find_c_sources(RUNTIME_DIR)
 
     errors = 0
     compiled = 0
     skipped = 0
 
-    # ── Compile C files first ─────────────────────────────────────────────────
-    for stem, src in sorted(c_files.items()):
+    for src in sources:
         ok, did_work = build_c(src, args.force, args.verbose)
         if not ok:
             errors += 1
@@ -205,23 +151,6 @@ def main():
         else:
             skipped += 1
 
-    # ── Assemble .asm files — skip if a .c (and thus .o) already covers it ────
-    for stem, src in sorted(asm_files.items()):
-        if stem in c_files:
-            # C file takes priority — its .o is already built above
-            if args.verbose:
-                print(f"  skip (C override): {os.path.relpath(src)}")
-            continue
-
-        ok, did_work = build_asm(src, args.target, args.force, args.verbose)
-        if not ok:
-            errors += 1
-        elif did_work:
-            compiled += 1
-        else:
-            skipped += 1
-
-    # ── Summary ───────────────────────────────────────────────────────────────
     print()
     if errors:
         print(f"Done: {compiled} compiled, {skipped} up-to-date, {errors} FAILED")

@@ -1,5 +1,5 @@
 // Hylian standard library interface — std.errors
-// Auto-generated from errors_linux.asm
+// Hylian runtime errors interface
 //
 // Usage:
 //   include {

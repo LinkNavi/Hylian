@@ -406,6 +406,13 @@ stmt:
     | ASM_BLOCK {
         AsmBlockNode *ab = malloc(sizeof(AsmBlockNode));
         ab->base.type = NODE_ASM_BLOCK;
+        ab->base.resolved_type.kind = TYPE_SIMPLE;
+        ab->base.resolved_type.nullable = 0;
+        ab->base.resolved_type.name = NULL;
+        ab->base.resolved_type.elem_types = NULL;
+        ab->base.resolved_type.elem_type_count = 0;
+        ab->base.resolved_type.is_any = 0;
+        ab->base.resolved_type.fixed_size = 0;
         ab->body = $1;
         $$ = (ASTNode*)ab;
     }

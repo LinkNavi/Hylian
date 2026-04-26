@@ -1,0 +1,160 @@
+// Hylian standard library interface — std.networking.udp
+// UDP (User Datagram Protocol) networking interface
+//
+// UDP is a connectionless, unreliable transport protocol. Datagrams may be
+// lost, duplicated, or delivered out of order. It offers low overhead and
+// is well suited to latency-sensitive applications such as games, streaming,
+// and DNS queries.
+//
+// Usage:
+//   include {
+//       std.networking.udp,
+//   }
+
+module std.networking.udp
+
+// Create a new UDP socket.
+// Returns a socket file descriptor (fd) on success, or -1 on error.
+// The returned fd must be passed to all subsequent udp_* functions and
+// closed with udp_close() when no longer needed.
+//
+// Example:
+//   int fd = udp_socket();
+//   if (fd < 0) {
+//       panic("failed to create UDP socket");
+//   }
+fn udp_socket() -> int
+
+// Bind a UDP socket to the given local port on all interfaces.
+// Must be called before udp_recv_from() if you want to receive datagrams.
+// Returns 0 on success, or -1 on error (e.g. port already in use).
+//
+// Example:
+//   int rc = udp_bind(fd, 9000);
+//   if (rc < 0) {
+//       panic("bind failed");
+//   }
+fn udp_bind(fd: int, port: int) -> int
+
+// Send a datagram containing buf to host:port through fd.
+// host does not need to be null-terminated. Because UDP is connectionless,
+// each call may specify a different destination. Datagrams may not arrive.
+// Returns the number of bytes sent on success, or -1 on error.
+//
+// Example:
+//   int sent = udp_send_to(fd, "192.168.1.10", 5000, "ping");
+//   if (sent < 0) {
+//       println("send_to failed");
+//   }
+fn udp_send_to(fd: int, host: str, port: int, buf: str) -> int
+
+// Receive one datagram into buf (up to buf_len bytes) from any sender.
+// Blocks until a datagram arrives unless the socket is non-blocking.
+// Writes the sender's IP address (null-terminated) into src_addr_buf.
+// src_addr_buf should be at least 46 bytes to hold any IPv4 or IPv6 address.
+// Writes the sender's port number into src_port_out.
+// Returns the number of bytes received on success, or -1 on error.
+// Note: if the datagram is larger than buf_len, excess bytes are silently discarded.
+//
+// Example:
+//   str buf;
+//   str sender_ip;
+//   int sender_port;
+//   int n = udp_recv_from(fd, buf, sender_ip, sender_port);
+//   if (n >= 0) {
+//       println("got {{n}} bytes from {{sender_ip}}:{{sender_port}}");
+//   }
+fn udp_recv_from(fd: int, buf: str, src_addr_buf: str, src_port_out: int) -> int
+
+// Associate a UDP socket with a fixed remote address (host:port).
+// After connecting, udp_send() and udp_recv() can be used without specifying
+// an address on each call. The socket still uses UDP — datagrams may be lost.
+// host does not need to be null-terminated.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   int rc = udp_connect(fd, "10.0.0.1", 8080);
+//   if (rc < 0) {
+//       panic("connect failed");
+//   }
+fn udp_connect(fd: int, host: str, port: int) -> int
+
+// Send buf over a socket that was previously "connected" with udp_connect().
+// The destination is the address fixed at connect time.
+// Datagrams may be lost or reordered in transit.
+// Returns the number of bytes sent on success, or -1 on error.
+//
+// Example:
+//   int sent = udp_send(fd, "hello");
+//   if (sent < 0) {
+//       println("send failed");
+//   }
+fn udp_send(fd: int, buf: str) -> int
+
+// Receive a datagram over a socket that was previously "connected" with udp_connect().
+// Only datagrams from the connected remote address are delivered.
+// Blocks until a datagram arrives unless the socket is non-blocking.
+// Returns the number of bytes received on success, or -1 on error.
+//
+// Example:
+//   str buf;
+//   int n = udp_recv(fd, buf);
+//   if (n >= 0) {
+//       println("received {{n}} bytes");
+//   }
+fn udp_recv(fd: int, buf: str) -> int
+
+// Close a UDP socket and release its file descriptor.
+// The fd must not be used after this call.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   udp_close(fd);
+fn udp_close(fd: int) -> int
+
+// Set a socket's blocking mode.
+// Pass nonblocking=1 to make send/recv calls return immediately rather than
+// blocking when the socket is not ready. Pass 0 to restore blocking mode.
+// In non-blocking mode, udp_send/udp_recv return -1 when they would block.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   udp_set_nonblocking(fd, 1);
+fn udp_set_nonblocking(fd: int, nonblocking: int) -> int
+
+// Set a receive or send timeout on the socket.
+// which=0 sets the receive timeout (SO_RCVTIMEO).
+// which=1 sets the send timeout (SO_SNDTIMEO).
+// ms is the timeout duration in milliseconds. Pass 0 to disable the timeout.
+// After the timeout elapses, the blocked call returns -1.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   udp_set_timeout(fd, 0, 2000); // 2-second receive timeout
+fn udp_set_timeout(fd: int, which: int, ms: int) -> int
+
+// Enable or disable broadcasting on the socket (SO_BROADCAST).
+// Pass enable=1 to allow sending datagrams to broadcast addresses
+// (e.g. 255.255.255.255). Pass 0 to disable.
+// Broadcast datagrams are delivered to all hosts on the local network
+// segment but, like all UDP, may be lost or ignored.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   udp_set_broadcast(fd, 1);
+//   udp_send_to(fd, "255.255.255.255", 9999, "announce");
+fn udp_set_broadcast(fd: int, enable: int) -> int
+
+// Join an IPv4 multicast group, causing the socket to receive datagrams
+// sent to that multicast address. group_addr must be a valid IPv4 multicast
+// address string in dotted-decimal notation (e.g. "239.0.0.1").
+// group_addr does not need to be null-terminated.
+// Multiple groups may be joined on the same socket.
+// Returns 0 on success, or -1 on error.
+//
+// Example:
+//   int rc = udp_join_multicast(fd, "239.0.0.1");
+//   if (rc < 0) {
+//       panic("failed to join multicast group");
+//   }
+fn udp_join_multicast(fd: int, group_addr: str) -> int

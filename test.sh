@@ -13,7 +13,7 @@ echo "=== Building Hylian Compiler ==="
 cd src
 bison -d parser.y
 flex lexer.l
-gcc lex.yy.c parser.tab.c ast.c codegen_asm.c compiler.c -o ../hylian
+gcc lex.yy.c parser.tab.c ast.c codegen_asm.c typecheck.c compiler.c -o ../hylian
 cd ..
 echo -e "${GREEN}✓ Build successful${NC}\n"
 
@@ -42,7 +42,7 @@ resolve_runtime_obj() {
 }
 
 echo "=== Resolving IO Runtime ==="
-resolve_runtime_obj "runtime/std/io_linux" "io_runtime.o"
+resolve_runtime_obj "runtime/std/io" "io_runtime.o"
 echo ""
 
 PASS=0

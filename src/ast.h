@@ -36,8 +36,6 @@ typedef enum {
     NODE_ASM_BLOCK,
 } NodeType;
 
-typedef struct ASTNode { NodeType type; } ASTNode;
-
 typedef enum {
     TYPE_SIMPLE,   /* int, str, bool, void, Error, ClassName */
     TYPE_ARRAY,    /* array<T> or array<T, N> */
@@ -55,6 +53,8 @@ typedef struct Type {
     int is_any;               /* multi<any> */
     int fixed_size;           /* 0 = flexible, >0 = fixed */
 } Type;
+
+typedef struct ASTNode { NodeType type; Type resolved_type; } ASTNode;
 
 typedef struct {
     ASTNode base;

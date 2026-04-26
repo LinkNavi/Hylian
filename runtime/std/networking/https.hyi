@@ -1,0 +1,145 @@
+// Hylian standard library interface — std.networking.https
+//
+// HTTPS networking backed by OpenSSL TLS over a plain TCP socket.
+//
+// Two layers of API are provided:
+//
+//   High-level (one-shot requests):
+//     https_get  — send a GET request and collect the full response
+//     https_post — send a POST request and collect the full response
+//
+//   Low-level (streaming / handle-based):
+//     https_connect — open a persistent TLS connection, returns a handle
+//     https_send    — write raw bytes over an open TLS connection
+//     https_recv    — read raw bytes from an open TLS connection
+//     https_close   — shut down a TLS connection and free its resources
+//
+//   Response parsing helpers:
+//     https_body   — extract the body from a raw HTTP response buffer
+//     https_status — extract the HTTP status code from a raw HTTP response buffer
+//
+// For most use cases, https_get and https_post are all you need.
+// The handle-based API is intended for streaming responses, keep-alive
+// sessions, or any situation where you need fine-grained control over the
+// TLS connection lifecycle.
+//
+// Usage:
+//   include {
+//       std.networking.https,
+//   }
+//
+// Linking requires: -lssl -lcrypto
+
+module std.networking.https
+
+// ── High-level convenience functions ─────────────────────────────────────────
+
+// Perform a complete HTTPS GET request to https://<host><path>.
+// The full response — status line, headers, and body — is written into out_buf.
+// Certificate verification is always enabled.
+// Returns the total number of bytes written into out_buf, or -1 on error.
+//
+// Example:
+//   array<int, 65536> buf;
+//   int n = https_get("api.example.com", "/v1/status", buf);
+//   if (n < 0) {
+//       panic("GET failed");
+//   }
+//   println("response: {{buf}}");
+fn https_get(host: str, path: str, out_buf: str) -> int
+
+// Perform a complete HTTPS POST request to https://<host><path>.
+// content_type is the value of the Content-Type header (e.g. "application/json").
+// body is the raw request body bytes.
+// The full response is written into out_buf.
+// Certificate verification is always enabled.
+// Returns the total number of bytes written into out_buf, or -1 on error.
+//
+// Example:
+//   array<int, 65536> buf;
+//   str payload = "{\"key\": \"value\"}";
+//   int n = https_post("api.example.com", "/v1/data", "application/json", payload, buf);
+//   if (n < 0) {
+//       panic("POST failed");
+//   }
+fn https_post(host: str, path: str, content_type: str, body: str, out_buf: str) -> int
+
+// ── Low-level handle-based API ────────────────────────────────────────────────
+
+// Open a TLS connection to host:port.
+// verify_peer: 1 = verify the server certificate (recommended), 0 = skip verification.
+// Returns an opaque connection handle (>= 0) on success, or -1 on error.
+// The handle must be released with https_close when no longer needed.
+// Handles are a limited resource (max 64 open at a time); always close them.
+//
+// Example:
+//   int handle = https_connect("example.com", 443, 1);
+//   if (handle < 0) {
+//       panic("TLS connect failed");
+//   }
+fn https_connect(host: str, port: int, verify_peer: int) -> int
+
+// Send len bytes from buf over the TLS connection identified by handle.
+// Returns the number of bytes sent, or -1 on error.
+//
+// Example:
+//   str req = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+//   int sent = https_send(handle, req, len(req));
+//   if (sent < 0) {
+//       panic("send failed");
+//   }
+fn https_send(handle: int, buf: str, len: int) -> int
+
+// Receive up to buf_len bytes from the TLS connection into buf.
+// Returns bytes received (> 0), 0 if the remote end closed the connection
+// cleanly, or -1 on error.
+//
+// Example:
+//   array<int, 4096> buf;
+//   int n = https_recv(handle, buf, 4096);
+//   if (n < 0) {
+//       panic("recv failed");
+//   }
+//   if (n == 0) {
+//       println("connection closed");
+//   }
+fn https_recv(handle: int, buf: str, buf_len: int) -> int
+
+// Close the TLS connection identified by handle and release all associated
+// resources. Returns 0 on success, or -1 on error.
+// After this call the handle value is invalid and must not be reused.
+//
+// Example:
+//   https_close(handle);
+fn https_close(handle: int) -> int
+
+// ── Response parsing helpers ──────────────────────────────────────────────────
+
+// Extract the HTTP response body from a raw response buffer (headers + body).
+// Scans for the blank line (\r\n\r\n) that separates headers from the body,
+// then copies everything after it into out_buf.
+// Returns the body length in bytes, or -1 if no header/body separator was found.
+//
+// Example:
+//   array<int, 65536> response;
+//   array<int, 65536> body;
+//   int n = https_get("example.com", "/", response);
+//   int body_len = https_body(response, n, body);
+//   if (body_len < 0) {
+//       panic("could not find response body");
+//   }
+fn https_body(response: str, response_len: int, out_buf: str) -> int
+
+// Extract the HTTP status code from a raw response buffer.
+// Parses the status code from the first line of the response
+// (expected format: "HTTP/1.x NNN Reason Phrase").
+// Returns the status code (e.g. 200, 404, 500), or -1 on parse error.
+//
+// Example:
+//   array<int, 65536> response;
+//   int n = https_get("example.com", "/", response);
+//   int status = https_status(response, n);
+//   if (status != 200) {
+//       println("unexpected status: {{status}}");
+//   }
+fn https_status(response: str, response_len: int) -> int

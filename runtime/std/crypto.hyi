@@ -1,0 +1,75 @@
+// Hylian standard library interface — std.crypto
+//
+// Cryptographic primitives backed by OpenSSL.
+// Includes hashing, HMAC, authenticated encryption, and a CSPRNG.
+//
+// Usage:
+//   include {
+//       std.crypto,
+//   }
+//
+// Linking requires: -lssl -lcrypto
+
+module std.crypto
+
+// ── Hashing ───────────────────────────────────────────────────────────────────
+
+// Hash `input` using the named algorithm ("sha256", "sha512", "sha1", "md5").
+// Returns the raw digest bytes written into a caller-supplied buffer.
+// Returns the number of bytes written, or -1 on error.
+fn crypto_hash(algorithm: str, input: str, out_buf: str) -> int
+
+// Like crypto_hash but returns a lowercase hex string.
+// Returns the number of hex characters written, or -1 on error.
+fn crypto_hash_hex(algorithm: str, input: str, out_buf: str) -> int
+
+// ── HMAC ──────────────────────────────────────────────────────────────────────
+
+// Compute HMAC of `input` with `key` using the named digest algorithm.
+// Writes raw digest bytes into out_buf.
+// Returns bytes written, or -1 on error.
+fn crypto_hmac(algorithm: str, key: str, input: str, out_buf: str) -> int
+
+// Like crypto_hmac but writes a lowercase hex string into out_buf.
+// Returns hex char count, or -1 on error.
+fn crypto_hmac_hex(algorithm: str, key: str, input: str, out_buf: str) -> int
+
+// ── Authenticated Encryption (AES-256-GCM) ───────────────────────────────────
+
+// Encrypt `plaintext` using AES-256-GCM.
+//   key     — must be exactly 32 bytes
+//   iv      — must be exactly 12 bytes (use crypto_random_bytes to generate)
+//   out_buf — must be at least len(plaintext) + 16 bytes
+//             layout: [ciphertext][16-byte auth tag]
+// Returns total bytes written (plaintext_len + 16), or -1 on error.
+fn crypto_encrypt(key: str, iv: str, plaintext: str, out_buf: str) -> int
+
+// Decrypt AES-256-GCM ciphertext produced by crypto_encrypt.
+//   key        — 32 bytes
+//   iv         — 12 bytes (same as used for encryption)
+//   ciphertext — ciphertext bytes followed immediately by the 16-byte auth tag
+//   out_buf    — must be at least len(ciphertext) bytes
+// Returns plaintext length on success, or -1 if decryption or tag check fails.
+fn crypto_decrypt(key: str, iv: str, ciphertext: str, out_buf: str) -> int
+
+// ── Random ────────────────────────────────────────────────────────────────────
+
+// Fill `buf` with `len` cryptographically secure random bytes (CSPRNG).
+// Returns len on success, -1 on failure.
+fn crypto_random_bytes(buf: str, len: int) -> int
+
+// Return a cryptographically secure random integer in [0, max).
+// Returns -1 if max <= 0 or on RNG failure.
+fn crypto_random_int(max: int) -> int
+
+// Return a cryptographically secure random float in [0.0, 1.0).
+// The return value is the bit-pattern of a double reinterpreted as int.
+// Cast it back to float in Hylian: float f = bits_to_float(crypto_random_float())
+fn crypto_random_float() -> int
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+// Compare two byte buffers of equal length in constant time.
+// Use this to compare MACs or digests to prevent timing attacks.
+// Returns 1 if equal, 0 if not.
+fn crypto_constant_time_eq(a: str, b: str, len: int) -> int

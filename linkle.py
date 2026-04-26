@@ -441,70 +441,56 @@ class BuildError(Exception):
 # ─────────────────────────────────────────────────────────────────────────────
 
 STD_MODULES = [
-    {
-        "include": "std.io",
-        "stems": {
-            "linux": "io_linux",
-            "macos": "io_macos",
-            "windows": "io_windows",
-        },
-        "is_c": False,
-    },
-    {
-        "include": "std.errors",
-        "stems": {
-            "linux": "errors_linux",
-            "macos": "errors_macos",
-            "windows": "errors_windows",
-        },
-        "is_c": False,
-    },
-    {
-        "include": "std.strings",
-        "stems": {
-            "linux": "strings_linux",
-            "macos": "strings_macos",
-            "windows": "strings_windows",
-        },
-        "is_c": False,
-    },
+    {"include": "std.io", "stem": "io", "link_libs": []},
+    {"include": "std.errors", "stem": "errors", "link_libs": []},
+    {"include": "std.strings", "stem": "strings", "link_libs": []},
     {
         "include": "std.system.filesystem",
-        "stems": {
-            "default": os.path.join("system", "filesystem_linux"),
-        },
-        "is_c": True,
+        "stem": os.path.join("system", "filesystem"),
+        "link_libs": [],
     },
     {
         "include": "std.system.env",
-        "stems": {
-            "linux": os.path.join("system", "env_linux"),
-            "macos": os.path.join("system", "env_macos"),
-            "windows": os.path.join("system", "env_windows"),
-        },
-        "is_c": False,
+        "stem": os.path.join("system", "env"),
+        "link_libs": [],
+    },
+    {"include": "std.crypto", "stem": "crypto", "link_libs": ["-lssl", "-lcrypto"]},
+    {
+        "include": "std.networking.tcp",
+        "stem": os.path.join("networking", "tcp"),
+        "link_libs": [],
+    },
+    {
+        "include": "std.networking.udp",
+        "stem": os.path.join("networking", "udp"),
+        "link_libs": [],
+    },
+    {
+        "include": "std.networking.https",
+        "stem": os.path.join("networking", "https"),
+        "link_libs": ["-lssl", "-lcrypto"],
     },
 ]
 
 
-def _stem_for(mod, target):
-    stems = mod["stems"]
-    return stems.get(target) or stems.get("default") or next(iter(stems.values()))
-
-
 def _collect_runtime_objs(includes, target, verbose):
     """
-    Given the list of std.* includes found in the source, return a list of
-    resolved .o paths for all needed runtime modules.
+    Given the list of std.* includes found in the source, return a tuple of
+    (list of resolved .o paths, list of extra linker flags) for all needed
+    runtime modules.
     """
     needed = set(includes)
     objs = []
+    extra_libs = []
     for mod in STD_MODULES:
         if mod["include"] not in needed:
             continue
-        stem = _stem_for(mod, target)
+        stem = mod["stem"]
         objs.append(_runtime_obj(stem, target, verbose))
-    return objs
+        for lib in mod.get("link_libs", []):
+            if lib not in extra_libs:
+                extra_libs.append(lib)
+    return objs, extra_libs
 
 
 def _scan_includes(hy_file):
@@ -577,11 +563,12 @@ def cmd_build(cfg, target, verbose, project_root):
 
     # ── Step 3: resolve runtime objects ───────────────────────────────────────
     includes = _scan_includes(main_hy)
-    runtime_objs = _collect_runtime_objs(includes, target, verbose)
+    runtime_objs, extra_libs = _collect_runtime_objs(includes, target, verbose)
 
     # ── Step 4: link ──────────────────────────────────────────────────────────
     info(f"Linking    {os.path.relpath(bin_out)}")
     link_cmd = ["gcc", out_obj] + runtime_objs + ["-o", bin_out]
+    link_cmd += extra_libs
 
     if target != "windows":
         link_cmd.append("-no-pie")

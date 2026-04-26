@@ -4,6 +4,7 @@
 
 #include "ast.h"
 #include "codegen_asm.h"
+#include "typecheck.h"
 #include <string.h>
 
 /* ─── External parser interface ─────────────────────────────────────────────── */
@@ -240,6 +241,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    typecheck(program);
     codegen_asm(program, out, input_file, target);
     fclose(out);
     printf("Generated %s\n", output_file);

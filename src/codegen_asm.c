@@ -10,6 +10,35 @@ static const char *current_target    = "linux";
 static int         io_included        = 0; /* set to 1 when std.io is in the include list */
 static const char *current_class_name = NULL; /* set while emitting a class method/ctor */
 
+/* Runtime call-name rewrite table: populated by codegen_asm() once the
+   module list is known.
+   src_prefix  — the prefix as written in Hylian source (e.g. "crypto_")
+   abi_prefix  — the full ABI symbol prefix (e.g. "hylian_crypto_")
+   So "crypto_hash" -> "hylian_crypto_hash",
+      "tcp_connect" -> "hylian_net_tcp_connect", etc. */
+#define MAX_FN_PREFIXES 32
+typedef struct {
+    const char *src_prefix; /* prefix as seen in Hylian source */
+    const char *abi_prefix; /* full prefix of the C symbol        */
+} FnPrefix;
+static FnPrefix fn_prefixes[MAX_FN_PREFIXES];
+static int      fn_prefix_count = 0;
+
+/* Rewrite a Hylian source call name to its runtime symbol name.
+   Strips src_prefix and prepends abi_prefix. */
+static const char *rewrite_call_name(const char *name) {
+    static char buf[256];
+    for (int i = 0; i < fn_prefix_count; i++) {
+        size_t plen = strlen(fn_prefixes[i].src_prefix);
+        if (strncmp(name, fn_prefixes[i].src_prefix, plen) == 0) {
+            snprintf(buf, sizeof(buf), "%s%s",
+                     fn_prefixes[i].abi_prefix, name + plen);
+            return buf;
+        }
+    }
+    return name;
+}
+
 /* Returns the symbol name with a leading underscore on macOS, plain otherwise. */
 static const char *sym(const char *name) {
     static char buf[128];
@@ -316,12 +345,24 @@ static void emit_stmts(ASTNode **stmts, int count, FILE *out, const char *fn_nam
 /* Given an expression node, return the class name if statically determinable. */
 static const char *expr_class_name(ASTNode *node) {
     if (!node) return NULL;
-    if (node->type == NODE_IDENTIFIER)
-        return locals_type(((IdentifierNode *)node)->name);
+    /* Use resolved_type if available (set by typecheck pass) */
+    if (node->resolved_type.kind == TYPE_ARRAY) return "array";
+    if (node->resolved_type.kind == TYPE_MULTI) return "multi";
+    if (node->resolved_type.kind == TYPE_SIMPLE && node->resolved_type.name)
+        return node->resolved_type.name;
+    /* Fallback: identifier lookup in locals */
+    if (node->type == NODE_IDENTIFIER) {
+        const char *tn = locals_type(((IdentifierNode *)node)->name);
+        return tn;
+    }
     if (node->type == NODE_VAR_DECL) {
         VarDeclNode *vd = (VarDeclNode *)node;
         if (vd->var_type.kind == TYPE_SIMPLE && vd->var_type.name)
             return vd->var_type.name;
+        if (vd->var_type.kind == TYPE_ARRAY)
+            return "array";
+        if (vd->var_type.kind == TYPE_MULTI)
+            return "multi";
     }
     return NULL;
 }
@@ -384,6 +425,12 @@ static int count_var_decls(ASTNode **stmts, int count) {
                 ASTNode *init_arr[1] = { nd->init };
                 n += count_var_decls(init_arr, 1);
             }
+            n += count_var_decls(nd->body, nd->body_count);
+            break;
+        }
+        case NODE_FOR_IN: {
+            ForInNode *nd = (ForInNode *)s;
+            n += 4; /* __for_arr_N, __for_len_N, __for_idx_N, loop var */
             n += count_var_decls(nd->body, nd->body_count);
             break;
         }
@@ -675,7 +722,7 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
         if (is_print || is_println) {
             if (call->arg_count >= 1) {
                 ASTNode *arg = call->args[0];
-                int need_stack_cleanup = 0;
+                int need_stack_cleanup = 0;  /* bytes to add rsp by after call */
 
                 if (arg->type == NODE_LITERAL && ((LiteralNode *)arg)->lit_type == LIT_STRING) {
                     /* String literal: direct pointer + length */
@@ -685,15 +732,18 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
                     fprintf(out, "    lea rdi, [rel %s]\n", lbl);
                     fprintf(out, "    mov rsi, %zu\n", len);
                 } else if (arg->type == NODE_INTERP_STRING) {
-                    /* Interpolated string: emit_expr sets rax=ptr, r15=len */
+                    /* Interpolated string: emit_expr leaves buffer on stack,
+                       rax=ptr, r15=len.  We must clean up 544 bytes after
+                       the call. */
                     emit_expr(arg, out, fn_name);
                     fprintf(out, "    mov rdi, rax\n");
                     fprintf(out, "    mov rsi, r15\n");
+                    need_stack_cleanup = 544;
                 } else {
                     /* Integer or other expression: convert to string */
                     emit_expr(arg, out, fn_name);
                     fprintf(out, "    sub rsp, 32\n");
-                    need_stack_cleanup = 1;
+                    need_stack_cleanup = 32;
                     fprintf(out, "    mov rdi, rax\n");
                     fprintf(out, "    mov rsi, rsp\n");
                     fprintf(out, "    mov rdx, 32\n");
@@ -708,7 +758,7 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
                     fprintf(out, "    call %s\n", sym("hylian_println"));
 
                 if (need_stack_cleanup)
-                    fprintf(out, "    add rsp, 32\n");
+                    fprintf(out, "    add rsp, %d\n", need_stack_cleanup);
             } else {
                 /* print() with no args — print empty string */
                 const char *lbl = register_string("");
@@ -737,7 +787,7 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
         for (int i = nargs - 1; i >= 0; i--) {
             fprintf(out, "    pop %s\n", arg_regs[i]);
         }
-        fprintf(out, "    call %s\n", call->name);
+        fprintf(out, "    call %s\n", rewrite_call_name(call->name));
         /* result in rax */
         break;
     }
@@ -745,6 +795,41 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
     case NODE_MEMBER_ACCESS: {
         MemberAccessNode *ma = (MemberAccessNode *)node;
         const char *class_name = expr_class_name(ma->object);
+
+        /* ── array.len ─────────────────────────────────────────────────── */
+        if (class_name && strcmp(class_name, "array") == 0) {
+            if (strcmp(ma->member, "len") == 0) {
+                emit_expr(ma->object, out, fn_name);
+                fprintf(out, "    mov rax, [rax + 0]\n"); /* length at offset 0 */
+                break;
+            }
+            if (strcmp(ma->member, "cap") == 0) {
+                emit_expr(ma->object, out, fn_name);
+                fprintf(out, "    mov rax, [rax + 8]\n"); /* capacity at offset 8 */
+                break;
+            }
+            fprintf(out, "    ; array: unknown member '%s'\n", ma->member);
+            fprintf(out, "    xor rax, rax\n");
+            break;
+        }
+
+        /* ── multi.tag / multi.value ────────────────────────────────────── */
+        if (class_name && strcmp(class_name, "multi") == 0) {
+            if (strcmp(ma->member, "tag") == 0) {
+                emit_expr(ma->object, out, fn_name);
+                fprintf(out, "    mov rax, [rax + 0]\n"); /* tag at offset 0 */
+                break;
+            }
+            if (strcmp(ma->member, "value") == 0) {
+                emit_expr(ma->object, out, fn_name);
+                fprintf(out, "    mov rax, [rax + 8]\n"); /* value at offset 8 */
+                break;
+            }
+            fprintf(out, "    ; multi: unknown member '%s'\n", ma->member);
+            fprintf(out, "    xor rax, rax\n");
+            break;
+        }
+
         if (!class_name) {
             fprintf(out, "    ; member access: unknown class for .%s\n", ma->member);
             fprintf(out, "    xor rax, rax\n");
@@ -934,27 +1019,65 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
         /* Null-terminate the result buffer */
         fprintf(out, "    mov byte [r14], 0\n");
 
-        /* rax = pointer to buffer, r15 = length */
-        fprintf(out, "    mov rax, r13\n");
-        fprintf(out, "    sub r14, r13\n");
-        fprintf(out, "    mov r15, r14\n");
-
-        /* Restore saved r13 and r14 from the stack frame without
-           popping (we still need rsp to stay where it is so the buffer
-           lives in the frame until the function epilogue).
+        /* rax = pointer to buffer, r15 = length.
            Stack layout from current rsp upward:
              [0 .. 519]  512-byte buffer + 8 pad
              [520]       saved r15  (push r15 — 8 bytes)
              [528]       saved r14  (push r14)
-             [536]       saved r13  (push r13)          */
+             [536]       saved r13  (push r13)
+           We restore r13/r14 now but leave rsp pointing at the buffer so
+           it stays alive.  The caller is responsible for doing
+               add rsp, 544
+           after it has finished reading rax/r15. */
+        fprintf(out, "    mov rax, r13\n");
+        fprintf(out, "    sub r14, r13\n");
+        fprintf(out, "    mov r15, r14\n");
         fprintf(out, "    mov r13, [rsp + 536]\n");
         fprintf(out, "    mov r14, [rsp + 528]\n");
-        /* r15 intentionally NOT restored here — caller reads it as length.
-           The frame epilogue (mov rsp, rbp) will clean everything up. */
-        /* Unwind the 520-byte sub + the three saved registers (24 bytes) */
-        fprintf(out, "    add rsp, 544\n");
-        /* rax = pointer into (now-unwound but still within the frame) buffer */
-        /* r15 = byte length of the assembled string                          */
+        /* r15 = length; rax = ptr to buffer still on stack.
+           Caller must emit: add rsp, 544   to clean up. */
+        break;
+    }
+
+    case NODE_ARRAY_LITERAL: {
+        ArrayLiteralNode *al = (ArrayLiteralNode *)node;
+        int count = al->elem_count;
+        int capacity = count < 8 ? 8 : count;
+        /* malloc((capacity + 2) * 8) bytes: 2 words header + capacity elements */
+        fprintf(out, "    ; array literal with %d elements\n", count);
+        fprintf(out, "    mov rdi, %d\n", (capacity + 2) * 8);
+        fprintf(out, "    call malloc\n");
+        /* rax = array pointer; save it in r11 across element evaluations */
+        fprintf(out, "    push r11\n");
+        fprintf(out, "    mov r11, rax\n");
+        /* write header: length = count, capacity = capacity */
+        fprintf(out, "    mov qword [r11 + 0], %d\n", count);
+        fprintf(out, "    mov qword [r11 + 8], %d\n", capacity);
+        /* evaluate each element and store */
+        for (int i = 0; i < count; i++) {
+            emit_expr(al->elements[i], out, fn_name);
+            fprintf(out, "    mov [r11 + %d], rax\n", 16 + i * 8);
+        }
+        fprintf(out, "    mov rax, r11\n");
+        fprintf(out, "    pop r11\n");
+        break;
+    }
+
+    case NODE_INDEX: {
+        IndexNode *ix = (IndexNode *)node;
+        /* evaluate object -> rax (array pointer), save in r11 */
+        emit_expr(ix->object, out, fn_name);
+        fprintf(out, "    push r11\n");
+        fprintf(out, "    mov r11, rax\n");
+        /* evaluate index -> rax */
+        emit_expr(ix->index, out, fn_name);
+        fprintf(out, "    mov rcx, rax\n");
+        /* compute offset: 16 + rcx*8 */
+        fprintf(out, "    imul rcx, rcx, 8\n");
+        fprintf(out, "    add rcx, 16\n");
+        fprintf(out, "    add rcx, r11\n");
+        fprintf(out, "    mov rax, [rcx]\n");
+        fprintf(out, "    pop r11\n");
         break;
     }
 
@@ -979,6 +1102,69 @@ static void emit_stmt(ASTNode *node, FILE *out, const char *fn_name) {
 
     case NODE_VAR_DECL: {
         VarDeclNode *vd = (VarDeclNode *)node;
+
+        if (vd->var_type.kind == TYPE_ARRAY) {
+            /* Heap-allocated array: [ptr+0]=length, [ptr+8]=capacity, [ptr+16..]=elements */
+            int off = locals_alloc_typed(vd->var_name, "array");
+            if (vd->initializer && vd->initializer->type == NODE_ARRAY_LITERAL) {
+                /* emit_expr for NODE_ARRAY_LITERAL already does the right thing */
+                emit_expr(vd->initializer, out, fn_name);
+            } else if (vd->initializer) {
+                /* Some other expression that yields an array pointer */
+                emit_expr(vd->initializer, out, fn_name);
+            } else {
+                /* No initializer: allocate 8-slot empty array */
+                fprintf(out, "    ; array<%s> default alloc (8 slots)\n",
+                        vd->var_type.elem_type_count > 0 ? vd->var_type.elem_types[0].name : "?");
+                fprintf(out, "    mov rdi, %d\n", (8 + 2) * 8); /* 10 * 8 = 80 bytes */
+                fprintf(out, "    call malloc\n");
+                fprintf(out, "    mov qword [rax + 0], 0\n");  /* length = 0 */
+                fprintf(out, "    mov qword [rax + 8], 8\n");  /* capacity = 8 */
+                /* zero the 8 element slots */
+                fprintf(out, "    push r11\n");
+                fprintf(out, "    mov r11, rax\n");
+                for (int i = 0; i < 8; i++)
+                    fprintf(out, "    mov qword [r11 + %d], 0\n", 16 + i * 8);
+                fprintf(out, "    mov rax, r11\n");
+                fprintf(out, "    pop r11\n");
+            }
+            fprintf(out, "    mov [rbp - %d], rax\n", off);
+            break;
+        }
+
+        if (vd->var_type.kind == TYPE_MULTI) {
+            /* Heap-allocated tagged union: [ptr+0]=tag, [ptr+8]=value */
+            int off = locals_alloc_typed(vd->var_name, "multi");
+            if (vd->initializer) {
+                /* Determine tag from resolved_type of initializer vs multi elem_types */
+                int tag = 0;
+                Type init_type = vd->initializer->resolved_type;
+                for (int ti = 0; ti < vd->var_type.elem_type_count; ti++) {
+                    Type *et = &vd->var_type.elem_types[ti];
+                    if (et->name && init_type.name &&
+                        strcmp(et->name, init_type.name) == 0) {
+                        tag = ti;
+                        break;
+                    }
+                }
+                emit_expr(vd->initializer, out, fn_name);
+                fprintf(out, "    push rax\n");           /* save init value */
+                fprintf(out, "    mov rdi, 16\n");
+                fprintf(out, "    call malloc\n");
+                fprintf(out, "    pop rcx\n");            /* rcx = init value */
+                fprintf(out, "    mov qword [rax + 0], %d\n", tag); /* tag */
+                fprintf(out, "    mov [rax + 8], rcx\n");            /* value */
+            } else {
+                fprintf(out, "    mov rdi, 16\n");
+                fprintf(out, "    call malloc\n");
+                fprintf(out, "    mov qword [rax + 0], 0\n");
+                fprintf(out, "    mov qword [rax + 8], 0\n");
+            }
+            fprintf(out, "    mov [rbp - %d], rax\n", off);
+            break;
+        }
+
+        /* Default: simple type */
         int off = locals_alloc_typed(vd->var_name, vd->var_type.name);
         if (vd->initializer) {
             emit_expr(vd->initializer, out, fn_name);
@@ -1224,7 +1410,96 @@ static void emit_stmt(ASTNode *node, FILE *out, const char *fn_name) {
     }
 
     case NODE_INDEX_ASSIGN: {
-        fprintf(out, "    ; index assign not supported in asm backend\n");
+        IndexAssignNode *ia = (IndexAssignNode *)node;
+        /* Evaluate value first, push it */
+        emit_expr(ia->value, out, fn_name);
+        fprintf(out, "    push rax\n");              /* save value */
+        /* Evaluate object (array pointer) -> rax, save to r11 */
+        emit_expr(ia->object, out, fn_name);
+        fprintf(out, "    push r11\n");
+        fprintf(out, "    mov r11, rax\n");          /* r11 = array ptr */
+        /* Evaluate index -> rax */
+        emit_expr(ia->index, out, fn_name);
+        fprintf(out, "    mov rcx, rax\n");          /* rcx = index */
+        /* Compute address: r11 + 16 + rcx*8 */
+        fprintf(out, "    imul rcx, rcx, 8\n");
+        fprintf(out, "    add rcx, 16\n");
+        fprintf(out, "    add rcx, r11\n");
+        /* Pop value into rdx */
+        fprintf(out, "    pop r11\n");               /* restore r11 first */
+        fprintf(out, "    pop rdx\n");               /* rdx = value */
+        fprintf(out, "    mov [rcx], rdx\n");
+        break;
+    }
+
+    case NODE_FOR_IN: {
+        ForInNode *fi = (ForInNode *)node;
+        int lbl_loop = next_label();
+        int lbl_end  = next_label();
+        int idx_lbl  = next_label(); /* used to make unique hidden var names */
+
+        /* Hidden locals: __for_idx_N (loop counter), __for_arr_N (array ptr),
+           __for_len_N (cached length).  We use synthesised names with the
+           label number so nested for-in loops don't collide. */
+        char idx_name[64], arr_name[64], len_name[64];
+        snprintf(idx_name, sizeof(idx_name), "__for_idx_%d", idx_lbl);
+        snprintf(arr_name, sizeof(arr_name), "__for_arr_%d", idx_lbl);
+        snprintf(len_name, sizeof(len_name), "__for_len_%d", idx_lbl);
+
+        /* Evaluate collection -> rax (array pointer) */
+        emit_expr(fi->collection, out, fn_name);
+        fprintf(out, "    push r11\n");
+        fprintf(out, "    mov r11, rax\n");          /* r11 = array ptr */
+
+        /* Allocate hidden locals */
+        int arr_off = locals_alloc(arr_name);
+        int len_off = locals_alloc(len_name);
+        int idx_off = locals_alloc(idx_name);
+        /* Allocate loop variable — use element type from resolved_type if available */
+        const char *elem_type_name = NULL;
+        if (fi->collection->resolved_type.kind == TYPE_ARRAY &&
+            fi->collection->resolved_type.elem_type_count > 0) {
+            elem_type_name = fi->collection->resolved_type.elem_types[0].name;
+        }
+        int var_off = locals_alloc_typed(fi->var_name, elem_type_name);
+
+        /* Store array ptr */
+        fprintf(out, "    mov [rbp - %d], r11\n", arr_off);
+        /* Load and store length */
+        fprintf(out, "    mov rax, [r11 + 0]\n");
+        fprintf(out, "    mov [rbp - %d], rax\n", len_off);
+        /* index = 0 */
+        fprintf(out, "    mov qword [rbp - %d], 0\n", idx_off);
+        fprintf(out, "    pop r11\n");
+
+        loop_stack_push(lbl_loop, lbl_end);
+        fprintf(out, ".L%d:\n", lbl_loop);
+
+        /* if index >= length, exit */
+        fprintf(out, "    mov rax, [rbp - %d]\n", idx_off);
+        fprintf(out, "    cmp rax, [rbp - %d]\n", len_off);
+        fprintf(out, "    jge .L%d\n", lbl_end);
+
+        /* Load element: arr[idx] = [arr_ptr + 16 + idx*8] */
+        fprintf(out, "    push r11\n");
+        fprintf(out, "    mov r11, [rbp - %d]\n", arr_off);
+        fprintf(out, "    mov rcx, [rbp - %d]\n", idx_off);
+        fprintf(out, "    imul rcx, rcx, 8\n");
+        fprintf(out, "    add rcx, 16\n");
+        fprintf(out, "    add rcx, r11\n");
+        fprintf(out, "    mov rax, [rcx]\n");
+        fprintf(out, "    pop r11\n");
+        fprintf(out, "    mov [rbp - %d], rax\n", var_off);
+
+        emit_stmts(fi->body, fi->body_count, out, fn_name);
+
+        /* increment index */
+        fprintf(out, "    mov rax, [rbp - %d]\n", idx_off);
+        fprintf(out, "    inc rax\n");
+        fprintf(out, "    mov [rbp - %d], rax\n", idx_off);
+        fprintf(out, "    jmp .L%d\n", lbl_loop);
+        fprintf(out, ".L%d:\n", lbl_end);
+        loop_stack_pop();
         break;
     }
 
@@ -1316,14 +1591,51 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
     str_const_count = 0;
     _label_counter  = 0;
     loop_stack_top  = 0;
+    fn_prefix_count = 0;
 
-    /* Scan includes up front so io_included (and any future flags) are set
-       before we emit any function bodies into the memstream buffer. */
+    /* Scan includes up front so io_included and fn_prefix rewrites are set
+       before we emit any function bodies into the memstream buffer.
+       We inline a minimal copy of the STD_MODULES table here so we don't
+       have to forward-declare the full struct. */
     io_included = 0;
-    for (int i = 0; i < root->include_count; i++) {
-        const char *inc = root->includes[i];
-        if (!inc) continue;
-        if (strcmp(inc, "std.io") == 0) io_included = 1;
+    {
+        typedef struct {
+            const char *include_path;
+            const char *src_prefix; /* NULL = no rewrite */
+            const char *abi_prefix; /* full C symbol prefix */
+            int         sets_io;
+        } EarlyMod;
+        static const EarlyMod EARLY_MODS[] = {
+            { "std.io",                    NULL,       NULL,                    1 },
+            { "std.errors",                NULL,       NULL,                    0 },
+            { "std.strings",               NULL,       NULL,                    0 },
+            { "std.system.filesystem",     NULL,       NULL,                    0 },
+            { "std.system.env",            NULL,       NULL,                    0 },
+            { "std.crypto",                "crypto_",  "hylian_crypto_",        0 },
+            { "std.networking.tcp",        "tcp_",     "hylian_net_tcp_",       0 },
+            { "std.networking.udp",        "udp_",     "hylian_net_udp_",       0 },
+            { "std.networking.https",      "https_",   "hylian_net_https_",     0 },
+        };
+        static const int EARLY_MOD_COUNT =
+            (int)(sizeof(EARLY_MODS) / sizeof(EARLY_MODS[0]));
+
+        for (int i = 0; i < root->include_count; i++) {
+            const char *inc = root->includes[i];
+            if (!inc) continue;
+            for (int m = 0; m < EARLY_MOD_COUNT; m++) {
+                if (strcmp(inc, EARLY_MODS[m].include_path) == 0) {
+                    if (EARLY_MODS[m].sets_io) io_included = 1;
+                    if (EARLY_MODS[m].src_prefix &&
+                        fn_prefix_count < MAX_FN_PREFIXES) {
+                        fn_prefixes[fn_prefix_count].src_prefix =
+                            EARLY_MODS[m].src_prefix;
+                        fn_prefixes[fn_prefix_count].abi_prefix =
+                            EARLY_MODS[m].abi_prefix;
+                        fn_prefix_count++;
+                    }
+                }
+            }
+        }
     }
 
     /* We do a two-pass approach:
@@ -1509,32 +1821,37 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
      * Fields:
      *   include_path   — the "std.xxx" string users write in include {}
      *   obj_name       — the short .o name used on the link line  (e.g. "io")
-     *   stem_linux     — path stem under runtime/std/ for linux   (no extension)
-     *   stem_macos     — path stem for macos  (NULL = same as linux)
-     *   stem_windows   — path stem for windows (NULL = same as linux)
-     *   is_c           — 1 = built with gcc -c, 0 = assembled with nasm
+     *   stem           — path stem under runtime/std/  (no extension)
      *   externs        — space-separated list of symbols to extern-declare
      *                    (NULL = none beyond always-on symbols)
+     *   link_libs      — extra linker flags (e.g. "-lssl -lcrypto"), or NULL
+     *   fn_prefix      — if non-NULL, calls whose name starts with this prefix
+     *                    are rewritten to "hylian_" + name at the call site.
+     *                    e.g. fn_prefix="crypto_" rewrites crypto_hash ->
+     *                    hylian_crypto_hash in the emitted asm.
      *   sets_io        — 1 = sets io_included flag (only std.io)
      * ────────────────────────────────────────────────────────────────────────*/
     typedef struct {
         const char *include_path;
         const char *obj_name;
-        const char *stem_linux;
-        const char *stem_macos;   /* NULL = use stem_linux */
-        const char *stem_windows; /* NULL = use stem_linux */
-        int         is_c;
+        const char *stem;
         const char *externs;      /* space-separated symbol names, or NULL */
+        const char *link_libs;    /* extra -l flags for the link line, or NULL */
+        const char *fn_prefix;    /* call-site name rewrite prefix, or NULL */
         int         sets_io;
     } StdModule;
 
     static const StdModule STD_MODULES[] = {
-        /* include path              obj        linux stem                          macos stem                     windows stem                  C?  externs                                        io? */
-        { "std.io",                  "io",      "io_linux",                        "io_macos",                    "io_windows",                  0, "hylian_print hylian_println hylian_int_to_str", 1 },
-        { "std.errors",              "errors",  "errors_linux",                    "errors_macos",                "errors_windows",              0, "hylian_make_error hylian_panic",                0 },
-        { "std.strings",             "strings", "strings_linux",                   "strings_macos",               "strings_windows",             0, "hylian_str_len hylian_str_concat hylian_str_eq", 0 },
-        { "std.system.filesystem",   "fs",      "system/filesystem_linux",         NULL,                          NULL,                          1, "hylian_file_read hylian_file_write hylian_file_exists hylian_file_size hylian_mkdir", 0 },
-        { "std.system.env",          "env",     "system/env_linux",                "system/env_macos",            "system/env_windows",          0, "hylian_getenv hylian_exit",                     0 },
+        /* include path              obj        stem                        externs                                           link_libs        fn_prefix    io? */
+        { "std.io",                  "io",      "io",                       "hylian_print hylian_println hylian_int_to_str",  NULL,            NULL,        1 },
+        { "std.errors",              "errors",  "errors",                   "hylian_make_error hylian_panic",                 NULL,            NULL,        0 },
+        { "std.strings",             "strings", "strings",                  "hylian_str_len hylian_str_concat hylian_str_eq", NULL,            NULL,        0 },
+        { "std.system.filesystem",   "fs",      "system/filesystem",        "hylian_file_read hylian_file_write hylian_file_exists hylian_file_size hylian_mkdir", NULL, NULL, 0 },
+        { "std.system.env",          "env",     "system/env",               "hylian_getenv hylian_exit",                      NULL,            NULL,        0 },
+        { "std.crypto",              "crypto",  "crypto",                   "hylian_crypto_hash hylian_crypto_hash_hex hylian_crypto_hmac hylian_crypto_hmac_hex hylian_crypto_encrypt hylian_crypto_decrypt hylian_crypto_random_bytes hylian_crypto_random_int hylian_crypto_random_float hylian_crypto_constant_time_eq", "-lssl -lcrypto", "crypto_", 0 },
+        { "std.networking.tcp",      "tcp",     "networking/tcp",           "hylian_net_tcp_connect hylian_net_tcp_listen hylian_net_tcp_accept hylian_net_tcp_send hylian_net_tcp_recv hylian_net_tcp_close hylian_net_tcp_set_nonblocking hylian_net_tcp_set_reuseaddr hylian_net_tcp_set_timeout", NULL, "tcp_", 0 },
+        { "std.networking.udp",      "udp",     "networking/udp",           "hylian_net_udp_socket hylian_net_udp_bind hylian_net_udp_send_to hylian_net_udp_recv_from hylian_net_udp_connect hylian_net_udp_send hylian_net_udp_recv hylian_net_udp_close hylian_net_udp_set_nonblocking hylian_net_udp_set_timeout hylian_net_udp_set_broadcast hylian_net_udp_join_multicast", NULL, "udp_", 0 },
+        { "std.networking.https",    "https",   "networking/https",         "hylian_net_https_connect hylian_net_https_send hylian_net_https_recv hylian_net_https_get hylian_net_https_post hylian_net_https_close hylian_net_https_body hylian_net_https_status", "-lssl -lcrypto", "https_", 0 },
     };
     static const int STD_MODULE_COUNT = (int)(sizeof(STD_MODULES) / sizeof(STD_MODULES[0]));
 
@@ -1549,15 +1866,13 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
             if (strcmp(inc, STD_MODULES[m].include_path) == 0) {
                 mod_needed[m] = 1;
                 if (STD_MODULES[m].sets_io) io_included = 1;
+                if (STD_MODULES[m].fn_prefix && fn_prefix_count < MAX_FN_PREFIXES) {
+                                /* second-pass registration is a no-op now — early scan
+                                   already populated fn_prefixes before body emission */
+                            }
             }
         }
     }
-
-    /* Helper: pick the right stem for the current target */
-#define MOD_STEM(m) \
-    (strcmp(current_target, "macos")   == 0 && STD_MODULES[m].stem_macos   ? STD_MODULES[m].stem_macos   : \
-     strcmp(current_target, "windows") == 0 && STD_MODULES[m].stem_windows ? STD_MODULES[m].stem_windows : \
-     STD_MODULES[m].stem_linux)
 
     /* ── Build comment block ─────────────────────────────────────────────────*/
     const char *nasm_fmt =
@@ -1573,21 +1888,19 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
 
     for (int m = 0; m < STD_MODULE_COUNT; m++) {
         if (!mod_needed[m]) continue;
-        const char *stem = MOD_STEM(m);
-        if (STD_MODULES[m].is_c) {
-            fprintf(out, ";          # prefer pre-built: runtime/std/%s.o\n", stem);
-            fprintf(out, ";          # fallback:         gcc -O2 -c runtime/std/%s.c -o %s.o\n",
-                    stem, STD_MODULES[m].obj_name);
-        } else {
-            fprintf(out, ";          # prefer pre-built: runtime/std/%s.o\n", stem);
-            fprintf(out, ";          # fallback:         nasm -f %s runtime/std/%s.asm -o %s.o\n",
-                    nasm_fmt, stem, STD_MODULES[m].obj_name);
-        }
+        const char *stem = STD_MODULES[m].stem;
+        fprintf(out, ";          # prefer pre-built: runtime/std/%s.o\n", stem);
+        fprintf(out, ";          # fallback:         gcc -O2 -c runtime/std/%s.c -o %s.o\n",
+                stem, STD_MODULES[m].obj_name);
     }
 
     fprintf(out, "; Link:     gcc <file>.o");
     for (int m = 0; m < STD_MODULE_COUNT; m++) {
         if (mod_needed[m]) fprintf(out, " %s.o", STD_MODULES[m].obj_name);
+    }
+    for (int m = 0; m < STD_MODULE_COUNT; m++) {
+        if (mod_needed[m] && STD_MODULES[m].link_libs)
+            fprintf(out, " %s", STD_MODULES[m].link_libs);
     }
     fprintf(out, " -o <program>%s%s\n\n", bin_ext, link_flags);
 

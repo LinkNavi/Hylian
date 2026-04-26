@@ -1,5 +1,5 @@
 // Hylian standard library interface — std.system.filesystem
-// Auto-generated from system/filesystem_linux.c
+// Hylian runtime filesystem interface
 //
 // Usage:
 //   include {
