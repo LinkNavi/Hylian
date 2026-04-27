@@ -7,3 +7,4 @@ hylian
 test_lexer
 *.hy
 Docs/book/
+HylianLsp/zed-extension/target
