@@ -99,19 +99,30 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
 
   # ── Compile everything ───────────────────────────────────────────
   info "Compiling..."
-  run gcc \
-    -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
-    -O2 \
-    lex_lsp.yy.c \
-    parser_lsp.tab.c \
-    ast.c \
-    lsp_diag.c \
-    lsp_analysis.c \
-    lsp_proto.c \
-    typecheck.c \
-    lsp_main.c \
-    -o ../hylian-lsp
 
+  # Tree-sitter paths (relative to project root)
+  TS_INC="../tree-sitter/lib/include"
+  TS_SRC="../tree-sitter/lib/src/lib.c"
+  TSC_SRC="../tree-sitter-c/src/parser.c"
+
+    run gcc \
+      -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+      -O2 \
+      -I../tree-sitter/lib/include \
+      -I../tree-sitter-c/src \
+      -I../tree-sitter-c/src/tree_sitter \
+      lex_lsp.yy.c \
+      parser_lsp.tab.c \
+      ast.c \
+      lsp_diag.c \
+      lsp_analysis.c \
+      lsp_proto.c \
+      typecheck.c \
+      lsp_main.c \
+      lsp_c_extractor.c \
+      ../tree-sitter/lib/src/lib.c \
+      ../tree-sitter-c/src/parser.c \
+      -o ../hylian-lsp
   if [[ $? -ne 0 ]]; then
     fail "gcc compilation failed"
     exit 1

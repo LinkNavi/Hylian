@@ -5,11 +5,13 @@
 #include "ast.h"
 #include "typecheck.h"
 #include "lsp_diag.h"
+#include "lsp_log.h"
 
 /* ─── Diagnostics ───────────────────────────────────────────────────────────── */
 static const char *current_tc_file = "<unknown>";
 
 static void tc_error(int line, const char *fmt, ...) {
+    lsp_log("[typecheck] ERROR at line %d", line);
     va_list ap;
     char buf[512];
     va_start(ap, fmt);
@@ -20,6 +22,7 @@ static void tc_error(int line, const char *fmt, ...) {
 }
 
 static void tc_warn(int line, const char *fmt, ...) {
+    lsp_log("[typecheck] WARN at line %d", line);
     va_list ap;
     char buf[512];
     va_start(ap, fmt);
@@ -46,16 +49,19 @@ static int scope_stack[MAX_SCOPE_DEPTH];
 static int scope_depth = 0;
 
 static void scope_push(void) {
+    lsp_log("[typecheck] scope_push");
     if (scope_depth < MAX_SCOPE_DEPTH)
         scope_stack[scope_depth++] = sym_count;
 }
 
 static void scope_pop(void) {
+    lsp_log("[typecheck] scope_pop");
     if (scope_depth > 0)
         sym_count = scope_stack[--scope_depth];
 }
 
 static void scope_define(const char *name, Type t) {
+    lsp_log("[typecheck] scope_define: %s", name);
     if (sym_count < MAX_SCOPE_SYMS) {
         symbols[sym_count].name = (char *)name;
         symbols[sym_count].type = t;
@@ -64,6 +70,7 @@ static void scope_define(const char *name, Type t) {
 }
 
 static Type *scope_lookup(const char *name) {
+    lsp_log("[typecheck] scope_lookup: %s", name);
     for (int i = sym_count - 1; i >= 0; i--)
         if (symbols[i].name && strcmp(symbols[i].name, name) == 0)
             return &symbols[i].type;
@@ -92,6 +99,7 @@ static FieldEntry fields[1024];
 static int        field_count = 0;
 
 static FuncInfo *func_lookup(const char *name) {
+    lsp_log("[typecheck] func_lookup: %s", name);
     for (int i = 0; i < func_count; i++)
         if (funcs[i].name && strcmp(funcs[i].name, name) == 0)
             return &funcs[i];
@@ -99,6 +107,7 @@ static FuncInfo *func_lookup(const char *name) {
 }
 
 static FieldEntry *field_lookup(const char *class_name, const char *fname) {
+    lsp_log("[typecheck] field_lookup: %s.%s", class_name, fname);
     for (int i = 0; i < field_count; i++)
         if (fields[i].class_name && fields[i].field_name &&
             strcmp(fields[i].class_name, class_name) == 0 &&
@@ -110,12 +119,14 @@ static FieldEntry *field_lookup(const char *class_name, const char *fname) {
 /* ─── Unknown type helper ───────────────────────────────────────────────────── */
 
 static Type unknown_type(void) {
+    lsp_log("[typecheck] unknown_type");
     return make_simple_type(NULL, 0);
 }
 
 /* ─── Type name helper ──────────────────────────────────────────────────────── */
 
 static const char *type_name(Type t) {
+    lsp_log("[typecheck] type_name");
     static char buf[256];
     if (t.kind == TYPE_ARRAY) {
         if (t.elem_type_count > 0 && t.elem_types[0].name)
@@ -148,10 +159,34 @@ static const char *type_name(Type t) {
 
 static Type infer_expr(ASTNode *node);
 static void infer_stmt(ASTNode *node);
+/* ─── External function registry ───────────────────────────────────────────── */
 
+static TCExternalFunc *ext_funcs = NULL;
+static int ext_func_count = 0;
+
+void lsp_typecheck_with_externals(ProgramNode *program, const char *filename,
+                                  TCExternalFunc *ext, int ext_count) {
+    ext_funcs = ext;
+    ext_func_count = ext_count;
+    lsp_typecheck(program, filename);
+    ext_funcs = NULL;
+    ext_func_count = 0;
+}
+
+static TCExternalFunc *ext_lookup(const char *name) {
+    lsp_log("[typecheck] ext_lookup: %s", name);
+    for (int i = 0; i < ext_func_count; i++) {
+        if (ext_funcs[i].name && strcmp(ext_funcs[i].name, name) == 0) {
+            lsp_log("[typecheck] Registered external stdlib func used: %s (ret: %s)", ext_funcs[i].name, ext_funcs[i].return_type);
+            return &ext_funcs[i];
+        }
+    }
+    return NULL;
+}
 /* ─── Expression inference ──────────────────────────────────────────────────── */
 
 static Type infer_expr(ASTNode *node) {
+    lsp_log("[typecheck] infer_expr: node type=%d", node ? node->type : -1);
     if (!node) return unknown_type();
 
     Type result = unknown_type();
@@ -226,27 +261,20 @@ static Type infer_expr(ASTNode *node) {
         /* Infer all args first */
         for (int i = 0; i < fc->arg_count; i++)
             infer_expr(fc->args[i]);
-        /* Special built-ins that are not registered in the func table */
-        if (fc->name && strcmp(fc->name, "Err") == 0) {
-            result = make_simple_type("Error", 0);
-        } else if (fc->name && strcmp(fc->name, "panic") == 0) {
-            result = make_simple_type("void", 0);
-        } else if (fc->name && strcmp(fc->name, "print") == 0) {
-            result = make_simple_type("void", 0);
-        } else if (fc->name && strcmp(fc->name, "len") == 0) {
-            result = make_simple_type("int", 0);
-        } else if (fc->name && strcmp(fc->name, "push") == 0) {
-            result = make_simple_type("void", 0);
-        } else if (fc->name && strcmp(fc->name, "pop") == 0) {
-            result = unknown_type();
-        } else if (fc->name && strcmp(fc->name, "exit") == 0) {
-            result = make_simple_type("void", 0);
-        } else if (fc->name) {
+
+        if (fc->name) {
+            /* 1. Check user-defined functions first */
             FuncInfo *fi = func_lookup(fc->name);
             if (fi) {
                 result = fi->return_type;
             } else {
-                tc_error(node->line, "call to undefined function '%s'", fc->name);
+                /* 2. Check C stdlib externals (e.g. "std.io.print") */
+                TCExternalFunc *ext = ext_lookup(fc->name);
+                if (ext) {
+                    result = make_simple_type(ext->return_type, 0);
+                } else {
+                    tc_error(node->line, "call to undefined function '%s'", fc->name);
+                }
             }
         }
         break;
@@ -391,6 +419,7 @@ static Type infer_expr(ASTNode *node) {
 /* ─── Statement inference ───────────────────────────────────────────────────── */
 
 static void infer_stmt(ASTNode *node) {
+    lsp_log("[typecheck] infer_stmt: node type=%d", node ? node->type : -1);
     if (!node) return;
 
     switch (node->type) {
@@ -519,12 +548,15 @@ static void infer_stmt(ASTNode *node) {
     }
 }
 
+
+
 /* ─── Function body inference ───────────────────────────────────────────────── */
 
 static void infer_function(ASTNode **params, int param_count,
                             ASTNode **body, int body_count,
                             Type return_type, const char *class_name) {
     (void)return_type;
+    lsp_log("[typecheck] infer_function: param_count=%d, body_count=%d", param_count, body_count);
     scope_push();
     if (class_name)
         scope_define("self", make_simple_type((char *)class_name, 0));
@@ -542,6 +574,7 @@ static void infer_function(ASTNode **params, int param_count,
 
 static void register_func(const char *name, Type return_type,
                            ASTNode **params, int param_count) {
+    lsp_log("[typecheck] register_func: %s", name);
     if (func_count >= 256) return;
     FuncInfo *fi = &funcs[func_count++];
     fi->name = (char *)name;
@@ -558,6 +591,7 @@ static void register_func(const char *name, Type return_type,
 }
 
 static void register_field(const char *class_name, const char *fname, Type ftype) {
+    lsp_log("[typecheck] register_field: %s.%s", class_name, fname);
     if (field_count >= 1024) return;
     fields[field_count].class_name = (char *)class_name;
     fields[field_count].field_name = (char *)fname;
@@ -568,6 +602,7 @@ static void register_field(const char *class_name, const char *fname, Type ftype
 /* ─── Main typecheck entry ──────────────────────────────────────────────────── */
 
 void lsp_typecheck(ProgramNode *program, const char *filename) {
+    lsp_log("[typecheck] lsp_typecheck: file=%s", filename);
     current_tc_file = filename ? filename : "<unknown>";
 
     /* Reset state */

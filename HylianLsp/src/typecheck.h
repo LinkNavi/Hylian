@@ -8,5 +8,14 @@
    the editor as textDocument/publishDiagnostics notifications.
    filename is used in diagnostic messages (pass the source file path). */
 void lsp_typecheck(ProgramNode *program, const char *filename);
+/* External function signature for C stdlib integration */
+typedef struct {
+    const char *name;
+    const char *return_type;  /* e.g. "str", "int", "void" */
+    int param_count;
+    /* We could add param types here later if needed */
+} TCExternalFunc;
 
+void lsp_typecheck_with_externals(ProgramNode *program, const char *filename,
+                                  TCExternalFunc *ext, int ext_count);
 #endif

@@ -4,6 +4,7 @@
 
 #include "lsp_proto.h"
 #include "lsp_diag.h"
+#include "lsp_log.h"
 #include "lsp_analysis.h"
 
 /* ─── Global project ─────────────────────────────────────────────────────────
@@ -216,6 +217,8 @@ static void handle_initialize(FILE *out, long id, const char *params) {
 
         (void)plen;
     }
+
+    lsp_log("[lsp_main] Using workspace root: %s", root_path[0] ? root_path : ".");
 
     /* Create the project (scans workspace, parses all .hy files) */
     if (g_project) lsp_project_free(g_project);
