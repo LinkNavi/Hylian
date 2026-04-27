@@ -53,7 +53,7 @@
 extern int lsp_yydebug;
 #endif
 /* "%code requires" blocks.  */
-#line 67 "parser_lsp.y"
+#line 70 "parser_lsp.y"
  #include "ast.h" 
 
 #line 60 "parser_lsp.tab.h"
@@ -151,7 +151,7 @@ extern int lsp_yydebug;
 #if ! defined LSP_YYSTYPE && ! defined LSP_YYSTYPE_IS_DECLARED
 union LSP_YYSTYPE
 {
-#line 71 "parser_lsp.y"
+#line 74 "parser_lsp.y"
 
     char* str;
     int num;

@@ -129,6 +129,17 @@ static const char *type_name(Type t) {
         snprintf(buf, sizeof(buf), "multi<...>");
         return buf;
     }
+    if (t.kind == TYPE_TUPLE) {
+        char tmp[256] = "(";
+        for (int i = 0; i < t.elem_type_count; i++) {
+            if (i > 0) strncat(tmp, ", ", sizeof(tmp) - strlen(tmp) - 1);
+            strncat(tmp, t.elem_types[i].name ? t.elem_types[i].name : "?",
+                    sizeof(tmp) - strlen(tmp) - 1);
+        }
+        strncat(tmp, ")", sizeof(tmp) - strlen(tmp) - 1);
+        snprintf(buf, sizeof(buf), "%s", tmp);
+        return buf;
+    }
     if (t.name) return t.name;
     return "unknown";
 }
@@ -165,7 +176,7 @@ static Type infer_expr(ASTNode *node) {
         if (t) {
             result = *t;
         } else {
-            tc_error(0, "undefined variable '%s'", id->name);
+            tc_error(node->line, "undefined variable '%s'", id->name);
         }
         break;
     }
@@ -187,7 +198,7 @@ static Type infer_expr(ASTNode *node) {
                 (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
                  strcmp(op, "*") == 0 || strcmp(op, "/") == 0 ||
                  strcmp(op, "%") == 0)) {
-                tc_warn(0, "arithmetic on boolean value with operator '%s'", op);
+                tc_warn(node->line, "arithmetic on boolean value with operator '%s'", op);
             }
             result = left;
         }
@@ -235,7 +246,7 @@ static Type infer_expr(ASTNode *node) {
             if (fi) {
                 result = fi->return_type;
             } else {
-                tc_error(0, "call to undefined function '%s'", fc->name);
+                tc_error(node->line, "call to undefined function '%s'", fc->name);
             }
         }
         break;
@@ -259,7 +270,7 @@ static Type infer_expr(ASTNode *node) {
             if (fi) {
                 result = fi->return_type;
             } else {
-                tc_error(0, "no method '%s' on type '%s'", mc->method,
+                tc_error(node->line, "no method '%s' on type '%s'", mc->method,
                          obj_type.name ? obj_type.name : "unknown");
             }
         } else if (mc->method && obj_type.kind == TYPE_ARRAY) {
@@ -268,10 +279,10 @@ static Type infer_expr(ASTNode *node) {
                 strcmp(mc->method, "len")  == 0 || strcmp(mc->method, "cap")  == 0) {
                 result = make_simple_type("int", 0);
             } else {
-                tc_error(0, "no method '%s' on type '%s'", mc->method, type_name(obj_type));
+                tc_error(node->line, "no method '%s' on type '%s'", mc->method, type_name(obj_type));
             }
         } else if (mc->method && !obj_type.name) {
-            tc_error(0, "no method '%s' on type 'unknown'", mc->method);
+            tc_error(node->line, "no method '%s' on type 'unknown'", mc->method);
         }
         break;
     }
@@ -303,7 +314,7 @@ static Type infer_expr(ASTNode *node) {
                 if (fe) {
                     result = fe->field_type;
                 } else {
-                    tc_error(0, "no field '%s' on type '%s'", ma->member, obj_type.name);
+                    tc_error(node->line, "no field '%s' on type '%s'", ma->member, obj_type.name);
                 }
             }
         }
@@ -330,6 +341,16 @@ static Type infer_expr(ASTNode *node) {
         }
         result.is_any = 0;
         result.fixed_size = 0;
+        break;
+    }
+
+    case NODE_TUPLE: {
+        TupleNode *tn = (TupleNode *)node;
+        Type *elem_types = malloc(tn->elem_count * sizeof(Type));
+        for (int i = 0; i < tn->elem_count; i++)
+            elem_types[i] = infer_expr(tn->elements[i]);
+        result = make_tuple_type(elem_types, tn->elem_count);
+        free(elem_types);
         break;
     }
 
@@ -384,7 +405,7 @@ static void infer_stmt(ASTNode *node) {
         if (decl_type.name && strcmp(decl_type.name, "auto") == 0 &&
             (!init_type.name || strcmp(init_type.name, "unknown") == 0) &&
             init_type.kind == TYPE_SIMPLE && !init_type.name) {
-            tc_warn(0, "cannot infer type for '%s' from initializer", vd->var_name);
+            tc_warn(node->line, "cannot infer type for '%s' from initializer", vd->var_name);
         }
         scope_define(vd->var_name, decl_type);
         node->resolved_type = decl_type;

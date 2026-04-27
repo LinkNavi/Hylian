@@ -153,7 +153,7 @@
 
 [ "true" "false" ] @boolean
 
-"nil" @constant.builtin
+(nil_literal) @constant.builtin
 
 ; ── Comments ─────────────────────────────────────────────────────────────────
 

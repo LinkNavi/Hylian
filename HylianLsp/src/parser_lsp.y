@@ -20,6 +20,9 @@ void yyerror(const char *s) {
                   LSP_DIAG_ERROR, s);
 }
 
+/* Stamp the current line number onto any ASTNode* or ASTNode-embedding struct */
+#define SET_LINE(n) do { if (n) ((ASTNode*)(n))->line = lsp_yylineno; } while(0)
+
 ProgramNode* root = NULL;
 
 typedef struct NodeList {
@@ -106,9 +109,9 @@ void typelist_add(TypeList* l, Type t) {
 %type <method_node> method_decl
 %type <func_node> func_decl
 %type <field_node> field_decl
-%type <type_node> type
+%type <type_node> type nullable_type
 %type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
-%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list
+%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list tuple_type_items
 %type <node> include_path
 
 
@@ -393,6 +396,27 @@ args:
     | args COMMA expr { NodeList* l=(NodeList*)$1; list_add(l,$3); $$=l; }
     ;
 
+/* nullable_type: a type with an optional trailing '?' */
+nullable_type:
+    type              { $$ = $1; }
+    | type QUESTION   { Type t = $1; t.nullable = 1; $$ = t; }
+    ;
+
+/* tuple_type_items: at least two nullable_type separated by commas, stored as TypeList* */
+tuple_type_items:
+    nullable_type COMMA nullable_type {
+        TypeList* tl = typelist_new();
+        typelist_add(tl, $1);
+        typelist_add(tl, $3);
+        $$ = (void*)tl;
+    }
+    | tuple_type_items COMMA nullable_type {
+        TypeList* tl = (TypeList*)$1;
+        typelist_add(tl, $3);
+        $$ = (void*)tl;
+    }
+    ;
+
 /* union_types: pipe-separated list of types for multi<A | B | ...>
    We reuse void* node_list slot but store a TypeList* instead */
 union_types:
@@ -435,6 +459,12 @@ type:
         $$ = make_multi_type(tl->items, tl->count, 0, $5);
         free(tl->items); free(tl);
     }
+    /* tuple type: (A, B) or (A?, B, C) etc. */
+    | LPAREN tuple_type_items RPAREN {
+        TypeList* tl = (TypeList*)$2;
+        $$ = make_tuple_type(tl->items, tl->count);
+        free(tl->items); free(tl);
+    }
     ;
 
 stmt_list:
@@ -451,8 +481,8 @@ stmt:
     | return_stmt
     /* error recovery: skip a malformed statement up to the next ';' */
     | error SEMICOLON { $$ = NULL; yyerrok; }
-    | BREAK SEMICOLON    { $$ = (ASTNode*)make_break(); }
-    | CONTINUE SEMICOLON { $$ = (ASTNode*)make_continue(); }
+    | BREAK SEMICOLON    { $$ = (ASTNode*)make_break(); SET_LINE($$); }
+    | CONTINUE SEMICOLON { $$ = (ASTNode*)make_continue(); SET_LINE($$); }
     | ASM_BLOCK {
         AsmBlockNode *ab = malloc(sizeof(AsmBlockNode));
         ab->base.type = NODE_ASM_BLOCK;
@@ -466,35 +496,35 @@ stmt:
         ab->body = $1;
         $$ = (ASTNode*)ab;
     }
-    | DEFER expr SEMICOLON { $$ = (ASTNode*)make_defer($2); }
+    | DEFER expr SEMICOLON { $$ = (ASTNode*)make_defer($2); SET_LINE($$); }
     | expr SEMICOLON { $$ = $1; }
     /* := declare-assign (type inferred as auto) */
     | IDENTIFIER DECLARE_ASSIGN expr SEMICOLON {
-        $$ = (ASTNode*)make_var_decl(make_simple_type("auto", 0), $1, $3);
+        $$ = (ASTNode*)make_var_decl(make_simple_type("auto", 0), $1, $3); SET_LINE($$);
     }
     /* simple assign */
     | IDENTIFIER ASSIGN expr SEMICOLON {
-        $$ = (ASTNode*)make_assign($1, $3);
+        $$ = (ASTNode*)make_assign($1, $3); SET_LINE($$);
     }
     /* compound assign */
-    | IDENTIFIER PLUS_ASSIGN expr SEMICOLON  { $$ = (ASTNode*)make_compound_assign("+=", $1, $3); }
-    | IDENTIFIER MINUS_ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_compound_assign("-=", $1, $3); }
-    | IDENTIFIER STAR_ASSIGN expr SEMICOLON  { $$ = (ASTNode*)make_compound_assign("*=", $1, $3); }
-    | IDENTIFIER SLASH_ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_compound_assign("/=", $1, $3); }
-    | IDENTIFIER MOD_ASSIGN expr SEMICOLON   { $$ = (ASTNode*)make_compound_assign("%=", $1, $3); }
+    | IDENTIFIER PLUS_ASSIGN expr SEMICOLON  { $$ = (ASTNode*)make_compound_assign("+=", $1, $3); SET_LINE($$); }
+    | IDENTIFIER MINUS_ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_compound_assign("-=", $1, $3); SET_LINE($$); }
+    | IDENTIFIER STAR_ASSIGN expr SEMICOLON  { $$ = (ASTNode*)make_compound_assign("*=", $1, $3); SET_LINE($$); }
+    | IDENTIFIER SLASH_ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_compound_assign("/=", $1, $3); SET_LINE($$); }
+    | IDENTIFIER MOD_ASSIGN expr SEMICOLON   { $$ = (ASTNode*)make_compound_assign("%=", $1, $3); SET_LINE($$); }
     /* member assign: obj.field = expr */
     | expr DOT IDENTIFIER ASSIGN expr SEMICOLON {
-        $$ = (ASTNode*)make_member_assign($1, $3, $5);
+        $$ = (ASTNode*)make_member_assign($1, $3, $5); SET_LINE($$);
     }
     /* index assign: expr[expr] = expr */
     | expr LBRACKET expr RBRACKET ASSIGN expr SEMICOLON {
-        $$ = (ASTNode*)make_index_assign($1, $3, $6);
+        $$ = (ASTNode*)make_index_assign($1, $3, $6); SET_LINE($$);
     }
     /* if */
     | IF LPAREN expr RPAREN LBRACE stmt_list RBRACE {
         IfNode* ifn = make_if($3);
         NodeList* ts=(NodeList*)$6; ifn->then_body=ts->items; ifn->then_count=ts->count; free(ts);
-        $$ = (ASTNode*)ifn;
+        $$ = (ASTNode*)ifn; SET_LINE($$);
     }
     | IF LPAREN expr RPAREN LBRACE stmt_list RBRACE ELSE LBRACE stmt_list RBRACE {
         IfNode* ifn = make_if($3);
@@ -502,38 +532,38 @@ stmt:
         ifn->then_body=ts->items; ifn->then_count=ts->count;
         ifn->else_body=es->items; ifn->else_count=es->count;
         free(ts); free(es);
-        $$ = (ASTNode*)ifn;
+        $$ = (ASTNode*)ifn; SET_LINE($$);
     }
     /* while */
     | WHILE LPAREN expr RPAREN LBRACE stmt_list RBRACE {
         WhileNode* wn = make_while($3);
         NodeList* sl=(NodeList*)$6; wn->body=sl->items; wn->body_count=sl->count; free(sl);
-        $$ = (ASTNode*)wn;
+        $$ = (ASTNode*)wn; SET_LINE($$);
     }
     /* for */
     | FOR LPAREN for_init SEMICOLON expr SEMICOLON for_init RPAREN LBRACE stmt_list RBRACE {
         ForNode* fn = make_for($3, $5, $7);
         NodeList* sl=(NodeList*)$10; fn->body=sl->items; fn->body_count=sl->count; free(sl);
-        $$ = (ASTNode*)fn;
+        $$ = (ASTNode*)fn; SET_LINE($$);
     }
     | FOR LPAREN for_init SEMICOLON expr SEMICOLON RPAREN LBRACE stmt_list RBRACE {
         ForNode* fn = make_for($3, $5, NULL);
         NodeList* sl=(NodeList*)$9; fn->body=sl->items; fn->body_count=sl->count; free(sl);
-        $$ = (ASTNode*)fn;
+        $$ = (ASTNode*)fn; SET_LINE($$);
     }
     /* for-in: for (item in collection) */
     | FOR LPAREN IDENTIFIER IN expr RPAREN LBRACE stmt_list RBRACE {
         ForInNode* fn = make_for_in($3, 0, $5);
         NodeList* sl=(NodeList*)$8; fn->body=sl->items; fn->body_count=sl->count; free(sl);
         free($3);
-        $$ = (ASTNode*)fn;
+        $$ = (ASTNode*)fn; SET_LINE($$);
     }
     /* for-in by reference: for (&item in collection) */
     | FOR LPAREN AMP IDENTIFIER IN expr RPAREN LBRACE stmt_list RBRACE {
         ForInNode* fn = make_for_in($4, 1, $6);
         NodeList* sl=(NodeList*)$9; fn->body=sl->items; fn->body_count=sl->count; free(sl);
         free($4);
-        $$ = (ASTNode*)fn;
+        $$ = (ASTNode*)fn; SET_LINE($$);
     }
     ;
 
@@ -545,85 +575,108 @@ for_init:
     ;
 
 var_decl:
-    type IDENTIFIER ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_var_decl($1, $2, $4); }
-    | type IDENTIFIER SEMICOLON           { $$ = (ASTNode*)make_var_decl($1, $2, NULL); }
+    type IDENTIFIER ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_var_decl($1, $2, $4); SET_LINE($$); }
+    | type IDENTIFIER SEMICOLON           { $$ = (ASTNode*)make_var_decl($1, $2, NULL); SET_LINE($$); }
     | type QUESTION IDENTIFIER ASSIGN expr SEMICOLON {
         Type t = $1; t.nullable = 1;
-        $$ = (ASTNode*)make_var_decl(t, $3, $5);
+        $$ = (ASTNode*)make_var_decl(t, $3, $5); SET_LINE($$);
     }
     | type QUESTION IDENTIFIER SEMICOLON {
         Type t = $1; t.nullable = 1;
-        $$ = (ASTNode*)make_var_decl(t, $3, NULL);
+        $$ = (ASTNode*)make_var_decl(t, $3, NULL); SET_LINE($$);
     }
     ;
 
 return_stmt:
-    RETURN expr SEMICOLON { $$ = (ASTNode*)make_return($2); }
-    | RETURN SEMICOLON    { $$ = (ASTNode*)make_return(NULL); }
+    RETURN expr SEMICOLON { $$ = (ASTNode*)make_return($2); SET_LINE($$); }
+    | RETURN expr COMMA args SEMICOLON {
+        NodeList* al = (NodeList*)$4;
+        int total = 1 + al->count;
+        ASTNode **elems = malloc(total * sizeof(ASTNode*));
+        elems[0] = $2;
+        for (int i = 0; i < al->count; i++) elems[i+1] = al->items[i];
+        free(al->items); free(al);
+        ASTNode* tup = (ASTNode*)make_tuple(elems, total);
+        free(elems);
+        $$ = (ASTNode*)make_return(tup); SET_LINE($$);
+    }
+    | RETURN SEMICOLON    { $$ = (ASTNode*)make_return(NULL); SET_LINE($$); }
     ;
 
 expr:
     NUMBER {
         char buf[32]; sprintf(buf, "%d", $1);
-        $$ = (ASTNode*)make_literal(buf, LIT_INT);
+        $$ = (ASTNode*)make_literal(buf, LIT_INT); SET_LINE($$);
     }
-    | FLOAT_LITERAL { $$ = (ASTNode*)make_literal($1, LIT_FLOAT); }
-    | STRING_LITERAL { $$ = (ASTNode*)make_literal($1, LIT_STRING); }
-    | INTERP_STRING  { $$ = (ASTNode*)make_interp_string($1); }
-    | NIL    { $$ = (ASTNode*)make_literal("nullptr", LIT_NIL); }
-    | TRUE_LIT  { $$ = (ASTNode*)make_literal("true", LIT_BOOL); }
-    | FALSE_LIT { $$ = (ASTNode*)make_literal("false", LIT_BOOL); }
+    | FLOAT_LITERAL { $$ = (ASTNode*)make_literal($1, LIT_FLOAT); SET_LINE($$); }
+    | STRING_LITERAL { $$ = (ASTNode*)make_literal($1, LIT_STRING); SET_LINE($$); }
+    | INTERP_STRING  { $$ = (ASTNode*)make_interp_string($1); SET_LINE($$); }
+    | NIL    { $$ = (ASTNode*)make_literal("nullptr", LIT_NIL); SET_LINE($$); }
+    | TRUE_LIT  { $$ = (ASTNode*)make_literal("true", LIT_BOOL); SET_LINE($$); }
+    | FALSE_LIT { $$ = (ASTNode*)make_literal("false", LIT_BOOL); SET_LINE($$); }
     /* array literal */
     | LBRACKET arg_list RBRACKET {
         NodeList* al = (NodeList*)$2;
         $$ = (ASTNode*)make_array_literal(al->items, al->count);
-        free(al->items); free(al);
+        free(al->items); free(al); SET_LINE($$);
     }
     /* index access */
-    | expr LBRACKET expr RBRACKET { $$ = (ASTNode*)make_index($1, $3); }
+    | expr LBRACKET expr RBRACKET { $$ = (ASTNode*)make_index($1, $3); SET_LINE($$); }
     /* free function call */
     | IDENTIFIER LPAREN arg_list RPAREN {
         FuncCallNode* c = make_func_call($1);
         NodeList* al=(NodeList*)$3; c->args=al->items; c->arg_count=al->count; free(al);
-        $$ = (ASTNode*)c;
+        $$ = (ASTNode*)c; SET_LINE($$);
     }
     /* new */
     | NEW IDENTIFIER LPAREN arg_list RPAREN {
         NewNode* n = make_new($2);
         NodeList* al=(NodeList*)$4; n->args=al->items; n->arg_count=al->count; free(al);
-        $$ = (ASTNode*)n;
+        $$ = (ASTNode*)n; SET_LINE($$);
     }
-    | IDENTIFIER { $$ = (ASTNode*)make_identifier($1); }
+    | IDENTIFIER { $$ = (ASTNode*)make_identifier($1); SET_LINE($$); }
     /* method call */
     | expr DOT IDENTIFIER LPAREN arg_list RPAREN {
         MethodCallNode* c = make_method_call($1, $3);
         NodeList* al=(NodeList*)$5; c->args=al->items; c->arg_count=al->count; free(al);
-        $$ = (ASTNode*)c;
+        $$ = (ASTNode*)c; SET_LINE($$);
     }
     /* member access */
-    | expr DOT IDENTIFIER { $$ = (ASTNode*)make_member_access($1, $3); }
+    | expr DOT IDENTIFIER { $$ = (ASTNode*)make_member_access($1, $3); SET_LINE($$); }
     /* binary ops */
-    | expr PLUS  expr { $$ = (ASTNode*)make_binary_op("+",  $1, $3); }
-    | expr MINUS expr { $$ = (ASTNode*)make_binary_op("-",  $1, $3); }
-    | expr STAR  expr { $$ = (ASTNode*)make_binary_op("*",  $1, $3); }
-    | expr SLASH expr { $$ = (ASTNode*)make_binary_op("/",  $1, $3); }
-    | expr MOD   expr { $$ = (ASTNode*)make_binary_op("%",  $1, $3); }
-    | expr LT    expr { $$ = (ASTNode*)make_binary_op("<",  $1, $3); }
-    | expr GT    expr { $$ = (ASTNode*)make_binary_op(">",  $1, $3); }
-    | expr LE    expr { $$ = (ASTNode*)make_binary_op("<=", $1, $3); }
-    | expr GE    expr { $$ = (ASTNode*)make_binary_op(">=", $1, $3); }
-    | expr EQ    expr { $$ = (ASTNode*)make_binary_op("==", $1, $3); }
-    | expr NE    expr { $$ = (ASTNode*)make_binary_op("!=", $1, $3); }
-    | expr AND   expr { $$ = (ASTNode*)make_binary_op("&&", $1, $3); }
-    | expr OR    expr { $$ = (ASTNode*)make_binary_op("||", $1, $3); }
+    | expr PLUS  expr { $$ = (ASTNode*)make_binary_op("+",  $1, $3); SET_LINE($$); }
+    | expr MINUS expr { $$ = (ASTNode*)make_binary_op("-",  $1, $3); SET_LINE($$); }
+    | expr STAR  expr { $$ = (ASTNode*)make_binary_op("*",  $1, $3); SET_LINE($$); }
+    | expr SLASH expr { $$ = (ASTNode*)make_binary_op("/",  $1, $3); SET_LINE($$); }
+    | expr MOD   expr { $$ = (ASTNode*)make_binary_op("%",  $1, $3); SET_LINE($$); }
+    | expr LT    expr { $$ = (ASTNode*)make_binary_op("<",  $1, $3); SET_LINE($$); }
+    | expr GT    expr { $$ = (ASTNode*)make_binary_op(">",  $1, $3); SET_LINE($$); }
+    | expr LE    expr { $$ = (ASTNode*)make_binary_op("<=", $1, $3); SET_LINE($$); }
+    | expr GE    expr { $$ = (ASTNode*)make_binary_op(">=", $1, $3); SET_LINE($$); }
+    | expr EQ    expr { $$ = (ASTNode*)make_binary_op("==", $1, $3); SET_LINE($$); }
+    | expr NE    expr { $$ = (ASTNode*)make_binary_op("!=", $1, $3); SET_LINE($$); }
+    | expr AND   expr { $$ = (ASTNode*)make_binary_op("&&", $1, $3); SET_LINE($$); }
+    | expr OR    expr { $$ = (ASTNode*)make_binary_op("||", $1, $3); SET_LINE($$); }
     /* unary */
-    | NOT expr          { $$ = (ASTNode*)make_unary_op("!", $2, 0); }
-    | MINUS expr %prec UMINUS { $$ = (ASTNode*)make_unary_op("-", $2, 0); }
-    | INC expr          { $$ = (ASTNode*)make_unary_op("++", $2, 0); }
-    | DEC expr          { $$ = (ASTNode*)make_unary_op("--", $2, 0); }
-    | expr INC          { $$ = (ASTNode*)make_unary_op("++", $1, 1); }
-    | expr DEC          { $$ = (ASTNode*)make_unary_op("--", $1, 1); }
+    | NOT expr          { $$ = (ASTNode*)make_unary_op("!", $2, 0); SET_LINE($$); }
+    | MINUS expr %prec UMINUS { $$ = (ASTNode*)make_unary_op("-", $2, 0); SET_LINE($$); }
+    | INC expr          { $$ = (ASTNode*)make_unary_op("++", $2, 0); SET_LINE($$); }
+    | DEC expr          { $$ = (ASTNode*)make_unary_op("--", $2, 0); SET_LINE($$); }
+    | expr INC          { $$ = (ASTNode*)make_unary_op("++", $1, 1); SET_LINE($$); }
+    | expr DEC          { $$ = (ASTNode*)make_unary_op("--", $1, 1); SET_LINE($$); }
     | LPAREN expr RPAREN { $$ = $2; }
+    /* tuple literal: (a, b) or (a, b, c, ...) */
+    | LPAREN expr COMMA args RPAREN {
+        NodeList* al = (NodeList*)$4;
+        int total = 1 + al->count;
+        ASTNode **elems = malloc(total * sizeof(ASTNode*));
+        elems[0] = $2;
+        for (int i = 0; i < al->count; i++) elems[i+1] = al->items[i];
+        free(al->items); free(al);
+        $$ = (ASTNode*)make_tuple(elems, total);
+        free(elems);
+        SET_LINE($$);
+    }
     ;
 
 %%

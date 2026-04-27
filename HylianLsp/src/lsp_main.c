@@ -229,7 +229,7 @@ static void handle_initialize(FILE *out, long id, const char *params) {
       jb_key_begin_obj(&b, "capabilities");
 
         jb_key_begin_obj(&b, "textDocumentSync");
-          jb_key_int(&b, "openClose", 1);
+          jb_key_bool(&b, "openClose", 1);
           jb_key_int(&b, "change", 1);   /* Full sync */
         jb_obj_end(&b);
 

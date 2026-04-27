@@ -11,6 +11,8 @@ module.exports = grammar({
 	conflicts: ($) => [
 		[$.func_decl, $.method_decl],
 		[$.type, $.identifier_expr],
+		[$.tuple_type, $.paren_expr],
+		[$.tuple_expr, $.paren_expr],
 	],
 
 	rules: {
@@ -34,9 +36,16 @@ module.exports = grammar({
 		type: ($) =>
 			prec.right(
 				seq(
-					choice($.primitive_type, $.array_type, $.multi_type, $.identifier),
+					choice($.primitive_type, $.array_type, $.multi_type, $.tuple_type, $.identifier),
 					optional("?"),
 				),
+			),
+
+		tuple_type: ($) =>
+			seq(
+				"(",
+				seq($.type, optional("?"), repeat1(seq(",", $.type, optional("?")))),
+				")",
 			),
 
 		primitive_type: (_) => choice("int", "str", "bool", "void", "Error"),
@@ -186,7 +195,17 @@ module.exports = grammar({
 				";",
 			),
 
-		return_stmt: ($) => seq("return", optional($.expression), ";"),
+		return_stmt: ($) =>
+			seq(
+				"return",
+				optional(
+					choice(
+						seq($.expression, repeat1(seq(",", $.expression))), // multi-return
+						$.expression,
+					),
+				),
+				";",
+			),
 
 		if_stmt: ($) =>
 			seq(
@@ -264,9 +283,13 @@ module.exports = grammar({
 				$.nil_literal,
 				$.identifier_expr,
 				$.paren_expr,
+				$.tuple_expr,
 			),
 
 		paren_expr: ($) => seq("(", $.expression, ")"),
+
+		tuple_expr: ($) =>
+			seq("(", $.expression, repeat1(seq(",", $.expression)), ")"),
 
 		binary_expr: ($) =>
 			choice(

@@ -34,12 +34,14 @@ typedef enum {
     NODE_INDEX,
     NODE_INDEX_ASSIGN,
     NODE_ASM_BLOCK,
+    NODE_TUPLE,     /* tuple literal: (a, b, c) */
 } NodeType;
 
 typedef enum {
     TYPE_SIMPLE,   /* int, str, bool, void, Error, ClassName */
     TYPE_ARRAY,    /* array<T> or array<T, N> */
     TYPE_MULTI,    /* multi<A | B | ...> or multi<any> with optional N */
+    TYPE_TUPLE,    /* (A, B, ...) — tuple return type */
 } TypeKind;
 
 typedef struct Type {
@@ -54,7 +56,7 @@ typedef struct Type {
     int fixed_size;           /* 0 = flexible, >0 = fixed */
 } Type;
 
-typedef struct ASTNode { NodeType type; Type resolved_type; } ASTNode;
+typedef struct ASTNode { NodeType type; Type resolved_type; int line; } ASTNode;
 
 typedef struct {
     ASTNode base;
@@ -239,6 +241,12 @@ typedef struct {
 
 typedef struct { ASTNode base; char *header; } CppIncludeNode;
 typedef struct { ASTNode base; ASTNode *value; } ReturnNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode **elements;
+    int elem_count;
+} TupleNode;
 typedef struct { ASTNode base; ASTNode *expr; } DeferNode;
 typedef struct { ASTNode base; } BreakNode;
 typedef struct { ASTNode base; } ContinueNode;
@@ -294,8 +302,10 @@ ContinueNode *make_continue();
 ArrayLiteralNode *make_array_literal(ASTNode **elems, int count);
 IndexNode *make_index(ASTNode *object, ASTNode *index);
 IndexAssignNode *make_index_assign(ASTNode *object, ASTNode *index, ASTNode *value);
+TupleNode *make_tuple(ASTNode **elems, int count);
 Type make_simple_type(char *name, int nullable);
 Type make_array_type(Type elem, int fixed_size);
 Type make_multi_type(Type *elems, int count, int is_any, int fixed_size);
+Type make_tuple_type(Type *elems, int count);
 
 #endif

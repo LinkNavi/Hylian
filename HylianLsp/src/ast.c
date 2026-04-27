@@ -314,6 +314,7 @@ static void zero_resolved_type(ASTNode *n) {
     n->resolved_type.elem_type_count = 0;
     n->resolved_type.is_any = 0;
     n->resolved_type.fixed_size = 0;
+    n->line = 0;
 }
 
 Type make_array_type(Type elem, int fixed_size) {
@@ -368,6 +369,38 @@ IndexNode *make_index(ASTNode *object, ASTNode *index) {
     n->object = object;
     n->index = index;
     return n;
+}
+
+TupleNode *make_tuple(ASTNode **elems, int count) {
+    TupleNode *n = malloc(sizeof(TupleNode));
+    n->base.type = NODE_TUPLE;
+    zero_resolved_type(&n->base);
+    n->elem_count = count;
+    if (count > 0) {
+        n->elements = malloc(count * sizeof(ASTNode *));
+        for (int i = 0; i < count; i++) n->elements[i] = elems[i];
+    } else {
+        n->elements = NULL;
+    }
+    return n;
+}
+
+Type make_tuple_type(Type *elems, int count) {
+    Type t;
+    t.kind = TYPE_TUPLE;
+    t.name = NULL;
+    t.nullable = 0;
+    t.is_any = 0;
+    t.fixed_size = count;
+    if (elems && count > 0) {
+        t.elem_types = malloc(count * sizeof(Type));
+        for (int i = 0; i < count; i++) t.elem_types[i] = elems[i];
+        t.elem_type_count = count;
+    } else {
+        t.elem_types = NULL;
+        t.elem_type_count = 0;
+    }
+    return t;
 }
 
 IndexAssignNode *make_index_assign(ASTNode *object, ASTNode *index, ASTNode *value) {

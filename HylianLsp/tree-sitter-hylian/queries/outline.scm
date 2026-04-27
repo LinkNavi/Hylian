@@ -22,7 +22,7 @@
 
 (class_decl
   name: (identifier) @context
-  body: (class_body
+  (class_body
     (class_member
       (method_decl
         name: (identifier) @name)))) @item
@@ -31,17 +31,16 @@
 
 (class_decl
   name: (identifier) @context
-  body: (class_body
+  (class_body
     (class_member
       (ctor_decl
         name: (identifier) @name)))) @item
 
 ; ── Public fields ─────────────────────────────────────────────────────────────
-; Only public fields are worth cluttering the outline with.
 
 (class_decl
   name: (identifier) @context
-  body: (class_body
+  (class_body
     (class_member
       (field_decl
         "public"

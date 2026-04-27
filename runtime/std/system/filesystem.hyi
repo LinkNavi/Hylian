@@ -56,3 +56,19 @@ fn file_size(path: str) -> int
 //       panic(err.message());
 //   }
 fn mkdir(path: str) -> int
+
+// Get the current working directory.
+// Returns the absolute path as a string, or an empty string on error.
+//
+// Example:
+//   str cwd = getcwd();
+//   println(cwd);
+fn getcwd() -> str
+
+// Get the parent directory of a path.
+// Strips the last path component. Returns "." if there is no separator.
+// Returns the root if already at root.
+//
+// Example:
+//   str parent = parent_dir("/home/user/project");  // "/home/user"
+fn parent_dir(path: str) -> str

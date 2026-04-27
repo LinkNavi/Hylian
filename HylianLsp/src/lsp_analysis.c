@@ -99,6 +99,16 @@ static void type_to_str(Type t, char *buf, int bufsz) {
             snprintf(buf, bufsz, "multi<any>");
         else
             snprintf(buf, bufsz, "multi<...>");
+    } else if (t.kind == TYPE_TUPLE) {
+        char tmp[256] = "(";
+        for (int i = 0; i < t.elem_type_count; i++) {
+            char et[64];
+            type_to_str(t.elem_types[i], et, sizeof(et));
+            if (i > 0) strncat(tmp, ", ", sizeof(tmp) - strlen(tmp) - 1);
+            strncat(tmp, et, sizeof(tmp) - strlen(tmp) - 1);
+        }
+        strncat(tmp, ")", sizeof(tmp) - strlen(tmp) - 1);
+        snprintf(buf, bufsz, "%s%s", tmp, t.nullable ? "?" : "");
     } else {
         snprintf(buf, bufsz, "%s%s",
                  t.name ? t.name : "unknown",
@@ -674,6 +684,93 @@ static void collect_locals(ProgramNode *prog, int line,
     }
 }
 
+/* ─── Include block detection ────────────────────────────────────────────────── */
+
+/* Known stdlib modules */
+static const char *stdlib_modules[] = {
+    "std.io",
+    "std.string",
+    "std.errors",
+    "std.crypto",
+    "std.system.env",
+    "std.system.filesystem",
+    "std.networking.tcp",
+    "std.networking.udp",
+    "std.networking.https",
+    NULL
+};
+
+/* Returns 1 if the cursor (line, col) is inside an unclosed `include { }` block.
+   Also fills prefix_out with whatever partial module name is being typed. */
+static int cursor_in_include(const char *source, int line, int col,
+                              char *prefix_out, int prefix_sz)
+{
+    if (!source) return 0;
+
+    /* Find the offset of the cursor */
+    int cur_line = 0;
+    const char *p = source;
+    while (*p && cur_line < line) { if (*p++ == '\n') cur_line++; }
+    int cur_col = 0;
+    while (*p && *p != '\n' && cur_col < col) { p++; cur_col++; }
+    const char *cursor = p;
+
+    /* Scan backward looking for `include` followed by `{` with no closing `}` */
+    const char *q = cursor;
+    int brace_depth = 0;
+    while (q > source) {
+        q--;
+        if (*q == '}') brace_depth++;
+        else if (*q == '{') {
+            if (brace_depth > 0) { brace_depth--; continue; }
+            /* found an unmatched { — check if preceded by `include` */
+            const char *r = q - 1;
+            while (r >= source && (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r'))
+                r--;
+            /* r should point at the last char of "include" */
+            if (r - source >= 6 && strncmp(r - 6, "include", 7) == 0 &&
+                (r - 6 == source || !isalnum((unsigned char)*(r-7)))) {
+                /* We're inside include { ... }. Extract the partial word at cursor. */
+                if (prefix_out && prefix_sz > 0) {
+                    const char *word_start = cursor;
+                    while (word_start > source &&
+                           (isalnum((unsigned char)*(word_start-1)) ||
+                            *(word_start-1) == '.' || *(word_start-1) == '_'))
+                        word_start--;
+                    int len = (int)(cursor - word_start);
+                    if (len >= prefix_sz) len = prefix_sz - 1;
+                    memcpy(prefix_out, word_start, len);
+                    prefix_out[len] = '\0';
+                }
+                return 1;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Convert an absolute .hy filepath to a dot-separated module name relative
+   to root_dir. e.g. /proj/Game/Player.hy -> "Game.Player" */
+static void filepath_to_module(const char *root_dir, const char *filepath,
+                               char *buf, int bufsz)
+{
+    int rlen = (int)strlen(root_dir);
+    const char *rel = filepath;
+    if (strncmp(filepath, root_dir, rlen) == 0 && filepath[rlen] == '/')
+        rel = filepath + rlen + 1;
+
+    int len = (int)strlen(rel);
+    /* strip .hy suffix */
+    if (len > 3 && strcmp(rel + len - 3, ".hy") == 0)
+        len -= 3;
+
+    int copy = len < bufsz - 1 ? len : bufsz - 1;
+    for (int i = 0; i < copy; i++)
+        buf[i] = (rel[i] == '/') ? '.' : rel[i];
+    buf[copy] = '\0';
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════════
    Public: lsp_complete
    ═══════════════════════════════════════════════════════════════════════════════ */
@@ -686,6 +783,38 @@ int lsp_complete(LspState *st,
 
     LspProject *proj = st->project;
     int count = 0;
+
+    /* ── Include block completion ── */
+    char inc_prefix[256] = "";
+    if (cursor_in_include(source, line, col, inc_prefix, sizeof(inc_prefix))) {
+        /* Stdlib modules */
+        for (int i = 0; stdlib_modules[i] && count < max_out; i++) {
+            if (inc_prefix[0] == '\0' ||
+                strncmp(stdlib_modules[i], inc_prefix, strlen(inc_prefix)) == 0) {
+                add_completion_to(out, &count, max_out,
+                                  stdlib_modules[i], COMPLETE_MODULE,
+                                  "stdlib module", NULL);
+            }
+        }
+        /* User project files */
+        if (proj) {
+            for (int f = 0; f < proj->file_count && count < max_out; f++) {
+                char mod[512];
+                filepath_to_module(proj->root_dir, proj->files[f].filepath,
+                                   mod, sizeof(mod));
+                if (mod[0] == '\0') continue;
+                /* skip std.* paths that ended up here */
+                if (strncmp(mod, "std.", 4) == 0) continue;
+                if (inc_prefix[0] == '\0' ||
+                    strncmp(mod, inc_prefix, strlen(inc_prefix)) == 0) {
+                    add_completion_to(out, &count, max_out,
+                                      mod, COMPLETE_MODULE,
+                                      "project file", NULL);
+                }
+            }
+        }
+        return count;
+    }
 
     /* ── Member access completion (after a '.') ── */
     char obj_name[128] = "";

@@ -13,6 +13,7 @@ typedef enum {
     COMPLETE_FIELD     = 5,
     COMPLETE_METHOD    = 2,
     COMPLETE_KEYWORD   = 14,
+    COMPLETE_MODULE    = 9,    /* LSP CompletionItemKind: Module */
 } CompletionKind;
 
 typedef struct {
