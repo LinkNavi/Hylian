@@ -35,6 +35,7 @@ typedef enum {
     NODE_INDEX_ASSIGN,
     NODE_ASM_BLOCK,
     NODE_TUPLE,     /* tuple literal: (a, b, c) */
+    NODE_ENUM,      /* enum Color { Red, Green, Blue } */
 } NodeType;
 
 typedef enum {
@@ -210,6 +211,19 @@ typedef struct {
 } ClassNode;
 
 typedef struct {
+    char *name;   /* variant identifier, e.g. "Red" */
+    int   value;  /* integer value, e.g. 0 */
+} EnumVariant;
+
+typedef struct {
+    ASTNode base;
+    char *name;
+    int is_public;
+    EnumVariant *variants;
+    int variant_count;
+} EnumNode;
+
+typedef struct {
     ASTNode base;
     ASTNode **declarations;
     int decl_count;
@@ -272,6 +286,7 @@ typedef struct {
 } IndexAssignNode;
 
 ProgramNode *make_program();
+EnumNode *make_enum(char *name, int is_public);
 ClassNode *make_class(char *name, int is_public);
 MethodNode *make_method(Type return_type, char *name);
 FuncNode *make_func(Type return_type, char *name);

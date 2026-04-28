@@ -271,6 +271,24 @@ static void index_program(ProgramNode *prog,
             add_completion_to(arr, count, max, fn->name, COMPLETE_FUNCTION, sig, doc);
         }
 
+        if (d->type == NODE_ENUM) {
+            EnumNode *en = (EnumNode *)d;
+            char doc[512];
+            snprintf(doc, sizeof(doc), "defined in `%s`", source_file);
+            add_completion_to(arr, count, max, en->name, COMPLETE_CLASS,
+                              en->name, doc);
+            for (int v = 0; v < en->variant_count && *count < max; v++) {
+                char det[128];
+                snprintf(det, sizeof(det), "%s::%s = %d",
+                         en->name, en->variants[v].name, en->variants[v].value);
+                char vdoc[512];
+                snprintf(vdoc, sizeof(vdoc), "variant of enum `%s` in `%s`",
+                         en->name, source_file);
+                add_completion_to(arr, count, max, en->variants[v].name,
+                                  COMPLETE_VARIABLE, det, vdoc);
+            }
+        }
+
         if (d->type == NODE_CLASS) {
             ClassNode *cn = (ClassNode *)d;
             char doc[512];
@@ -938,6 +956,23 @@ static ClassNode *find_class_in_project(LspProject *proj, const char *class_name
     return NULL;
 }
 
+/* ─── Find an enum node across the whole project ────────────────────────────── */
+static EnumNode *find_enum_in_project(LspProject *proj, const char *enum_name) {
+    if (!proj || !enum_name) return NULL;
+    for (int f = 0; f < proj->file_count; f++) {
+        ProgramNode *prog = proj->files[f].program;
+        if (!prog) continue;
+        for (int i = 0; i < prog->decl_count; i++) {
+            ASTNode *d = prog->declarations[i];
+            if (d && d->type == NODE_ENUM) {
+                EnumNode *en = (EnumNode *)d;
+                if (strcmp(en->name, enum_name) == 0) return en;
+            }
+        }
+    }
+    return NULL;
+}
+
 /* ─── Collect local variables reachable at cursor ────────────────────────────── */
 static void collect_locals(ProgramNode *prog, int line,
                             CompletionItem *out, int *count, int max)
@@ -1147,6 +1182,49 @@ int lsp_complete(LspState *st,
         }
 
         if (class_name) {
+            /* ── array<T> built-in members ── */
+            if (strcmp(class_name, "array") == 0) {
+                static const struct {
+                    const char    *label;
+                    const char    *detail;
+                    CompletionKind kind;
+                } arr_members[] = {
+                    { "len",  "int len",           COMPLETE_FIELD  },
+                    { "cap",  "int cap",           COMPLETE_FIELD  },
+                    { "push", "void push(T val)",  COMPLETE_METHOD },
+                    { "pop",  "T pop()",           COMPLETE_METHOD },
+                };
+                static const int arr_member_count =
+                    (int)(sizeof(arr_members) / sizeof(arr_members[0]));
+                for (int m = 0; m < arr_member_count && count < max_out; m++) {
+                    out[count] = (CompletionItem){0};
+                    snprintf(out[count].label,  sizeof(out[count].label),
+                             "%s", arr_members[m].label);
+                    snprintf(out[count].detail, sizeof(out[count].detail),
+                             "%s", arr_members[m].detail);
+                    out[count].kind = arr_members[m].kind;
+                    count++;
+                }
+                return count;
+            }
+
+            /* ── Enum variant members ── */
+            EnumNode *en = find_enum_in_project(proj, class_name);
+            if (en) {
+                for (int v = 0; v < en->variant_count && count < max_out; v++) {
+                    out[count] = (CompletionItem){0};
+                    snprintf(out[count].label,  sizeof(out[count].label),
+                             "%s", en->variants[v].name);
+                    snprintf(out[count].detail, sizeof(out[count].detail),
+                             "%s::%s = %d",
+                             en->name, en->variants[v].name,
+                             en->variants[v].value);
+                    out[count].kind = COMPLETE_VARIABLE;
+                    count++;
+                }
+                if (count > 0) return count;
+            }
+
             /* Find the class definition across the whole project */
             ClassNode *cn = find_class_in_project(proj, class_name);
             if (cn) {
@@ -1321,6 +1399,31 @@ HoverResult lsp_hover(LspState *st,
                 return res;
             }
 
+            /* ── Enum type or variant ── */
+            if (d->type == NODE_ENUM) {
+                EnumNode *en = (EnumNode *)d;
+                if (strcmp(en->name, word) == 0) {
+                    snprintf(res.content, sizeof(res.content),
+                             "```hylian\n%senum %s\n```\n*from `%s`*",
+                             en->is_public ? "public " : "", en->name, src_label);
+                    res.found = 1;
+                    free(word);
+                    return res;
+                }
+                for (int v = 0; v < en->variant_count; v++) {
+                    if (strcmp(en->variants[v].name, word) == 0) {
+                        snprintf(res.content, sizeof(res.content),
+                                 "```hylian\n%s::%s = %d\n```\n*variant of `%s` from `%s`*",
+                                 en->name, en->variants[v].name,
+                                 en->variants[v].value,
+                                 en->name, src_label);
+                        res.found = 1;
+                        free(word);
+                        return res;
+                    }
+                }
+            }
+
             /* ── Class, method, or field ── */
             if (d->type == NODE_CLASS) {
                 ClassNode *cn = (ClassNode *)d;
@@ -1379,6 +1482,24 @@ HoverResult lsp_hover(LspState *st,
                 res.found = 1;
                 free(word);
                 return res;
+            }
+        }
+    }
+
+    /* ── array<T> method hover (fallback when no other definition matched) ── */
+    if (!res.found) {
+        static const struct { const char *name; const char *sig; } arr_hover[] = {
+            { "push", "void push(T val)" },
+            { "pop",  "T pop()"          },
+            { NULL, NULL }
+        };
+        for (int i = 0; arr_hover[i].name; i++) {
+            if (strcmp(word, arr_hover[i].name) == 0) {
+                snprintf(res.content, sizeof(res.content),
+                         "```hylian\n%s\n```\n*array\\<T\\> method*",
+                         arr_hover[i].sig);
+                res.found = 1;
+                break;
             }
         }
     }

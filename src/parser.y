@@ -111,6 +111,7 @@ void typelist_add(TypeList* l, Type t) {
     ASTNode* node;
     ProgramNode* program;
     ClassNode* class_node;
+    EnumNode* enum_node;
     MethodNode* method_node;
     FuncNode* func_node;
     FieldNode* field_node;
@@ -118,7 +119,7 @@ void typelist_add(TypeList* l, Type t) {
     void* node_list;
 }
 
-%token INCLUDE CLASS PUBLIC PRIVATE IF ELSE RETURN NEW NIL TRUE_LIT FALSE_LIT
+%token INCLUDE CLASS ENUM PUBLIC PRIVATE IF ELSE RETURN NEW NIL TRUE_LIT FALSE_LIT
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
 %token DEFER MATCH UNSAFE CONST STATIC EXTERN AMP
 %token INT STRING ERROR BOOL
@@ -137,6 +138,7 @@ void typelist_add(TypeList* l, Type t) {
 
 %type <program> program
 %type <class_node> class_decl
+%type <enum_node> enum_decl enum_body
 %type <method_node> method_decl
 %type <func_node> func_decl
 %type <field_node> field_decl
@@ -171,6 +173,11 @@ program:
         $$->declarations[$$->decl_count++] = (ASTNode*)$2;
     }
     | program func_decl {
+        $$ = $1;
+        $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
+        $$->declarations[$$->decl_count++] = (ASTNode*)$2;
+    }
+    | program enum_decl {
         $$ = $1;
         $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
         $$->declarations[$$->decl_count++] = (ASTNode*)$2;
@@ -335,6 +342,41 @@ class_decl:
         }
         free(body->items); free(body);
     }
+    ;
+
+enum_decl:
+    ENUM IDENTIFIER LBRACE enum_body RBRACE {
+        free($4->name);
+        $4->name = strdup($2); $4->is_public = 0;
+        free($2); $$ = $4;
+    }
+    | PUBLIC ENUM IDENTIFIER LBRACE enum_body RBRACE {
+        free($5->name);
+        $5->name = strdup($3); $5->is_public = 1;
+        free($3); $$ = $5;
+    }
+    ;
+
+enum_body:
+    IDENTIFIER {
+        EnumNode *en = make_enum("__enum_tmp__", 0);
+        en->variants = realloc(en->variants, sizeof(EnumVariant));
+        en->variants[0].name  = strdup($1);
+        en->variants[0].value = 0;
+        en->variant_count = 1;
+        free($1); $$ = en;
+    }
+    | enum_body COMMA IDENTIFIER {
+        EnumNode *en = $1;
+        int next_val = en->variant_count;
+        en->variants = realloc(en->variants,
+                               (en->variant_count + 1) * sizeof(EnumVariant));
+        en->variants[en->variant_count].name  = strdup($3);
+        en->variants[en->variant_count].value = next_val;
+        en->variant_count++;
+        free($3); $$ = en;
+    }
+    | enum_body COMMA { $$ = $1; }
     ;
 
 func_decl:

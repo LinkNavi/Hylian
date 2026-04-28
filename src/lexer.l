@@ -43,6 +43,7 @@ static int has_interpolation(const char *s) {
 }
 "include"           { return INCLUDE; }
 "class"             { return CLASS; }
+"enum"              { return ENUM; }
 "public"            { return PUBLIC; }
 "private"           { return PRIVATE; }
 "if"                { return IF; }
