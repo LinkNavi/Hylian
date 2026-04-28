@@ -77,6 +77,17 @@ ProgramNode *make_program() {
     return n;
 }
 
+EnumNode *make_enum(char *name, int is_public) {
+    EnumNode *n = malloc(sizeof(EnumNode));
+    n->base.type = NODE_ENUM;
+    zero_resolved_type(&n->base);
+    n->name = strdup(name);
+    n->is_public = is_public;
+    n->variants = NULL;
+    n->variant_count = 0;
+    return n;
+}
+
 ClassNode *make_class(char *name, int is_public) {
     ClassNode *n = malloc(sizeof(ClassNode));
     n->base.type = NODE_CLASS;
@@ -345,6 +356,27 @@ Type make_multi_type(Type *elems, int count, int is_any, int fixed_size) {
         t.elem_type_count = 0;
     }
     return t;
+}
+
+SwitchCaseNode *make_switch_case(ASTNode *value, int is_default) {
+    SwitchCaseNode *n = malloc(sizeof(SwitchCaseNode));
+    n->base.type = NODE_CASE;
+    zero_resolved_type(&n->base);
+    n->value = value;
+    n->is_default = is_default;
+    n->body = NULL;
+    n->body_count = 0;
+    return n;
+}
+
+SwitchNode *make_switch(ASTNode *subject) {
+    SwitchNode *n = malloc(sizeof(SwitchNode));
+    n->base.type = NODE_SWITCH;
+    zero_resolved_type(&n->base);
+    n->subject = subject;
+    n->cases = NULL;
+    n->case_count = 0;
+    return n;
 }
 
 ArrayLiteralNode *make_array_literal(ASTNode **elems, int count) {

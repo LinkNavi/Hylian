@@ -70,7 +70,6 @@ static int has_interpolation(const char *s) {
 "case"              { return CASE; }
 "default"           { return DEFAULT; }
 "defer"             { return DEFER; }
-"match"             { return MATCH; }
 "unsafe"            { return UNSAFE; }
 "const"             { return CONST; }
 "static"            { return STATIC; }
@@ -117,6 +116,7 @@ static int has_interpolation(const char *s) {
 "%="                { return MOD_ASSIGN; }
 "="                 { return ASSIGN; }
 ":="                { return DECLARE_ASSIGN; }
+":"                 { return COLON; }
 ">="                { return GE; }
 "<="                { return LE; }
 "=="                { return EQ; }

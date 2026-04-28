@@ -89,10 +89,10 @@ void typelist_add(TypeList* l, Type t) {
 
 %token INCLUDE CLASS PUBLIC PRIVATE IF ELSE RETURN NEW NIL TRUE_LIT FALSE_LIT
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
-%token DEFER MATCH UNSAFE CONST STATIC EXTERN AMP
+%token DEFER UNSAFE CONST STATIC EXTERN AMP
 %token INT STRING ERROR BOOL
 %token <str> ASM_BLOCK
-%token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET SEMICOLON COMMA DOT QUESTION
+%token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET SEMICOLON COMMA DOT QUESTION COLON
 %token ASSIGN DECLARE_ASSIGN
 %token INC DEC
 %token PLUS_ASSIGN MINUS_ASSIGN STAR_ASSIGN SLASH_ASSIGN MOD_ASSIGN
@@ -111,7 +111,7 @@ void typelist_add(TypeList* l, Type t) {
 %type <field_node> field_decl
 %type <type_node> type nullable_type
 %type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
-%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list tuple_type_items
+%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list tuple_type_items switch_arms
 %type <node> include_path
 
 
@@ -564,6 +564,31 @@ stmt:
         NodeList* sl=(NodeList*)$9; fn->body=sl->items; fn->body_count=sl->count; free(sl);
         free($4);
         $$ = (ASTNode*)fn; SET_LINE($$);
+    }
+    /* switch */
+    | SWITCH LPAREN expr RPAREN LBRACE switch_arms RBRACE {
+        SwitchNode* sn = make_switch($3);
+        NodeList* arms = (NodeList*)$6;
+        sn->cases = (SwitchCaseNode**)arms->items;
+        sn->case_count = arms->count;
+        free(arms);
+        $$ = (ASTNode*)sn; SET_LINE($$);
+    }
+    ;
+
+switch_arms:
+    /* empty */ { $$ = list_new(); }
+    | switch_arms CASE expr COLON LBRACE stmt_list RBRACE {
+        NodeList* l = (NodeList*)$1;
+        SwitchCaseNode* c = make_switch_case($3, 0); SET_LINE(c);
+        NodeList* body = (NodeList*)$6; c->body = body->items; c->body_count = body->count; free(body);
+        list_add(l, (ASTNode*)c); $$ = l;
+    }
+    | switch_arms DEFAULT COLON LBRACE stmt_list RBRACE {
+        NodeList* l = (NodeList*)$1;
+        SwitchCaseNode* c = make_switch_case(NULL, 1); SET_LINE(c);
+        NodeList* body = (NodeList*)$5; c->body = body->items; c->body_count = body->count; free(body);
+        list_add(l, (ASTNode*)c); $$ = l;
     }
     ;
 

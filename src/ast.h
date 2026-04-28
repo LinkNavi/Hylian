@@ -35,6 +35,9 @@ typedef enum {
     NODE_INDEX_ASSIGN,
     NODE_ASM_BLOCK,
     NODE_TUPLE,     /* tuple literal: (a, b, c) */
+    NODE_ENUM,      /* enum Color { Red, Green, Blue } */
+    NODE_SWITCH,    /* switch (expr) { case v: { } ... default: { } } */
+    NODE_CASE,      /* one arm of a switch: case value: { body } or default: { body } */
 } NodeType;
 
 typedef enum {
@@ -210,6 +213,19 @@ typedef struct {
 } ClassNode;
 
 typedef struct {
+    char *name;   /* variant identifier, e.g. "Red" */
+    int   value;  /* integer value, e.g. 0 */
+} EnumVariant;
+
+typedef struct {
+    ASTNode base;
+    char *name;
+    int is_public;
+    EnumVariant *variants;
+    int variant_count;
+} EnumNode;
+
+typedef struct {
     ASTNode base;
     ASTNode **declarations;
     int decl_count;
@@ -272,6 +288,7 @@ typedef struct {
 } IndexAssignNode;
 
 ProgramNode *make_program();
+EnumNode *make_enum(char *name, int is_public);
 ClassNode *make_class(char *name, int is_public);
 MethodNode *make_method(Type return_type, char *name);
 FuncNode *make_func(Type return_type, char *name);
@@ -299,6 +316,23 @@ DeferNode *make_defer(ASTNode *expr);
 BreakNode *make_break();
 ContinueNode *make_continue();
 
+typedef struct {
+    ASTNode base;
+    ASTNode *value;   /* NULL for default arm */
+    int is_default;
+    ASTNode **body;
+    int body_count;
+} SwitchCaseNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode *subject;          /* the expression being switched on */
+    SwitchCaseNode **cases;    /* array of case arms (includes default if present) */
+    int case_count;
+} SwitchNode;
+
+SwitchCaseNode *make_switch_case(ASTNode *value, int is_default);
+SwitchNode *make_switch(ASTNode *subject);
 ArrayLiteralNode *make_array_literal(ASTNode **elems, int count);
 IndexNode *make_index(ASTNode *object, ASTNode *index);
 IndexAssignNode *make_index_assign(ASTNode *object, ASTNode *index, ASTNode *value);

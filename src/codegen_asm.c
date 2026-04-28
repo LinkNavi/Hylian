@@ -278,6 +278,55 @@ static int class_field_offset(ClassInfo *ci, const char *field_name) {
     return -1;
 }
 
+/* ─── Enum registry ──────────────────────────────────────────────────────────── */
+
+#define MAX_ENUMS    32
+#define MAX_VARIANTS 64
+
+typedef struct {
+    char *variant_name;
+    int   value;
+} EnumVariantInfo;
+
+typedef struct {
+    char *name;
+    EnumVariantInfo variants[MAX_VARIANTS];
+    int  variant_count;
+} EnumRegEntry;
+
+static EnumRegEntry enum_registry[MAX_ENUMS];
+static int          enum_count = 0;
+
+static void enum_registry_reset(void) { enum_count = 0; }
+
+static EnumRegEntry *enum_find(const char *name) {
+    for (int i = 0; i < enum_count; i++)
+        if (strcmp(enum_registry[i].name, name) == 0)
+            return &enum_registry[i];
+    return NULL;
+}
+
+static void enum_register(EnumNode *en) {
+    if (enum_count >= MAX_ENUMS) return;
+    EnumRegEntry *ei = &enum_registry[enum_count++];
+    ei->name = en->name;
+    ei->variant_count = 0;
+    for (int i = 0; i < en->variant_count && i < MAX_VARIANTS; i++) {
+        ei->variants[i].variant_name = en->variants[i].name;
+        ei->variants[i].value        = en->variants[i].value;
+        ei->variant_count++;
+    }
+}
+
+static int enum_variant_value(const char *enum_name, const char *variant) {
+    EnumRegEntry *ei = enum_find(enum_name);
+    if (!ei) return -1;
+    for (int i = 0; i < ei->variant_count; i++)
+        if (strcmp(ei->variants[i].variant_name, variant) == 0)
+            return ei->variants[i].value;
+    return -1;
+}
+
 static const char *class_field_type(ClassInfo *ci, const char *field_name) {
     for (int i = 0; i < ci->field_count; i++)
         if (strcmp(ci->fields[i].name, field_name) == 0)
@@ -432,6 +481,16 @@ static int count_var_decls(ASTNode **stmts, int count) {
             ForInNode *nd = (ForInNode *)s;
             n += 4; /* __for_arr_N, __for_len_N, __for_idx_N, loop var */
             n += count_var_decls(nd->body, nd->body_count);
+            break;
+        }
+        case NODE_SWITCH: {
+            SwitchNode *sw = (SwitchNode *)s;
+            n += 1; /* __switch_N hidden local for subject */
+            for (int j = 0; j < sw->case_count; j++) {
+                SwitchCaseNode *arm = sw->cases[j];
+                if (arm)
+                    n += count_var_decls(arm->body, arm->body_count);
+            }
             break;
         }
         default:
@@ -845,6 +904,22 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
             break;
         }
 
+        /* ── EnumName.Variant → integer constant ────────────────────────── */
+        if (ma->object->type == NODE_IDENTIFIER) {
+            const char *id = ((IdentifierNode *)ma->object)->name;
+            EnumRegEntry *ei = enum_find(id);
+            if (ei) {
+                int val = enum_variant_value(id, ma->member);
+                if (val >= 0) {
+                    fprintf(out, "    mov rax, %d\n", val);
+                } else {
+                    fprintf(out, "    ; unknown enum variant '%s::%s'\n", id, ma->member);
+                    fprintf(out, "    xor rax, rax\n");
+                }
+                break;
+            }
+        }
+
         if (!class_name) {
             fprintf(out, "    ; member access: unknown class for .%s\n", ma->member);
             fprintf(out, "    xor rax, rax\n");
@@ -893,6 +968,85 @@ static void emit_expr(ASTNode *node, FILE *out, const char *fn_name) {
             emit_expr(mc->object, out, fn_name);
             fprintf(out, "    ; .message() — load Error.message ptr at offset 0\n");
             fprintf(out, "    mov rax, [rax + 0]\n");
+            break;
+        }
+
+        /* ── array.push(val) ─────────────────────────────────────────────── */
+        if (strcmp(class_name, "array") == 0 && strcmp(mc->method, "push") == 0) {
+            if (mc->arg_count < 1) {
+                fprintf(out, "    ; array.push(): missing argument\n");
+                fprintf(out, "    xor rax, rax\n");
+                break;
+            }
+            /* Realloc may move the array block, so we need the variable's stack
+               slot to update the stored pointer.  Only supported for simple
+               local identifier objects. */
+            int var_off = -1;
+            if (mc->object->type == NODE_IDENTIFIER)
+                var_off = locals_find(((IdentifierNode *)mc->object)->name);
+            if (var_off < 0) {
+                fprintf(out, "    ; array.push(): object is not a simple local — unsupported\n");
+                fprintf(out, "    xor rax, rax\n");
+                break;
+            }
+
+            int lbl_fast  = next_label();
+            int lbl_dbl   = next_label();
+            int lbl_alloc = next_label();
+
+            /* 1: evaluate argument, save on stack */
+            emit_expr(mc->args[0], out, fn_name);
+            fprintf(out, "    push rax\n");                         /* stack: [val] */
+
+            /* 2: load array pointer into r11 */
+            fprintf(out, "    mov r11, [rbp - %d]\n", var_off);
+
+            /* 3: bounds-check — compare length vs capacity */
+            fprintf(out, "    mov rax, [r11]\n");                   /* rax = length  */
+            fprintf(out, "    cmp rax, [r11 + 8]\n");              /* vs capacity   */
+            fprintf(out, "    jl .L%d\n", lbl_fast);               /* room? → skip realloc */
+
+            /* 4: realloc — double capacity (bootstrap to 8 if currently 0) */
+            fprintf(out, "    mov rax, [r11 + 8]\n");              /* rax = capacity */
+            fprintf(out, "    test rax, rax\n");
+            fprintf(out, "    jnz .L%d\n", lbl_dbl);
+            fprintf(out, "    mov rax, 8\n");
+            fprintf(out, "    jmp .L%d\n", lbl_alloc);
+            fprintf(out, ".L%d:\n", lbl_dbl);
+            fprintf(out, "    shl rax, 1\n");                      /* new_cap = cap * 2 */
+            fprintf(out, ".L%d:\n", lbl_alloc);
+            /* rax = new_cap; push it so it survives the call */
+            fprintf(out, "    push rax\n");                        /* stack: [new_cap, val] */
+            fprintf(out, "    mov rsi, rax\n");
+            fprintf(out, "    shl rsi, 3\n");                      /* rsi = new_cap * 8   */
+            fprintf(out, "    add rsi, 16\n");                     /* rsi = new byte size */
+            fprintf(out, "    mov rdi, r11\n");                    /* rdi = old ptr       */
+            fprintf(out, "    call realloc\n");
+            fprintf(out, "    mov r11, rax\n");                    /* r11 = new ptr       */
+            fprintf(out, "    mov [rbp - %d], r11\n", var_off);   /* update variable     */
+            fprintf(out, "    pop rax\n");                         /* stack: [val]; rax = new_cap */
+            fprintf(out, "    mov [r11 + 8], rax\n");             /* update capacity field */
+
+            /* 5: write element and bump length */
+            fprintf(out, ".L%d:\n", lbl_fast);
+            fprintf(out, "    mov rax, [r11]\n");                  /* rax = length (fresh load) */
+            fprintf(out, "    pop rcx\n");                         /* stack: []; rcx = val */
+            fprintf(out, "    lea rdx, [r11 + 16]\n");            /* element base  */
+            fprintf(out, "    mov [rdx + rax*8], rcx\n");         /* elements[len] = val */
+            fprintf(out, "    inc qword [r11]\n");                 /* length++      */
+            fprintf(out, "    xor rax, rax\n");                   /* push → void   */
+            break;
+        }
+
+        /* ── array.pop() ──────────────────────────────────────────────────── */
+        if (strcmp(class_name, "array") == 0 && strcmp(mc->method, "pop") == 0) {
+            /* Load array pointer; emit_self_addr puts it in rdi */
+            emit_self_addr(mc->object, out, fn_name);
+            fprintf(out, "    mov r11, rdi\n");                    /* r11 = array ptr */
+            fprintf(out, "    dec qword [r11]\n");                 /* length--        */
+            fprintf(out, "    mov rax, [r11]\n");                  /* rax = new length = last index */
+            fprintf(out, "    lea rdx, [r11 + 16]\n");            /* element base    */
+            fprintf(out, "    mov rax, [rdx + rax*8]\n");         /* rax = elements[last] */
             break;
         }
 
@@ -1342,6 +1496,58 @@ static void emit_stmt(ASTNode *node, FILE *out, const char *fn_name) {
         break;
     }
 
+    case NODE_SWITCH: {
+        SwitchNode *sw = (SwitchNode *)node;
+
+        /* Evaluate subject and stash in a hidden local */
+        int sw_lbl = next_label();
+        char subj_name[64];
+        snprintf(subj_name, sizeof(subj_name), "__switch_%d", sw_lbl);
+        int subj_off = locals_alloc(subj_name);
+
+        emit_expr(sw->subject, out, fn_name);
+        fprintf(out, "    mov [rbp - %d], rax\n", subj_off);
+
+        /* Allocate one label per arm plus one end label */
+        int *arm_labels = malloc(sw->case_count * sizeof(int));
+        int lbl_end = next_label();
+        int lbl_default = lbl_end; /* default jumps to end if absent */
+        for (int i = 0; i < sw->case_count; i++)
+            arm_labels[i] = next_label();
+
+        /* Emit comparison chain */
+        for (int i = 0; i < sw->case_count; i++) {
+            SwitchCaseNode *arm = sw->cases[i];
+            if (!arm) continue;
+            if (arm->is_default) {
+                lbl_default = arm_labels[i];
+                continue;
+            }
+            /* load subject */
+            fprintf(out, "    mov rax, [rbp - %d]\n", subj_off);
+            fprintf(out, "    push rax\n");
+            /* evaluate case value */
+            emit_expr(arm->value, out, fn_name);
+            fprintf(out, "    pop rcx\n");
+            fprintf(out, "    cmp rcx, rax\n");
+            fprintf(out, "    je .L%d\n", arm_labels[i]);
+        }
+        fprintf(out, "    jmp .L%d\n", lbl_default);
+
+        /* Emit each arm body */
+        for (int i = 0; i < sw->case_count; i++) {
+            SwitchCaseNode *arm = sw->cases[i];
+            if (!arm) continue;
+            fprintf(out, ".L%d:\n", arm_labels[i]);
+            emit_stmts(arm->body, arm->body_count, out, fn_name);
+            fprintf(out, "    jmp .L%d\n", lbl_end);
+        }
+
+        fprintf(out, ".L%d:\n", lbl_end);
+        free(arm_labels);
+        break;
+    }
+
     case NODE_FUNC_CALL: {
         /* Statement-level function call: emit and discard result */
         emit_expr(node, out, fn_name);
@@ -1637,7 +1843,7 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
         static const EarlyMod EARLY_MODS[] = {
             { "std.io",                    NULL,       NULL,                    1 },
             { "std.errors",                NULL,       NULL,                    0 },
-            { "std.strings",               NULL,       NULL,                    0 },
+            { "std.strings",               "str_",     "hylian_",               0 },
             { "std.system.filesystem",     NULL,       NULL,                    0 },
             { "std.system.env",            NULL,       NULL,                    0 },
             { "std.crypto",                "crypto_",  "hylian_crypto_",        0 },
@@ -1689,12 +1895,15 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
     /* Walk top-level declarations and emit functions */
     int found_main = 0;
 
-    /* Pre-pass: register all classes so field offsets are known during emission */
+    /* Pre-pass: register all classes and enums so they're known during emission */
     class_registry_reset();
+    enum_registry_reset();
     for (int i = 0; i < root->decl_count; i++) {
         ASTNode *decl = root->declarations[i];
         if (decl && decl->type == NODE_CLASS)
             class_register((ClassNode *)decl);
+        if (decl && decl->type == NODE_ENUM)
+            enum_register((EnumNode *)decl);
     }
 
     static const char *emit_arg_regs[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
@@ -1710,6 +1919,12 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
             emit_function(fn->name, fn->params, fn->param_count,
                           fn->body, fn->body_count,
                           is_main_fn, text_out);
+        } else if (decl->type == NODE_ENUM) {
+            EnumNode *en = (EnumNode *)decl;
+            fprintf(text_out, "    ; enum %s\n", en->name);
+            for (int j = 0; j < en->variant_count; j++)
+                fprintf(text_out, "    ; %s::%s = %d\n",
+                        en->name, en->variants[j].name, en->variants[j].value);
         } else if (decl->type == NODE_VAR_DECL) {
             /* Top-level var decl: emit as comment for now */
             fprintf(text_out, "    ; top-level var decl not emitted as code\n");
@@ -1874,7 +2089,7 @@ void codegen_asm(ProgramNode *root, FILE *out, const char *src_filename, const c
         /* include path              obj        stem                        externs                                           link_libs        fn_prefix    io? */
         { "std.io",                  "io",      "io",                       "hylian_print hylian_println hylian_int_to_str",  NULL,            NULL,        1 },
         { "std.errors",              "errors",  "errors",                   "hylian_make_error hylian_panic",                 NULL,            NULL,        0 },
-        { "std.strings",             "strings", "strings",                  "hylian_str_len hylian_str_concat hylian_str_eq", NULL,            NULL,        0 },
+        { "std.strings",             "strings", "strings",                  "hylian_length hylian_is_empty hylian_contains hylian_starts_with hylian_ends_with hylian_index_of hylian_slice hylian_trim hylian_trim_start hylian_trim_end hylian_to_upper hylian_to_lower hylian_replace hylian_split hylian_join hylian_to_int hylian_to_float hylian_from_int hylian_equals", NULL, "str_",      0 },
         { "std.system.filesystem",   "fs",      "system/filesystem",        "hylian_file_read hylian_file_write hylian_file_exists hylian_file_size hylian_mkdir", NULL, NULL, 0 },
         { "std.system.env",          "env",     "system/env",               "hylian_getenv hylian_exit",                      NULL,            NULL,        0 },
         { "std.crypto",              "crypto",  "crypto",                   "hylian_crypto_hash hylian_crypto_hash_hex hylian_crypto_hmac hylian_crypto_hmac_hex hylian_crypto_encrypt hylian_crypto_decrypt hylian_crypto_random_bytes hylian_crypto_random_int hylian_crypto_random_float hylian_crypto_constant_time_eq", "-lssl -lcrypto", "crypto_", 0 },
