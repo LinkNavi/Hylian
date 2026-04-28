@@ -88,6 +88,18 @@ static int        func_count = 0;
 static FieldEntry fields[1024];
 static int        field_count = 0;
 
+/* ─── Enum type registry ────────────────────────────────────────────────────── */
+
+static const char *enum_type_names[64];
+static int         enum_type_count = 0;
+
+static int is_enum_type(const char *name) {
+    for (int i = 0; i < enum_type_count; i++)
+        if (enum_type_names[i] && strcmp(enum_type_names[i], name) == 0)
+            return 1;
+    return 0;
+}
+
 static FuncInfo *func_lookup(const char *name) {
     for (int i = 0; i < func_count; i++)
         if (funcs[i].name && strcmp(funcs[i].name, name) == 0)
@@ -275,6 +287,15 @@ static Type infer_expr(ASTNode *node) {
 
     case NODE_MEMBER_ACCESS: {
         MemberAccessNode *ma = (MemberAccessNode *)node;
+        /* ── EnumName.Variant → int ── */
+        if (ma->object && ma->object->type == NODE_IDENTIFIER) {
+            const char *id = ((IdentifierNode *)ma->object)->name;
+            if (is_enum_type(id)) {
+                result = make_simple_type("int", 0);
+                node->resolved_type = result;
+                break;
+            }
+        }
         Type obj_type = infer_expr(ma->object);
         if (obj_type.kind == TYPE_ARRAY) {
             if (ma->member && (strcmp(ma->member, "len") == 0 ||
@@ -547,15 +568,22 @@ void typecheck(ProgramNode *program, const char *filename) {
     current_tc_file = filename ? filename : "<unknown>";
 
     /* Reset state */
-    sym_count   = 0;
-    scope_depth = 0;
-    func_count  = 0;
-    field_count = 0;
+    sym_count       = 0;
+    scope_depth     = 0;
+    func_count      = 0;
+    field_count     = 0;
+    enum_type_count = 0;
 
-    /* Pass 1: register all top-level functions and classes */
+    /* Pass 1: register all top-level functions, classes, and enums */
     for (int i = 0; i < program->decl_count; i++) {
         ASTNode *d = program->declarations[i];
         if (!d) continue;
+
+        if (d->type == NODE_ENUM) {
+            EnumNode *en = (EnumNode *)d;
+            if (enum_type_count < 64)
+                enum_type_names[enum_type_count++] = en->name;
+        }
 
         if (d->type == NODE_FUNC) {
             FuncNode *fn = (FuncNode *)d;

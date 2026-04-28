@@ -77,6 +77,17 @@ ProgramNode *make_program() {
     return n;
 }
 
+EnumNode *make_enum(char *name, int is_public) {
+    EnumNode *n = malloc(sizeof(EnumNode));
+    n->base.type = NODE_ENUM;
+    zero_resolved_type(&n->base);
+    n->name = strdup(name);
+    n->is_public = is_public;
+    n->variants = NULL;
+    n->variant_count = 0;
+    return n;
+}
+
 ClassNode *make_class(char *name, int is_public) {
     ClassNode *n = malloc(sizeof(ClassNode));
     n->base.type = NODE_CLASS;
