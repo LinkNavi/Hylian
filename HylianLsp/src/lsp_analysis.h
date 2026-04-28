@@ -65,7 +65,8 @@ typedef struct {
     /* All known source files */
     ProjectFile files[MAX_PROJECT_FILES];
     int         file_count;
-
+CompletionItem stdlib_completions[MAX_COMPLETIONS];
+int            stdlib_completion_count;
     /* Merged completion list built from ALL files in the project.
        Rebuilt by lsp_project_rebuild_index() whenever any file changes. */
     CompletionItem global_completions[MAX_COMPLETIONS];
