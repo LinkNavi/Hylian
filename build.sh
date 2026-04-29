@@ -102,7 +102,7 @@ fi
     exit 1
   fi
 
-  run gcc lex.yy.c parser.tab.c ast.c codegen_asm.c typecheck.c compiler.c -o ../hylian
+  run gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c typecheck.c compiler.c -o ../hylian
   if [[ $? -ne 0 ]]; then
     fail "gcc compilation failed"
     exit 1

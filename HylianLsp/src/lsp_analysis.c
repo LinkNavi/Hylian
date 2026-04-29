@@ -1493,10 +1493,6 @@ int lsp_complete(LspState *st,
             }
         }
 
-<<<<<<< HEAD
-        if (class_name)
-        {
-=======
         if (class_name) {
             /* ── array<T> built-in members ── */
             if (strcmp(class_name, "array") == 0) {
@@ -1541,7 +1537,6 @@ int lsp_complete(LspState *st,
                 if (count > 0) return count;
             }
 
->>>>>>> cee1e098bf54fe8000a97e65f56d7bf242249313
             /* Find the class definition across the whole project */
             ClassNode *cn = find_class_in_project(proj, class_name);
             if (cn)

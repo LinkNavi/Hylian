@@ -56,7 +56,7 @@ header "Building Hylian Compiler"
 cd src
 bison -d parser.y   2>/dev/null
 flex lexer.l        2>/dev/null
-gcc lex.yy.c parser.tab.c ast.c codegen_asm.c typecheck.c compiler.c \
+gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c typecheck.c compiler.c \
     -o ../hylian 2>&1
 if [ $? -ne 0 ]; then
     echo -e "${RED}✗ Compiler build failed — aborting.${NC}"
@@ -94,6 +94,54 @@ resolve_runtime_obj() {
 resolve_runtime_obj "runtime/std/io"      "io_runtime.o"
 resolve_runtime_obj "runtime/std/errors"  "errors_runtime.o"
 resolve_runtime_obj "runtime/std/strings" "strings_runtime.o"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IR dump test runner (checks stderr output from --dump-ir, no linking needed)
+# run_test_ir_dump <id> <desc> <hy_src> <grep_pattern> [absent_pattern]
+# Pass = grep_pattern IS found in dump AND absent_pattern (if given) is NOT found.
+# ─────────────────────────────────────────────────────────────────────────────
+
+run_test_ir_dump() {
+    local id="$1"
+    local desc="$2"
+    local src="$3"
+    local must_have="$4"
+    local must_not_have="${5:-}"   # optional: pattern that must be absent
+
+    local hy_file="__test_${id}.hy"
+    local asm_file="__test_${id}.asm"
+    TMPFILES+=("$hy_file" "$asm_file")
+
+    printf '%s' "$src" > "$hy_file"
+
+    local ir_out
+    ir_out=$(./hylian "$hy_file" -o "$asm_file" --dump-ir 2>&1)
+    if [ $? -ne 0 ]; then
+        fail_msg "$desc"
+        info_msg "compiler error: $ir_out"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    if ! echo "$ir_out" | grep -qF "$must_have"; then
+        fail_msg "$desc"
+        info_msg "expected pattern: $must_have"
+        info_msg "dump (first 10 lines): $(echo "$ir_out" | head -10)"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    if [ -n "$must_not_have" ] && echo "$ir_out" | grep -qF "$must_not_have"; then
+        fail_msg "$desc"
+        info_msg "pattern should be absent: $must_not_have"
+        info_msg "dump (first 10 lines): $(echo "$ir_out" | head -10)"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    pass_msg "$desc"
+    PASS=$((PASS + 1))
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test runner
@@ -987,6 +1035,492 @@ Error? main() {
     return nil;
 }' \
 "1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: Strings (std.strings)
+# ─────────────────────────────────────────────────────────────────────────────
+
+section "Strings (std.strings)"
+
+run_test "t110" "str_length of literal" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    int n = str_length("hello");
+    println(n);
+    return nil;
+}' \
+"5"
+
+run_test "t111" "str_length of variable" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    str s = "hylian";
+    int n = str_length(s);
+    println(n);
+    return nil;
+}' \
+"6"
+
+run_test "t112" "str_to_upper" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    str s = str_to_upper("hello");
+    println(s);
+    return nil;
+}' \
+"HELLO"
+
+run_test "t113" "str_to_lower" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    str s = str_to_lower("WORLD");
+    println(s);
+    return nil;
+}' \
+"world"
+
+run_test "t114" "str_contains true" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    bool found = str_contains("hello world", "world");
+    if (found) {
+        println("yes");
+    } else {
+        println("no");
+    }
+    return nil;
+}' \
+"yes"
+
+run_test "t115" "str_contains false" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    bool found = str_contains("hello", "xyz");
+    if (found) {
+        println("yes");
+    } else {
+        println("no");
+    }
+    return nil;
+}' \
+"no"
+
+run_test "t116" "str_equals same strings" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    bool eq = str_equals("hello", "hello");
+    if (eq) {
+        println("equal");
+    } else {
+        println("not equal");
+    }
+    return nil;
+}' \
+"equal"
+
+run_test "t117" "str_equals different strings" \
+'include {
+    std.io,
+    std.strings,
+}
+Error? main() {
+    bool eq = str_equals("foo", "bar");
+    if (eq) {
+        println("equal");
+    } else {
+        println("not equal");
+    }
+    return nil;
+}' \
+"not equal"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: Array push / pop
+# ─────────────────────────────────────────────────────────────────────────────
+
+section "Array push / pop"
+
+run_test "t120" "push increases len" \
+'include {
+    std.io,
+}
+Error? main() {
+    array<int> nums = [];
+    nums.push(10);
+    nums.push(20);
+    nums.push(30);
+    println(nums.len);
+    return nil;
+}' \
+"3"
+
+run_test "t121" "push then index" \
+'include {
+    std.io,
+}
+Error? main() {
+    array<int> nums = [];
+    nums.push(42);
+    println(nums[0]);
+    return nil;
+}' \
+"42"
+
+run_test "t122" "push multiple and read all" \
+'include {
+    std.io,
+}
+Error? main() {
+    array<int> nums = [];
+    nums.push(1);
+    nums.push(2);
+    nums.push(3);
+    println(nums[0]);
+    println(nums[1]);
+    println(nums[2]);
+    return nil;
+}' \
+"1
+2
+3"
+
+run_test "t123" "pop returns last element" \
+'include {
+    std.io,
+}
+Error? main() {
+    array<int> nums = [10, 20, 30];
+    int v = nums.pop();
+    println(v);
+    return nil;
+}' \
+"30"
+
+run_test "t124" "pop decreases len" \
+'include {
+    std.io,
+}
+Error? main() {
+    array<int> nums = [10, 20, 30];
+    nums.pop();
+    println(nums.len);
+    return nil;
+}' \
+"2"
+
+run_test "t125" "push-then-pop LIFO order" \
+'include {
+    std.io,
+}
+Error? main() {
+    array<int> nums = [];
+    nums.push(5);
+    nums.push(10);
+    int a = nums.pop();
+    int b = nums.pop();
+    println(a);
+    println(b);
+    return nil;
+}' \
+"10
+5"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: Enums
+# ─────────────────────────────────────────────────────────────────────────────
+
+section "Enums"
+
+run_test "t130" "enum variant value (first = 0)" \
+'include {
+    std.io,
+}
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+Error? main() {
+    int v = Color.Red;
+    println(v);
+    return nil;
+}' \
+"0"
+
+run_test "t131" "enum variant value (second = 1)" \
+'include {
+    std.io,
+}
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+Error? main() {
+    int v = Color.Green;
+    println(v);
+    return nil;
+}' \
+"1"
+
+run_test "t132" "enum variant value (third = 2)" \
+'include {
+    std.io,
+}
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+Error? main() {
+    int v = Direction.East;
+    println(v);
+    return nil;
+}' \
+"2"
+
+run_test "t133" "enum in if comparison" \
+'include {
+    std.io,
+}
+enum Status {
+    Ok,
+    Fail,
+}
+Error? main() {
+    int s = Status.Ok;
+    if (s == Status.Ok) {
+        println("ok");
+    } else {
+        println("fail");
+    }
+    return nil;
+}' \
+"ok"
+
+run_test "t134" "enum stored in variable" \
+'include {
+    std.io,
+}
+enum Level {
+    Low,
+    Mid,
+    High,
+}
+Error? main() {
+    int lvl = Level.High;
+    println(lvl);
+    return nil;
+}' \
+"2"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: Switch statements
+# ─────────────────────────────────────────────────────────────────────────────
+
+section "Switch statements"
+
+run_test "t140" "switch matches first case" \
+'include {
+    std.io,
+}
+Error? main() {
+    int x = 1;
+    switch (x) {
+        case 1: { println("one"); }
+        case 2: { println("two"); }
+        case 3: { println("three"); }
+    }
+    return nil;
+}' \
+"one"
+
+run_test "t141" "switch matches middle case" \
+'include {
+    std.io,
+}
+Error? main() {
+    int x = 2;
+    switch (x) {
+        case 1: { println("one"); }
+        case 2: { println("two"); }
+        case 3: { println("three"); }
+    }
+    return nil;
+}' \
+"two"
+
+run_test "t142" "switch with default" \
+'include {
+    std.io,
+}
+Error? main() {
+    int x = 99;
+    switch (x) {
+        case 1: { println("one"); }
+        case 2: { println("two"); }
+        default: { println("other"); }
+    }
+    return nil;
+}' \
+"other"
+
+run_test "t143" "switch on enum variant" \
+'include {
+    std.io,
+}
+enum Dir {
+    North,
+    South,
+    East,
+    West,
+}
+Error? main() {
+    int d = Dir.South;
+    switch (d) {
+        case Dir.North: { println("north"); }
+        case Dir.South: { println("south"); }
+        case Dir.East:  { println("east"); }
+        case Dir.West:  { println("west"); }
+    }
+    return nil;
+}' \
+"south"
+
+run_test "t144" "switch no match and no default does nothing" \
+'include {
+    std.io,
+}
+Error? main() {
+    int x = 5;
+    switch (x) {
+        case 1: { println("one"); }
+        case 2: { println("two"); }
+    }
+    println("done");
+    return nil;
+}' \
+"done"
+
+run_test "t145" "switch on computed expression" \
+'include {
+    std.io,
+}
+Error? main() {
+    int a = 1;
+    int b = 2;
+    switch (a + b) {
+        case 2: { println("two"); }
+        case 3: { println("three"); }
+        default: { println("other"); }
+    }
+    return nil;
+}' \
+"three"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: IR layer (--dump-ir)
+# ─────────────────────────────────────────────────────────────────────────────
+
+section "IR layer (--dump-ir)"
+
+run_test_ir_dump "t150" "--dump-ir emits before-opt header" \
+'include {
+    std.io,
+}
+Error? main() {
+    println("hi");
+    return nil;
+}' \
+"=== IR before optimization ==="
+
+run_test_ir_dump "t151" "--dump-ir emits after-opt header" \
+'include {
+    std.io,
+}
+Error? main() {
+    println("hi");
+    return nil;
+}' \
+"=== IR after optimization"
+
+run_test_ir_dump "t152" "--dump-ir shows FUNC_BEGIN in dump" \
+'include {
+    std.io,
+}
+Error? main() {
+    println("hi");
+    return nil;
+}' \
+"FUNC_BEGIN"
+
+run_test_ir_dump "t153" "--dump-ir shows CONST_INT in dump" \
+'include {
+    std.io,
+}
+Error? main() {
+    int x = 7;
+    println(x);
+    return nil;
+}' \
+"CONST_INT"
+
+run_test_ir_dump "t154" "constant folding: optimization makes at least one change" \
+'include {
+    std.io,
+}
+Error? main() {
+    int x = 2 + 3;
+    println(x);
+    return nil;
+}' \
+"=== IR after optimization" \
+"(0 changes)"
+
+run_test_ir_dump "t155" "--dump-ir shows STORE_VAR for named variable" \
+'include {
+    std.io,
+}
+Error? main() {
+    int n = 42;
+    println(n);
+    return nil;
+}' \
+"STORE_VAR"
+
+run_test "t156" "--dump-ir still produces correct output" \
+'include {
+    std.io,
+}
+Error? main() {
+    int x = 10;
+    int y = 20;
+    println(x + y);
+    return nil;
+}' \
+"30"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Results

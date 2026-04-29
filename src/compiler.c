@@ -4,8 +4,10 @@
 
 #include "ast.h"
 #include "codegen_asm.h"
+#include "ir.h"
+#include "lower.h"
+#include "opt.h"
 #include "typecheck.h"
-#include <string.h>
 
 /* ─── External parser interface ─────────────────────────────────────────────── */
 
@@ -189,12 +191,14 @@ int main(int argc, char **argv) {
     const char *output_file = NULL;
     const char *src_dir     = ".";
     const char *target      = "linux";
+    int dump_ir = 0;
 
     /* Parse arguments:
          hylian <input.hy>
          hylian <input.hy> -o <output.asm>
          hylian <input.hy> -o <output.asm> --src-dir <dir>
-         hylian <input.hy> --target <linux|macos|windows> */
+         hylian <input.hy> --target <linux|macos|windows>
+         hylian <input.hy> --dump-ir */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
@@ -208,11 +212,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "hylian: unknown target '%s' (must be linux, macos, or windows)\n", target);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--dump-ir") == 0) {
+            dump_ir = 1;
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
         } else {
             fprintf(stderr, "hylian: unknown option '%s'\n", argv[i]);
-            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows]\n");
+            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows] [--dump-ir]\n");
             return 1;
         }
     }
@@ -223,7 +229,7 @@ int main(int argc, char **argv) {
 
     if (!input_file) {
         fprintf(stderr, "hylian: no input file specified\n");
-        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows]\n");
+        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows] [--dump-ir]\n");
         return 1;
     }
 
@@ -235,15 +241,39 @@ int main(int argc, char **argv) {
     ProgramNode *program = compile_file(input_file, src_dir);
     if (!program) return 1;
 
+    typecheck(program, input_file);
+
+    /* Lower AST → IR */
+    IRModule *mod = lower_program(program);
+
+    if (dump_ir) {
+        fprintf(stderr, "=== IR before optimization ===\n");
+        ir_dump(mod, stderr);
+        fprintf(stderr, "\n");
+    }
+
+    /* Optimize IR */
+    int changes = opt_run_all(mod);
+
+    if (dump_ir) {
+        fprintf(stderr, "=== IR after optimization (%d change%s) ===\n",
+                changes, changes == 1 ? "" : "s");
+        ir_dump(mod, stderr);
+        fprintf(stderr, "\n");
+    }
+
+    /* Generate assembly from IR */
     FILE *out = fopen(output_file, "w");
     if (!out) {
         fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);
+        ir_module_free(mod);
         return 1;
     }
 
-    typecheck(program, input_file);
-    codegen_asm(program, out, input_file, target);
+    codegen_ir(mod, out, input_file, target);
     fclose(out);
+    ir_module_free(mod);
+
     printf("Generated %s\n", output_file);
     return 0;
 }
