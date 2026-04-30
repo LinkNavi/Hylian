@@ -134,6 +134,9 @@ void ir_dump(const IRModule *mod, FILE *out) {
         if (ins->op == IR_FUNC_BEGIN) {
             if (in_func) fprintf(out, "\n");
             in_func = 1;
+            fprintf(out, "; FUNC_BEGIN %s%s\n",
+                    ins->str_extra ? ins->str_extra : "?",
+                    ins->extra_int ? " [main]" : "");
             fprintf(out, "; ── fn %s%s ──\n",
                     ins->str_extra ? ins->str_extra : "?",
                     ins->extra_int ? " [main]" : "");

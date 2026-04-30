@@ -1107,9 +1107,10 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename, const char *
             emit_ir_function(mod, i, text_out);
             /* Skip to FUNC_END */
             int depth = 1;
-            while (++i < mod->instr_count && depth > 0) {
+            while (++i < mod->instr_count) {
                 if (mod->instrs[i].op == IR_FUNC_BEGIN) depth++;
                 if (mod->instrs[i].op == IR_FUNC_END)   depth--;
+                if (depth == 0) break;
             }
         }
     }
@@ -1135,7 +1136,7 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename, const char *
     } StdMod;
     static const StdMod STD[] = {
         { "std.io",                  "io",      "io",                  "hylian_print hylian_println hylian_int_to_str",  NULL,            NULL,        1 },
-        { "std.errors",              "errors",  "errors",              "hylian_make_error hylian_panic",                 NULL,            NULL,        0 },
+        { "std.errors",              "errors",  "errors",              "hylian_make_error hylian_panic Error_message Error_code", NULL, NULL, 0 },
         { "std.strings",             "strings", "strings",             "hylian_length hylian_is_empty hylian_contains hylian_starts_with hylian_ends_with hylian_index_of hylian_slice hylian_trim hylian_trim_start hylian_trim_end hylian_to_upper hylian_to_lower hylian_replace hylian_split hylian_join hylian_to_int hylian_to_float hylian_from_int hylian_equals", NULL, "str_",      0 },
         { "std.system.filesystem",   "fs",      "system/filesystem",   "hylian_file_read hylian_file_write hylian_file_exists hylian_file_size hylian_mkdir", NULL, NULL, 0 },
         { "std.system.env",          "env",     "system/env",          "hylian_getenv hylian_exit",                      NULL,            NULL,        0 },

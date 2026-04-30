@@ -220,9 +220,8 @@ static int lower_expr(ASTNode *node, LowerState *s) {
 
         /* ── Err("msg") ────────────────────────────────────────────────── */
         if (strcmp(call->name, "Err") == 0) {
-            int t    = alloc_temp(s);
-            IRInstr *ins = ir_emit(s->mod, IR_ERR);
-            ins->dest   = irop_temp(t);
+            int t = alloc_temp(s);
+            IROperand err_src1 = irop_const_str(strdup("error"));
             if (call->arg_count >= 1) {
                 ASTNode *arg = call->args[0];
                 if (arg->type == NODE_LITERAL && ((LiteralNode *)arg)->lit_type == LIT_STRING) {
@@ -232,28 +231,27 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     if (len >= 2 && v[0] == '"' && v[len-1] == '"') {
                         memcpy(uq, v+1, len-2); uq[len-2] = '\0';
                     } else { strcpy(uq, v); }
-                    ins->src1 = irop_const_str(uq);
+                    err_src1 = irop_const_str(uq);
                 } else {
                     int ta = lower_expr(arg, s);
-                    ins->src1 = irop_temp(ta);
+                    err_src1 = irop_temp(ta);
                 }
-            } else {
-                ins->src1 = irop_const_str(strdup("error"));
             }
+            IRInstr *ins = ir_emit(s->mod, IR_ERR);
+            ins->dest = irop_temp(t);
+            ins->src1 = err_src1;
             return t;
         }
 
         /* ── panic("msg") ──────────────────────────────────────────────── */
         if (strcmp(call->name, "panic") == 0) {
             int t = alloc_temp(s);
+            IROperand panic_src1 = irop_const_str(strdup("panic"));
+            if (call->arg_count >= 1)
+                panic_src1 = irop_temp(lower_expr(call->args[0], s));
             IRInstr *ins = ir_emit(s->mod, IR_PANIC);
             ins->dest = irop_temp(t);
-            if (call->arg_count >= 1) {
-                int ta = lower_expr(call->args[0], s);
-                ins->src1 = irop_temp(ta);
-            } else {
-                ins->src1 = irop_const_str(strdup("panic"));
-            }
+            ins->src1 = panic_src1;
             return t;
         }
 
@@ -261,12 +259,16 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         if (strcmp(call->name, "print") == 0 || strcmp(call->name, "println") == 0) {
             int t = alloc_temp(s);
             IROpcode irop = strcmp(call->name, "print") == 0 ? IR_PRINT : IR_PRINTLN;
-            IRInstr *ins  = ir_emit(s->mod, irop);
-            ins->dest = irop_temp(t);
+            /* Evaluate the argument BEFORE emitting the print instruction so that
+               any IR_LOAD_VAR / IR_CONST_* instructions appear first in the stream.
+               Also avoids using a stale pointer if ir_emit() reallocates instrs[]. */
+            int cat = PRINT_ARG_STR_LIT;
+            IROperand src1 = irop_const_str(strdup(""));
+            InterpSegment *extra_segs = NULL;
+            int extra_seg_count = 0;
             if (call->arg_count >= 1) {
                 ASTNode *arg = call->args[0];
-                int cat = classify_print_arg(arg);
-                ins->extra_int = cat;
+                cat = classify_print_arg(arg);
                 if (cat == PRINT_ARG_STR_LIT) {
                     LiteralNode *lit = (LiteralNode *)arg;
                     const char *v = lit->value; size_t len = strlen(v);
@@ -274,39 +276,43 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     if (len >= 2 && v[0] == '"' && v[len-1] == '"') {
                         memcpy(uq, v+1, len-2); uq[len-2] = '\0';
                     } else { strcpy(uq, v); }
-                    ins->src1 = irop_const_str(uq);
+                    src1 = irop_const_str(uq);
                 } else if (cat == PRINT_ARG_INTERP) {
-                    /* embed segments directly for codegen */
                     InterpStringNode *istr = (InterpStringNode *)arg;
-                    ins->extra_segs     = istr->segments;
-                    ins->extra_seg_count = istr->seg_count;
-                    ins->src1 = irop_none();
+                    extra_segs      = istr->segments;
+                    extra_seg_count = istr->seg_count;
+                    src1 = irop_none();
                 } else {
                     int ta = lower_expr(arg, s);
-                    ins->src1 = irop_temp(ta);
+                    src1 = irop_temp(ta);
                 }
-            } else {
-                ins->extra_int = PRINT_ARG_STR_LIT;
-                ins->src1 = irop_const_str(strdup(""));
             }
+            IRInstr *ins = ir_emit(s->mod, irop);
+            ins->dest           = irop_temp(t);
+            ins->extra_int      = cat;
+            ins->src1           = src1;
+            ins->extra_segs     = extra_segs;
+            ins->extra_seg_count = extra_seg_count;
             return t;
         }
 
         /* ── General function call ─────────────────────────────────────── */
-        int t = alloc_temp(s);
-        IRInstr *ins = ir_emit(s->mod, IR_CALL);
-        ins->dest       = irop_temp(t);
-        ins->str_extra  = strdup(call->name);
-        int nargs = call->arg_count > 6 ? 6 : call->arg_count;
-        if (nargs > 0) {
-            ins->args     = malloc(nargs * sizeof(IROperand));
-            ins->arg_count = nargs;
-            for (int i = 0; i < nargs; i++) {
-                int ta = lower_expr(call->args[i], s);
-                ins->args[i] = irop_temp(ta);
+        {
+            int t = alloc_temp(s);
+            int nargs = call->arg_count > 6 ? 6 : call->arg_count;
+            IROperand *arg_ops = NULL;
+            if (nargs > 0) {
+                arg_ops = malloc(nargs * sizeof(IROperand));
+                for (int i = 0; i < nargs; i++)
+                    arg_ops[i] = irop_temp(lower_expr(call->args[i], s));
             }
+            IRInstr *ins = ir_emit(s->mod, IR_CALL);
+            ins->dest      = irop_temp(t);
+            ins->str_extra = strdup(call->name);
+            ins->args      = arg_ops;
+            ins->arg_count = nargs;
+            return t;
         }
-        return t;
     }
 
     /* ── Method call ──────────────────────────────────────────────────────── */
@@ -318,53 +324,51 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         int is_arr = (mc->object &&
                       mc->object->resolved_type.kind == TYPE_ARRAY);
         if (is_arr && strcmp(mc->method, "push") == 0 && mc->arg_count >= 1) {
-            IRInstr *ins = ir_emit(s->mod, IR_ARRAY_PUSH);
-            ins->dest = irop_temp(t);
+            char *arr_name = (mc->object->type == NODE_IDENTIFIER)
+                             ? strdup(((IdentifierNode *)mc->object)->name) : NULL;
             int tobj = lower_expr(mc->object, s);
-            ins->src1 = irop_temp(tobj);
             int tval = lower_expr(mc->args[0], s);
-            ins->src2 = irop_temp(tval);
-            /* carry the var name so codegen can update the stack slot */
-            if (mc->object->type == NODE_IDENTIFIER)
-                ins->str_extra = strdup(((IdentifierNode *)mc->object)->name);
+            IRInstr *ins = ir_emit(s->mod, IR_ARRAY_PUSH);
+            ins->dest      = irop_temp(t);
+            ins->src1      = irop_temp(tobj);
+            ins->src2      = irop_temp(tval);
+            ins->str_extra = arr_name;
             return t;
         }
         if (is_arr && strcmp(mc->method, "pop") == 0) {
+            int tobj = lower_expr(mc->object, s);
             IRInstr *ins = ir_emit(s->mod, IR_ARRAY_POP);
             ins->dest = irop_temp(t);
-            int tobj = lower_expr(mc->object, s);
             ins->src1 = irop_temp(tobj);
             return t;
         }
 
-        /* Generic method call */
-        IRInstr *ins = ir_emit(s->mod, IR_CALL);
-        ins->dest = irop_temp(t);
-        /* Build mangled name: ClassName_methodName */
-        const char *cname = NULL;
-        if (mc->object && mc->object->resolved_type.kind == TYPE_SIMPLE &&
-            mc->object->resolved_type.name)
-            cname = mc->object->resolved_type.name;
-        if (cname) {
-            size_t sz = strlen(cname) + 1 + strlen(mc->method) + 1;
-            char *mn = malloc(sz);
-            snprintf(mn, sz, "%s_%s", cname, mc->method);
-            ins->str_extra = mn;
-        } else {
-            /* Fallback: method name alone */
-            ins->str_extra = strdup(mc->method);
+        /* Generic method call — evaluate self and args before emitting IR_CALL */
+        {
+            const char *cname = NULL;
+            if (mc->object && mc->object->resolved_type.kind == TYPE_SIMPLE &&
+                mc->object->resolved_type.name)
+                cname = mc->object->resolved_type.name;
+            char *mname;
+            if (cname) {
+                size_t sz = strlen(cname) + 1 + strlen(mc->method) + 1;
+                mname = malloc(sz);
+                snprintf(mname, sz, "%s_%s", cname, mc->method);
+            } else {
+                mname = strdup(mc->method);
+            }
+            int total = 1 + (mc->arg_count > 5 ? 5 : mc->arg_count);
+            IROperand *arg_ops = malloc(total * sizeof(IROperand));
+            arg_ops[0] = irop_temp(lower_expr(mc->object, s));
+            for (int i = 0; i < total - 1; i++)
+                arg_ops[i + 1] = irop_temp(lower_expr(mc->args[i], s));
+            IRInstr *ins = ir_emit(s->mod, IR_CALL);
+            ins->dest      = irop_temp(t);
+            ins->str_extra = mname;
+            ins->args      = arg_ops;
+            ins->arg_count = total;
+            return t;
         }
-        /* self + args */
-        int total = 1 + (mc->arg_count > 5 ? 5 : mc->arg_count);
-        ins->args     = malloc(total * sizeof(IROperand));
-        ins->arg_count = total;
-        int tself = lower_expr(mc->object, s);
-        ins->args[0] = irop_temp(tself);
-        for (int i = 0; i < total - 1; i++) {
-            int ta = lower_expr(mc->args[i], s);
-            ins->args[i + 1] = irop_temp(ta);
-        }
-        return t;
     }
 
     /* ── Member access ────────────────────────────────────────────────────── */
@@ -391,17 +395,8 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             return t;
         }
 
-        /* EnumName.Variant */
-        if (ma->object && ma->object->type == NODE_IDENTIFIER) {
-            IdentifierNode *id = (IdentifierNode *)ma->object;
-            IRInstr *ins    = ir_emit(s->mod, IR_ENUM_VAL);
-            ins->dest       = irop_temp(t);
-            ins->str_extra  = strdup(id->name);
-            ins->str_extra2 = strdup(ma->member);
-            return t;
-        }
-
-        /* Class field access */
+        /* Class field access — must come before enum check because a class
+           instance variable is also a NODE_IDENTIFIER */
         if (ma->object && ma->object->resolved_type.kind == TYPE_SIMPLE &&
             ma->object->resolved_type.name) {
             int tobj = lower_expr(ma->object, s);
@@ -409,6 +404,16 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->dest       = irop_temp(t);
             ins->src1       = irop_temp(tobj);
             ins->str_extra  = strdup(ma->object->resolved_type.name);
+            ins->str_extra2 = strdup(ma->member);
+            return t;
+        }
+
+        /* EnumName.Variant */
+        if (ma->object && ma->object->type == NODE_IDENTIFIER) {
+            IdentifierNode *id = (IdentifierNode *)ma->object;
+            IRInstr *ins    = ir_emit(s->mod, IR_ENUM_VAL);
+            ins->dest       = irop_temp(t);
+            ins->str_extra  = strdup(id->name);
             ins->str_extra2 = strdup(ma->member);
             return t;
         }
@@ -424,18 +429,18 @@ static int lower_expr(ASTNode *node, LowerState *s) {
     case NODE_NEW: {
         NewNode *nn = (NewNode *)node;
         int t = alloc_temp(s);
+        int nargs = nn->arg_count > 5 ? 5 : nn->arg_count;
+        IROperand *arg_ops = NULL;
+        if (nargs > 0) {
+            arg_ops = malloc(nargs * sizeof(IROperand));
+            for (int i = 0; i < nargs; i++)
+                arg_ops[i] = irop_temp(lower_expr(nn->args[i], s));
+        }
         IRInstr *ins = ir_emit(s->mod, IR_NEW);
         ins->dest      = irop_temp(t);
         ins->str_extra = strdup(nn->class_name);
-        int nargs = nn->arg_count > 5 ? 5 : nn->arg_count;
-        if (nargs > 0) {
-            ins->args      = malloc(nargs * sizeof(IROperand));
-            ins->arg_count = nargs;
-            for (int i = 0; i < nargs; i++) {
-                int ta = lower_expr(nn->args[i], s);
-                ins->args[i] = irop_temp(ta);
-            }
-        }
+        ins->args      = arg_ops;
+        ins->arg_count = nargs;
         return t;
     }
 
@@ -443,16 +448,16 @@ static int lower_expr(ASTNode *node, LowerState *s) {
     case NODE_ARRAY_LITERAL: {
         ArrayLiteralNode *al = (ArrayLiteralNode *)node;
         int t = alloc_temp(s);
+        IROperand *elem_ops = NULL;
+        if (al->elem_count > 0) {
+            elem_ops = malloc(al->elem_count * sizeof(IROperand));
+            for (int i = 0; i < al->elem_count; i++)
+                elem_ops[i] = irop_temp(lower_expr(al->elements[i], s));
+        }
         IRInstr *ins = ir_emit(s->mod, IR_ARRAY_INIT);
         ins->dest      = irop_temp(t);
-        if (al->elem_count > 0) {
-            ins->args      = malloc(al->elem_count * sizeof(IROperand));
-            ins->arg_count = al->elem_count;
-            for (int i = 0; i < al->elem_count; i++) {
-                int te = lower_expr(al->elements[i], s);
-                ins->args[i] = irop_temp(te);
-            }
-        }
+        ins->args      = elem_ops;
+        ins->arg_count = al->elem_count;
         return t;
     }
 
@@ -605,25 +610,27 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
     /* ── Member assign (obj.field = val) ─────────────────────────────────── */
     case NODE_MEMBER_ASSIGN: {
         MemberAssignNode *ma = (MemberAssignNode *)node;
+        /* Evaluate value and object BEFORE emitting IR_SET_FIELD */
         int tval = lower_expr(ma->value, s);
-        IRInstr *ins = ir_emit(s->mod, IR_SET_FIELD);
-        /* src1 = object pointer (NULL object means self) */
+        int tobj_or_self;
+        char *obj_class;
         if (ma->object == NULL) {
-            /* Implicit self — emit LOAD_VAR "self" */
-            int tself = alloc_temp(s);
+            tobj_or_self = alloc_temp(s);
             IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR);
-            lv->dest = irop_temp(tself); lv->str_extra = strdup("self");
-            ins->src1 = irop_temp(tself);
-            ins->str_extra = s->class_name ? strdup(s->class_name) : strdup("?");
+            lv->dest = irop_temp(tobj_or_self);
+            lv->str_extra = strdup("self");
+            obj_class = s->class_name ? strdup(s->class_name) : strdup("?");
         } else {
-            int tobj = lower_expr(ma->object, s);
-            ins->src1 = irop_temp(tobj);
-            ins->str_extra =
+            tobj_or_self = lower_expr(ma->object, s);
+            obj_class =
                 (ma->object->resolved_type.kind == TYPE_SIMPLE && ma->object->resolved_type.name)
                 ? strdup(ma->object->resolved_type.name)
                 : (s->class_name ? strdup(s->class_name) : strdup("?"));
         }
+        IRInstr *ins = ir_emit(s->mod, IR_SET_FIELD);
+        ins->src1       = irop_temp(tobj_or_self);
         ins->src2       = irop_temp(tval);
+        ins->str_extra  = obj_class;
         ins->str_extra2 = strdup(ma->member);
         break;
     }
@@ -644,11 +651,11 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
     /* ── Return ───────────────────────────────────────────────────────────── */
     case NODE_RETURN: {
         ReturnNode *ret = (ReturnNode *)node;
+        IROperand ret_src = {.kind = IROP_NONE};
+        if (ret->value)
+            ret_src = irop_temp(lower_expr(ret->value, s));
         IRInstr *ins = ir_emit(s->mod, IR_RETURN);
-        if (ret->value) {
-            int tv = lower_expr(ret->value, s);
-            ins->src1 = irop_temp(tv);
-        }
+        ins->src1 = ret_src;
         break;
     }
 

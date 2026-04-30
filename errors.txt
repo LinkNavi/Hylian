@@ -1,0 +1,26 @@
+❯ ./test.sh
+
+══════════════════════════════════════════
+  Building Hylian Compiler
+══════════════════════════════════════════
+  ✓ Compiler built successfully
+
+══════════════════════════════════════════
+  Resolving Runtime Objects
+══════════════════════════════════════════
+  ✓ runtime/std/io.o
+  ✓ runtime/std/errors.o
+  ✓ runtime/std/strings.o
+
+  ── Basic I/O ──
+Generated __test_t01.asm
+  ✓ PASS  Hello World
+Generated __test_t02.asm
+  ✓ PASS  print without newline then println
+Generated __test_t03.asm
+  ✗ FAIL  println integer
+    expected: 42
+    got:      0
+Generated __test_t04.asm
+  ✓ PASS  multiple println calls
+

@@ -33,6 +33,24 @@ void *hylian_make_error(char *msg, int64_t len) {
     return (void *)err;
 }
 
+// ── Error_message / Error_code ───────────────────────────────────────────────
+//
+// Methods on the Error class:
+//   Error_message(err) -> char*     returns the message string pointer
+//   Error_code(err)    -> int64_t   returns the numeric code (currently 0)
+
+char *Error_message(void *err) {
+    if (!err) return (char *)"";
+    char **e = (char **)err;
+    return e[0];
+}
+
+int64_t Error_code(void *err) {
+    if (!err) return 0;
+    char **e = (char **)err;
+    return *((int64_t *)(e + 1));
+}
+
 // ── hylian_panic ─────────────────────────────────────────────────────────────
 //
 // Write "panic: <msg>\n" to stderr and exit with code 1. Does not return.

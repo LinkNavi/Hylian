@@ -14,6 +14,7 @@ static int has_side_effects(const IRInstr *ins) {
     case IR_SET_FIELD:
     case IR_ARRAY_STORE:
     case IR_ARRAY_PUSH:
+    case IR_ARRAY_POP:
     case IR_CALL:
     case IR_NEW:
     case IR_RETURN:
