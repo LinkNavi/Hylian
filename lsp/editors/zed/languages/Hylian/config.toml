@@ -1,0 +1,6 @@
+name = "Hylian"
+grammar = "hylian"
+path_suffixes = ["hy"]
+
+[language_servers]
+"hylian-lsp" = { language_ids = { "Hylian" = "hylian" } }

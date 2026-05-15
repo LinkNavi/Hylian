@@ -1,0 +1,110 @@
+// Hylian kernel stdlib interface — std.kernel
+// Hylian bare-metal kernel I/O and hardware interface
+//
+// Usage:
+//   include {
+//       std.kernel,
+//   }
+
+module std.kernel
+
+// Clear the entire VGA text screen and reset the cursor to (0, 0).
+fn vga_clear()
+
+// Set the VGA text color attribute (0x00–0xFF).
+// Low nibble  = foreground colour (0=black … 15=bright white).
+// High nibble = background colour (0=black … 7=dark grey).
+// Common values: 0x07 = light grey on black (default),
+//                0x0F = bright white on black,
+//                0x02 = green on black,
+//                0x04 = red on black.
+fn vga_set_color(color: int)
+
+// Write one byte to a hardware I/O port (x86 OUT instruction).
+fn outb(port: int, value: int)
+
+// Read one byte from a hardware I/O port (x86 IN instruction).
+// Returns the byte value as an int (0–255).
+fn inb(port: int) -> int
+
+// Halt the CPU by looping on the HLT instruction.
+// Returns only if an interrupt fires and wakes the CPU.
+// Call in an infinite loop to permanently stop execution:
+//   while true { halt() }
+fn halt()
+
+// Print a string to the VGA text buffer without a trailing newline.
+fn print(msg: str)
+
+// Print a string to the VGA text buffer followed by a newline.
+fn println(msg: str)
+
+// Print an integer to the VGA text buffer followed by a newline.
+fn println(n: int)
+
+// Disable hardware interrupts (x86 CLI instruction).
+fn cli()
+
+// Enable hardware interrupts (x86 STI instruction).
+fn sti()
+
+// Read a control register. n must be a literal 0, 2, 3, or 4.
+// Example: uint64 fault_addr = read_cr(2);
+fn read_cr(n: int) -> uint64
+
+// Write a control register. n must be a literal 0, 2, 3, or 4.
+// Example: write_cr(3, new_page_table);
+fn write_cr(n: int, val: uint64)
+
+// Save all general-purpose registers onto the stack (ISR entry).
+// Pass 1 to also push a dummy zero error-code slot first:
+//   save_regs()   — for exceptions that push their own error code (e.g. #DF, #GP, #PF)
+//   save_regs(1)  — for exceptions with no error code (e.g. #DE, #UD)
+fn save_regs(push_dummy_error_code: int)
+fn save_regs()
+
+// Restore all general-purpose registers from the stack (ISR exit).
+// Pass 1 to discard the error-code slot before popping:
+//   restore_regs()   — for ISRs where the error code was already consumed
+//   restore_regs(1)  — for ISRs that used save_regs(1) or need to skip the slot
+fn restore_regs(skip_error_code: int)
+fn restore_regs()
+
+// Return from an interrupt handler (iretq).
+fn iret()
+
+// Fill a block of memory with a byte value.
+// ptr: pointer to the memory block
+// val: byte value to fill (0–255)
+// count: number of bytes to fill
+fn memset(ptr: *void, val: int, count: usize)
+
+// Copy a block of memory from src to dst.
+// dst: destination pointer
+// src: source pointer
+// count: number of bytes to copy
+fn memcpy(dst: *void, src: *void, count: usize)
+
+// Return the compile-time byte size of a named type.
+// Example: size_of(uint32) returns 4
+fn size_of(T: str) -> usize
+
+// ── Limine memory map accessors ───────────────────────────────────────────────
+
+// Returns the Higher Half Direct Map base offset Limine set up.
+// All physical addresses are accessible at phys + hhdm_offset().
+fn hhdm_offset() -> uint64
+
+// Returns the number of entries in the Limine memory map.
+fn memmap_count() -> uint64
+
+// Returns the physical base address of memory map entry i.
+fn memmap_base(i: uint64) -> uint64
+
+// Returns the length in bytes of memory map entry i.
+fn memmap_len(i: uint64) -> uint64
+
+// Returns the type of memory map entry i.
+// 0 = usable, 1 = reserved, 2 = ACPI reclaimable, 3 = ACPI NVS,
+// 4 = bad memory, 5 = bootloader reclaimable, 6 = kernel/modules, 7 = framebuffer
+fn memmap_type(i: uint64) -> uint64

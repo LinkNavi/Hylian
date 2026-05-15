@@ -1,0 +1,2746 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include "lsp_c_extractor.h"
+#include "lsp_analysis.h"
+#include "lsp_diag.h"
+#include "lsp_log.h"
+#include "ast.h"
+#include "typecheck.h"
+#include <unistd.h>
+
+static void log_include_processing(const char *include_name, const char *current_file)
+{
+    lsp_log("[lsp_analysis] Processing include: %s (from file: %s)", include_name, current_file);
+}
+
+static void log_function_resolution(const char *func_name, const char *module_name, const char *current_file)
+{
+    lsp_log("[lsp_analysis] Resolving function: %s in module: %s (from file: %s)", func_name, module_name, current_file);
+}
+
+extern int lsp_yyparse(void);
+extern void lsp_yyrestart(FILE *f);
+extern int lsp_yylineno;
+extern ProgramNode *root;
+extern const char *lsp_current_file;
+
+
+static const char *hylian_keywords[] = {
+    "if", "else", "while", "for", "in", "return", "new", "nil", "true", "false",
+    "break", "continue", "defer", "class", "public", "private",
+    "include", "void", "int", "str", "bool", "float", "Error",
+    "array", "multi", "any", "switch", "case", "default", "unsafe", "const", "static", "extern",
+    "volatile", "packed", "naked", "usize", "isize",
+    "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+    "float32", "float64",
+    NULL};
+
+
+typedef struct
+{
+    const char *name;
+    const char *detail;
+} BuiltinFunc;
+
+static const BuiltinFunc hylian_builtins[] = {
+    {"print", "void print(...)"},
+    {"panic", "void panic(str message)"},
+    {"Err", "Error Err(str message)"},
+    {"len", "int len(array<T> arr)"},
+    {"push", "void push(array<T> arr, T val)"},
+    {"pop", "T pop(array<T> arr)"},
+    {"exit", "void exit(int code)"},
+    {NULL, NULL}};
+
+
+/* Return heap-allocated directory portion of path, or "." */
+static char *dir_of(const char *path)
+{
+    const char *last = strrchr(path, '/');
+    if (!last)
+        return strdup(".");
+    int len = (int)(last - path);
+    char *dir = malloc(len + 1);
+    strncpy(dir, path, len);
+    dir[len] = '\0';
+    return dir;
+}
+
+/* Convert dot-separated module name to a filesystem path.
+   e.g. base_dir="/proj", module="Game.Player" -> "/proj/Game/Player.hy" */
+static char *module_to_filepath(const char *base_dir, const char *module)
+{
+    int mlen = (int)strlen(module);
+    /* replace dots with slashes */
+    char *rel = malloc(mlen + 4);
+    for (int i = 0; i < mlen; i++)
+        rel[i] = (module[i] == '.') ? '/' : module[i];
+    strcpy(rel + mlen, ".hy");
+
+    int total = (int)strlen(base_dir) + 1 + (int)strlen(rel) + 1;
+    char *full = malloc(total);
+    snprintf(full, total, "%s/%s", base_dir, rel);
+    free(rel);
+    return full;
+}
+
+/* Normalise a path: resolve ".." and "." components in place.
+   Very simple — just collapses double slashes and obvious ".." segments. */
+static void normalise_path(char *path)
+{
+    /* collapse // */
+    int len = (int)strlen(path);
+    for (int i = 0; i < len - 1; i++)
+    {
+        if (path[i] == '/' && path[i + 1] == '/')
+        {
+            memmove(path + i, path + i + 1, len - i);
+            len--;
+            i--;
+        }
+    }
+}
+/* Parse "void print(...)" -> return_type="void", name="print" */
+static void parse_c_sig(const char *detail, char *ret_type, char *name)
+{
+    ret_type[0] = '\0';
+    name[0] = '\0';
+    if (!detail)
+        return;
+
+    /* Simple parse: first word is return type, second is name(...) */
+    char buf[512];
+    strncpy(buf, detail, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *p = buf;
+    /* Skip leading whitespace */
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    /* Extract return type */
+    char *r = ret_type;
+    while (*p && *p != ' ' && *p != '\t')
+        *r++ = *p++;
+    *r = '\0';
+
+    /* Skip to name */
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    /* Extract name (stop at '(') */
+    char *n = name;
+    while (*p && *p != '(' && *p != ' ')
+        *n++ = *p++;
+    *n = '\0';
+}
+
+static void type_to_str(Type t, char *buf, int bufsz)
+{
+    if (t.kind == TYPE_ARRAY)
+    {
+        if (t.elem_type_count > 0 && t.elem_types && t.elem_types[0].name)
+            snprintf(buf, bufsz, "array<%s>", t.elem_types[0].name);
+        else
+            snprintf(buf, bufsz, "array<unknown>");
+    }
+    else if (t.kind == TYPE_MULTI)
+    {
+        if (t.is_any)
+            snprintf(buf, bufsz, "multi<any>");
+        else
+            snprintf(buf, bufsz, "multi<...>");
+    }
+    else if (t.kind == TYPE_TUPLE)
+    {
+        char tmp[256] = "(";
+        for (int i = 0; i < t.elem_type_count; i++)
+        {
+            char et[64];
+            type_to_str(t.elem_types[i], et, sizeof(et));
+            if (i > 0)
+                strncat(tmp, ", ", sizeof(tmp) - strlen(tmp) - 1);
+            strncat(tmp, et, sizeof(tmp) - strlen(tmp) - 1);
+        }
+        strncat(tmp, ")", sizeof(tmp) - strlen(tmp) - 1);
+        snprintf(buf, bufsz, "%s%s", tmp, t.nullable ? "?" : "");
+    }
+    else
+    {
+        snprintf(buf, bufsz, "%s%s",
+                 t.name ? t.name : "unknown",
+                 t.nullable ? "?" : "");
+    }
+}
+
+
+static void add_completion_to(CompletionItem *arr, int *count, int max,
+                              const char *label, CompletionKind kind,
+                              const char *detail, const char *doc)
+{
+    if (*count >= max)
+        return;
+    /* Deduplicate: skip if a completion with the same label+kind already exists */
+    for (int i = 0; i < *count; i++)
+    {
+        if (arr[i].kind == kind && strcmp(arr[i].label, label) == 0)
+            return;
+    }
+    CompletionItem *it = &arr[(*count)++];
+    snprintf(it->label, sizeof(it->label), "%s", label ? label : "");
+    snprintf(it->detail, sizeof(it->detail), "%s", detail ? detail : "");
+    snprintf(it->documentation, sizeof(it->documentation), "%s", doc ? doc : "");
+    it->kind = kind;
+}
+
+/* Build a human-readable signature string for a function/method */
+static void build_sig(char *buf, int bufsz,
+                      const char *ret, const char *name,
+                      ASTNode **params, int param_count)
+{
+    char pstr[256] = "";
+    for (int p = 0; p < param_count && params && params[p]; p++)
+    {
+        VarDeclNode *vd = (VarDeclNode *)params[p];
+        char pt[32];
+        type_to_str(vd->var_type, pt, sizeof(pt));
+        if (p > 0)
+            strncat(pstr, ", ", sizeof(pstr) - strlen(pstr) - 1);
+        strncat(pstr, pt, sizeof(pstr) - strlen(pstr) - 1);
+        strncat(pstr, " ", sizeof(pstr) - strlen(pstr) - 1);
+        strncat(pstr, vd->var_name, sizeof(pstr) - strlen(pstr) - 1);
+    }
+    snprintf(buf, bufsz, "%s %s(%s)", ret, name, pstr);
+}
+
+
+static ProgramNode *parse_source(const char *filepath, const char *source)
+{
+    lsp_log("[lsp_analysis] parse_source: file=%s", filepath);
+    FILE *tmp = tmpfile();
+    if (!tmp)
+        return NULL;
+    fwrite(source, 1, strlen(source), tmp);
+    rewind(tmp);
+
+    root = NULL;
+    lsp_current_file = filepath;
+    lsp_yyrestart(tmp);
+    lsp_yylineno = 1;
+    lsp_yyparse();
+    fclose(tmp);
+
+    ProgramNode *prog = root;
+    root = NULL;
+    return prog;
+}
+
+static ProgramNode *parse_file_from_disk(const char *filepath)
+{
+    lsp_log("[lsp_analysis] parse_file_from_disk: file=%s", filepath);
+    FILE *f = fopen(filepath, "r");
+    if (!f)
+        return NULL;
+
+    /* Read the whole file into memory */
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0)
+    {
+        fclose(f);
+        return NULL;
+    }
+
+    char *buf = malloc(sz + 1);
+    if (!buf)
+    {
+        fclose(f);
+        return NULL;
+    }
+    fread(buf, 1, sz, f);
+    fclose(f);
+    buf[sz] = '\0';
+
+    ProgramNode *prog = parse_source(filepath, buf);
+    free(buf);
+    return prog;
+}
+
+
+static void index_program(ProgramNode *prog,
+                          const char *source_file,
+                          CompletionItem *arr, int *count, int max)
+{
+    if (!prog)
+    {
+        lsp_log("[lsp_analysis] index_program: NULL program");
+        return;
+    }
+
+    for (int i = 0; i < prog->decl_count; i++)
+    {
+        ASTNode *d = prog->declarations[i];
+        if (!d)
+            continue;
+
+        if (d->type == NODE_FUNC)
+        {
+            FuncNode *fn = (FuncNode *)d;
+            char ret[64];
+            type_to_str(fn->return_type, ret, sizeof(ret));
+            char sig[256];
+            build_sig(sig, sizeof(sig), ret, fn->name,
+                      fn->params, fn->param_count);
+            char doc[512];
+            snprintf(doc, sizeof(doc), "defined in `%s`", source_file);
+            add_completion_to(arr, count, max, fn->name, COMPLETE_FUNCTION, sig, doc);
+        }
+
+        if (d->type == NODE_ENUM) {
+            EnumNode *en = (EnumNode *)d;
+            char doc[512];
+            snprintf(doc, sizeof(doc), "defined in `%s`", source_file);
+            add_completion_to(arr, count, max, en->name, COMPLETE_CLASS,
+                              en->name, doc);
+            for (int v = 0; v < en->variant_count && *count < max; v++) {
+                char det[128];
+                snprintf(det, sizeof(det), "%s::%s = %d",
+                         en->name, en->variants[v].name, en->variants[v].value);
+                char vdoc[512];
+                snprintf(vdoc, sizeof(vdoc), "variant of enum `%s` in `%s`",
+                         en->name, source_file);
+                add_completion_to(arr, count, max, en->variants[v].name,
+                                  COMPLETE_VARIABLE, det, vdoc);
+            }
+        }
+
+        if (d->type == NODE_CLASS)
+        {
+            ClassNode *cn = (ClassNode *)d;
+            char doc[512];
+            snprintf(doc, sizeof(doc), "defined in `%s`", source_file);
+            add_completion_to(arr, count, max, cn->name, COMPLETE_CLASS,
+                              cn->name, doc);
+
+            for (int m = 0; m < cn->method_count; m++)
+            {
+                MethodNode *mn = cn->methods[m];
+                if (!mn)
+                    continue;
+                char ret[64];
+                type_to_str(mn->return_type, ret, sizeof(ret));
+                char sig[256];
+                char msig[300];
+                build_sig(sig, sizeof(sig), ret, mn->name,
+                          mn->params, mn->param_count);
+                snprintf(msig, sizeof(msig), "%s::%s", cn->name, sig + strlen(ret) + 1);
+                char mdoc[512];
+                snprintf(mdoc, sizeof(mdoc), "method of `%s` in `%s`",
+                         cn->name, source_file);
+                add_completion_to(arr, count, max, mn->name, COMPLETE_METHOD,
+                                  msig, mdoc);
+            }
+
+            for (int f = 0; f < cn->field_count; f++)
+            {
+                FieldNode *fld = cn->fields[f];
+                if (!fld || !fld->is_public)
+                    continue;
+                char ft[64];
+                type_to_str(fld->field_type, ft, sizeof(ft));
+                char det[128];
+                snprintf(det, sizeof(det), "%s.%s: %s", cn->name, fld->name, ft);
+                char fdoc[512];
+                snprintf(fdoc, sizeof(fdoc), "field of `%s` in `%s`",
+                         cn->name, source_file);
+                add_completion_to(arr, count, max, fld->name, COMPLETE_FIELD,
+                                  det, fdoc);
+            }
+        }
+
+        if (d->type == NODE_MODULE)
+        {
+            ModuleNode *mn = (ModuleNode *)d;
+            char doc[512];
+            snprintf(doc, sizeof(doc), "module defined in `%s`", source_file);
+            add_completion_to(arr, count, max, mn->name, COMPLETE_CLASS, mn->name, doc);
+
+            for (int fi = 0; fi < mn->func_count && *count < max; fi++)
+            {
+                FuncNode *fn = mn->funcs[fi];
+                if (!fn || !fn->is_public) continue;
+                char ret[64];
+                type_to_str(fn->return_type, ret, sizeof(ret));
+                char sig[256];
+                build_sig(sig, sizeof(sig), ret, fn->name, fn->params, fn->param_count);
+                char label[256];
+                snprintf(label, sizeof(label), "%s.%s", mn->name, fn->name);
+                char fdoc[512];
+                snprintf(fdoc, sizeof(fdoc), "public function in module `%s` in `%s`",
+                         mn->name, source_file);
+                add_completion_to(arr, count, max, label, COMPLETE_FUNCTION, sig, fdoc);
+            }
+        }
+    }
+}
+
+
+static void scan_dir(LspProject *proj, const char *dir_path)
+{
+    lsp_log("[lsp_analysis] scan_dir: %s", dir_path);
+    DIR *d = opendir(dir_path);
+    if (!d)
+        return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL)
+    {
+        if (ent->d_name[0] == '.')
+            continue; /* skip hidden / . / .. */
+
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+        normalise_path(full);
+
+        struct stat st;
+        if (lstat(full, &st) != 0)
+            continue;
+
+        /* Never follow symlinks — avoids infinite loops through e.g. Wine's z: */
+        if (S_ISLNK(st.st_mode))
+            continue;
+
+        if (S_ISDIR(st.st_mode))
+        {
+            scan_dir(proj, full);
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            int nlen = (int)strlen(ent->d_name);
+            if (nlen > 3 && strcmp(ent->d_name + nlen - 3, ".hy") == 0)
+            {
+                lsp_project_get_or_add_file(proj, full);
+            }
+        }
+    }
+    closedir(d);
+}
+
+static int parse_hyi_sig(const char *line, char *name, char *ret_type, char *params, int max_len)
+{
+    /* Format: fn name(param: type, ...) -> ret_type */
+    /* or:     fn name() -> ret_type */
+    /* or:     fn name(param: type) */
+
+    const char *p = line;
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    if (strncmp(p, "fn ", 3) != 0)
+        return 0;
+    p += 3;
+
+    /* Extract function name */
+    const char *name_start = p;
+    while (*p && *p != '(' && *p != ' ' && *p != '\t')
+        p++;
+    int name_len = p - name_start;
+    if (name_len <= 0 || name_len >= max_len)
+        return 0;
+    memcpy(name, name_start, name_len);
+    name[name_len] = '\0';
+
+    /* Skip to params */
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != '(')
+        return 0;
+    p++;
+
+    /* Extract params */
+    const char *params_start = p;
+    int depth = 1;
+    while (*p && depth > 0)
+    {
+        if (*p == '(')
+            depth++;
+        else if (*p == ')')
+            depth--;
+        p++;
+    }
+    if (depth != 0)
+        return 0;
+    int params_len = (p - 1) - params_start; /* exclude closing ) */
+    if (params_len < 0)
+        params_len = 0;
+    if (params_len >= max_len)
+        params_len = max_len - 1;
+    memcpy(params, params_start, params_len);
+    params[params_len] = '\0';
+
+    /* Default return type */
+    strcpy(ret_type, "void");
+
+    /* Check for -> return type */
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p == '-' && *(p + 1) == '>')
+    {
+        p += 2;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        const char *ret_start = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+            p++;
+        int ret_len = p - ret_start;
+        if (ret_len > 0 && ret_len < max_len)
+        {
+            memcpy(ret_type, ret_start, ret_len);
+            ret_type[ret_len] = '\0';
+        }
+    }
+
+    return 1;
+}
+
+/* Forward declaration — resolve_vendor_import (defined below scan_hyi_stdlib)
+   calls resolve_imports which is defined after it. */
+static void resolve_imports(LspProject *proj, ProjectFile *pf);
+
+static void scan_hyi_vendor_file(LspProject *proj, const char *filepath, const char *module_name)
+{
+    lsp_log("[lsp_analysis] scan_hyi_vendor_file: %s (module: %s)", filepath, module_name);
+    FILE *f = fopen(filepath, "r");
+    if (!f)
+        return;
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    char current_class[128] = {0};
+    char current_struct[128] = {0};
+
+    while ((linelen = getline(&line, &linecap, f)) > 0)
+    {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (p[0] == '/' && p[1] == '/')
+            continue;
+
+        /* const NAME = VALUE — register as a constant completion */
+        if (strncmp(p, "const ", 6) == 0)
+        {
+            const char *cn = p + 6;
+            while (*cn == ' ' || *cn == '\t') cn++;
+            const char *cn_end = cn;
+            while (*cn_end && *cn_end != ' ' && *cn_end != '\t' && *cn_end != '=' && *cn_end != '\n' && *cn_end != '\r')
+                cn_end++;
+            int cn_len = cn_end - cn;
+            if (cn_len > 0 && cn_len < 128)
+            {
+                char const_name[128];
+                memcpy(const_name, cn, cn_len);
+                const_name[cn_len] = '\0';
+
+                /* parse value after '=' for detail string */
+                char val_str[64] = "?";
+                const char *eq = strchr(cn_end, '=');
+                if (eq) {
+                    const char *vp = eq + 1;
+                    while (*vp == ' ' || *vp == '\t') vp++;
+                    int vi = 0;
+                    while (*vp && *vp != '\n' && *vp != '\r' && vi < 63)
+                        val_str[vi++] = *vp++;
+                    val_str[vi] = '\0';
+                }
+
+                int dup = 0;
+                for (int j = 0; j < proj->stdlib_completion_count; j++)
+                    if (strcmp(proj->stdlib_completions[j].label, const_name) == 0) { dup = 1; break; }
+                if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+                {
+                    CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                    memset(it, 0, sizeof(*it));
+                    snprintf(it->label,         sizeof(it->label),         "%s", const_name);
+                    snprintf(it->detail,        sizeof(it->detail),        "const int = %s", val_str);
+                    snprintf(it->documentation, sizeof(it->documentation), "constant from `%s`", module_name);
+                    it->kind = COMPLETE_VARIABLE;
+                    lsp_log("[lsp_analysis] Registered vendor const: %s = %s", const_name, val_str);
+                }
+            }
+            continue;
+        }
+
+        /* Check for closing brace — exit class/struct context.
+           Skip if this line also contains '{' (e.g. one-liner "class Foo {}"
+           has already been handled below before we reach '}' separately). */
+        if (p[0] == '}')
+        {
+            current_class[0] = '\0';
+            current_struct[0] = '\0';
+            continue;
+        }
+
+        /* Check for class block: "class Name {"  or one-liner "class Name {}" */
+        if (strncmp(p, "class ", 6) == 0)
+        {
+            current_struct[0] = '\0';
+            const char *cn = p + 6;
+            while (*cn == ' ' || *cn == '\t') cn++;
+            /* skip "class const Foo {}" artefacts from bindgen */
+            if (strncmp(cn, "const", 5) == 0) continue;
+            const char *cn_end = cn;
+            while (*cn_end && *cn_end != ' ' && *cn_end != '\t' && *cn_end != '{' && *cn_end != '\n' && *cn_end != '\r')
+                cn_end++;
+            int cn_len = cn_end - cn;
+            if (cn_len > 0 && cn_len < (int)sizeof(current_class))
+            {
+                memcpy(current_class, cn, cn_len);
+                current_class[cn_len] = '\0';
+
+                /* Register COMPLETE_CLASS for the class name itself */
+                char doc[512];
+                snprintf(doc, sizeof(doc), "vendor class from `%s`", module_name);
+
+                int dup = 0;
+                for (int j = 0; j < proj->stdlib_completion_count; j++)
+                {
+                    if (strcmp(proj->stdlib_completions[j].label, current_class) == 0)
+                    {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+                {
+                    CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                    memset(it, 0, sizeof(*it));
+                    snprintf(it->label, sizeof(it->label), "%s", current_class);
+                    snprintf(it->detail, sizeof(it->detail), "class %s", current_class);
+                    snprintf(it->documentation, sizeof(it->documentation), "%s", doc);
+                    it->kind = COMPLETE_CLASS;
+                    lsp_log("[lsp_analysis] Registered vendor class: %s", current_class);
+                }
+
+                /* one-liner "class Name {}" — don't keep context open */
+                if (strstr(p, "{}"))
+                    current_class[0] = '\0';
+            }
+            continue;
+        }
+
+        /* Check for struct block: "struct Name {"  or one-liner "struct Name {}" */
+        if (strncmp(p, "struct ", 7) == 0)
+        {
+            current_class[0] = '\0';
+            const char *sn = p + 7;
+            while (*sn == ' ' || *sn == '\t') sn++;
+            const char *sn_end = sn;
+            while (*sn_end && *sn_end != ' ' && *sn_end != '\t' && *sn_end != '{' && *sn_end != '\n' && *sn_end != '\r')
+                sn_end++;
+            int sn_len = sn_end - sn;
+            if (sn_len > 0 && sn_len < (int)sizeof(current_struct))
+            {
+                memcpy(current_struct, sn, sn_len);
+                current_struct[sn_len] = '\0';
+
+                /* Register COMPLETE_CLASS for the struct name (structs are types) */
+                char doc[512];
+                snprintf(doc, sizeof(doc), "vendor struct from `%s`", module_name);
+
+                int dup = 0;
+                for (int j = 0; j < proj->stdlib_completion_count; j++)
+                {
+                    if (strcmp(proj->stdlib_completions[j].label, current_struct) == 0)
+                    {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+                {
+                    CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                    memset(it, 0, sizeof(*it));
+                    snprintf(it->label, sizeof(it->label), "%s", current_struct);
+                    snprintf(it->detail, sizeof(it->detail), "struct %s", current_struct);
+                    snprintf(it->documentation, sizeof(it->documentation), "%s", doc);
+                    it->kind = COMPLETE_CLASS;
+                    lsp_log("[lsp_analysis] Registered vendor struct: %s", current_struct);
+                }
+
+                /* one-liner "struct Name {}" — don't keep context open */
+                if (strstr(p, "{}"))
+                    current_struct[0] = '\0';
+            }
+            continue;
+        }
+
+        /* If inside a struct block, parse field lines (skip fn lines) */
+        if (current_struct[0])
+        {
+            if (strncmp(p, "fn ", 3) == 0 || strncmp(p, "module ", 7) == 0 || strncmp(p, "link ", 5) == 0)
+                continue;
+            if (p[0] == '\0' || p[0] == '\n' || p[0] == '\r')
+                continue;
+
+            /* Read field type */
+            char ftype[64] = {0};
+            int ti = 0;
+            const char *fp = p;
+            while (*fp && *fp != ' ' && *fp != '\t' && ti < 63) ftype[ti++] = *fp++;
+            ftype[ti] = '\0';
+            if (!ftype[0]) continue;
+
+            /* Skip whitespace */
+            while (*fp == ' ' || *fp == '\t') fp++;
+
+            /* Read field name */
+            char fname[128] = {0};
+            int fi = 0;
+            while (*fp && *fp != ' ' && *fp != '\t' && *fp != '\n' && *fp != '\r' && fi < 127)
+                fname[fi++] = *fp++;
+            fname[fi] = '\0';
+            if (!fname[0]) continue;
+
+            char fdoc[512];
+            snprintf(fdoc, sizeof(fdoc), "field of struct %s from `%s`", current_struct, module_name);
+            char fdetail[256];
+            snprintf(fdetail, sizeof(fdetail), "%s %s", ftype, fname);
+
+            /* Register qualified StructName.fieldName */
+            char qualified[256];
+            snprintf(qualified, sizeof(qualified), "%s.%s", current_struct, fname);
+
+            int dup = 0;
+            for (int j = 0; j < proj->stdlib_completion_count; j++)
+            {
+                if (strcmp(proj->stdlib_completions[j].label, qualified) == 0)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+            {
+                CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                memset(it, 0, sizeof(*it));
+                snprintf(it->label, sizeof(it->label), "%s", qualified);
+                snprintf(it->detail, sizeof(it->detail), "%s", fdetail);
+                snprintf(it->documentation, sizeof(it->documentation), "%s", fdoc);
+                it->kind = COMPLETE_FIELD;
+                lsp_log("[lsp_analysis] Registered vendor struct field: %s", qualified);
+            }
+
+            /* Also register short field name */
+            dup = 0;
+            for (int j = 0; j < proj->stdlib_completion_count; j++)
+            {
+                if (strcmp(proj->stdlib_completions[j].label, fname) == 0)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+            {
+                CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                memset(it, 0, sizeof(*it));
+                snprintf(it->label, sizeof(it->label), "%s", fname);
+                snprintf(it->detail, sizeof(it->detail), "%s", fdetail);
+                snprintf(it->documentation, sizeof(it->documentation), "%s", fdoc);
+                it->kind = COMPLETE_FIELD;
+            }
+            continue;
+        }
+
+        /* Try to parse as fn */
+        char func_name[128], ret_type[64], params[256];
+        if (!parse_hyi_sig(line, func_name, ret_type, params, sizeof(func_name)))
+            continue;
+
+        char doc[512];
+        char detail[512];
+        if (params[0])
+            snprintf(detail, sizeof(detail), "%s %s(%s)", ret_type, func_name, params);
+        else
+            snprintf(detail, sizeof(detail), "%s %s()", ret_type, func_name);
+
+        if (current_class[0])
+        {
+            /* Method inside a class block */
+            snprintf(doc, sizeof(doc), "vendor function from `%s`", module_name);
+
+            /* Register ClassName.methodName (qualified) */
+            char qualified[256];
+            snprintf(qualified, sizeof(qualified), "%s.%s", current_class, func_name);
+
+            int dup = 0;
+            for (int j = 0; j < proj->stdlib_completion_count; j++)
+            {
+                if (strcmp(proj->stdlib_completions[j].label, qualified) == 0)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+            {
+                CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                memset(it, 0, sizeof(*it));
+                snprintf(it->label, sizeof(it->label), "%s", qualified);
+                snprintf(it->detail, sizeof(it->detail), "%s", detail);
+                snprintf(it->documentation, sizeof(it->documentation), "%s", doc);
+                it->kind = COMPLETE_METHOD;
+                lsp_log("[lsp_analysis] Registered vendor method: %s", qualified);
+            }
+
+            /* Also register short method name */
+            dup = 0;
+            for (int j = 0; j < proj->stdlib_completion_count; j++)
+            {
+                if (strcmp(proj->stdlib_completions[j].label, func_name) == 0)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+            {
+                CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                memset(it, 0, sizeof(*it));
+                snprintf(it->label, sizeof(it->label), "%s", func_name);
+                snprintf(it->detail, sizeof(it->detail), "%s", detail);
+                snprintf(it->documentation, sizeof(it->documentation), "%s", doc);
+                it->kind = COMPLETE_METHOD;
+            }
+        }
+        else
+        {
+            /* Free function */
+            snprintf(doc, sizeof(doc), "vendor function from `%s`", module_name);
+
+            /* Qualified: module_name.func_name */
+            char qualified[256];
+            snprintf(qualified, sizeof(qualified), "%s.%s", module_name, func_name);
+
+            int dup = 0;
+            for (int j = 0; j < proj->stdlib_completion_count; j++)
+            {
+                if (strcmp(proj->stdlib_completions[j].label, qualified) == 0)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+            {
+                CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                memset(it, 0, sizeof(*it));
+                snprintf(it->label, sizeof(it->label), "%s", qualified);
+                snprintf(it->detail, sizeof(it->detail), "%s", detail);
+                snprintf(it->documentation, sizeof(it->documentation), "%s", doc);
+                it->kind = COMPLETE_FUNCTION;
+                lsp_log("[lsp_analysis] Registered vendor func: %s -> %s", qualified, detail);
+            }
+
+            /* Also register short name */
+            dup = 0;
+            for (int j = 0; j < proj->stdlib_completion_count; j++)
+            {
+                if (strcmp(proj->stdlib_completions[j].label, func_name) == 0)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && proj->stdlib_completion_count < MAX_COMPLETIONS)
+            {
+                CompletionItem *it = &proj->stdlib_completions[proj->stdlib_completion_count++];
+                memset(it, 0, sizeof(*it));
+                snprintf(it->label, sizeof(it->label), "%s", func_name);
+                snprintf(it->detail, sizeof(it->detail), "%s", detail);
+                snprintf(it->documentation, sizeof(it->documentation), "%s", doc);
+                it->kind = COMPLETE_FUNCTION;
+            }
+        }
+    }
+
+    free(line);
+    fclose(f);
+}
+
+static void resolve_vendor_import(LspProject *proj, const char *inc)
+{
+    /* Strip "vendors." prefix */
+    const char *alias = inc;
+    if (strncmp(inc, "vendors.", 8) == 0)
+        alias = inc + 8;
+
+    lsp_log("[lsp_analysis] resolve_vendor_import: inc=%s alias=%s", inc, alias);
+
+    /* Deduplicate: check if we already have a completion with label matching
+       the vendor module (e.g. "vendors.foo.something") */
+    char qualified_prefix[256];
+    snprintf(qualified_prefix, sizeof(qualified_prefix), "%s.", alias);
+    for (int j = 0; j < proj->stdlib_completion_count; j++)
+    {
+        /* If any entry starts with alias. we already scanned this vendor */
+        if (strncmp(proj->stdlib_completions[j].label, qualified_prefix, strlen(qualified_prefix)) == 0)
+        {
+            lsp_log("[lsp_analysis] vendor already scanned: %s", alias);
+            return;
+        }
+        /* Or the class name entry would equal alias itself for single-token vendors */
+    }
+
+    /* Try {root}/vendors/{alias}/{alias}.hyi first, then {root}/vendors/{alias}.hyi */
+    char hyi_path[1024];
+    snprintf(hyi_path, sizeof(hyi_path), "%s/vendors/%s/%s.hyi", proj->root_dir, alias, alias);
+    normalise_path(hyi_path);
+
+    FILE *test = fopen(hyi_path, "r");
+    if (!test)
+    {
+        snprintf(hyi_path, sizeof(hyi_path), "%s/vendors/%s.hyi", proj->root_dir, alias);
+        normalise_path(hyi_path);
+        test = fopen(hyi_path, "r");
+    }
+    if (test)
+    {
+        fclose(test);
+        scan_hyi_vendor_file(proj, hyi_path, alias);
+    }
+    else
+    {
+        lsp_log("[lsp_analysis] no .hyi found for vendor: %s", alias);
+    }
+
+    /* If there's also a .hy source file, resolve it as a normal user file */
+    char hy_path[1024];
+    snprintf(hy_path, sizeof(hy_path), "%s/vendors/%s/%s.hy", proj->root_dir, alias, alias);
+    normalise_path(hy_path);
+    FILE *hy_test = fopen(hy_path, "r");
+    if (hy_test)
+    {
+        fclose(hy_test);
+        ProjectFile *dep = lsp_project_find_file(proj, hy_path);
+        if (!dep)
+        {
+            dep = lsp_project_get_or_add_file(proj, hy_path);
+            if (dep && !dep->program)
+            {
+                LspDiag saved[LSP_DIAG_MAX];
+                int saved_count = lsp_diag_count;
+                memcpy(saved, lsp_diags, saved_count * sizeof(LspDiag));
+                lsp_diag_clear();
+
+                dep->program = parse_file_from_disk(hy_path);
+
+                dep->diag_count = lsp_diag_count < LSP_DIAG_MAX
+                                      ? lsp_diag_count
+                                      : LSP_DIAG_MAX;
+                memcpy(dep->diags, lsp_diags, dep->diag_count * sizeof(LspDiag));
+
+                lsp_diag_clear();
+                memcpy(lsp_diags, saved, saved_count * sizeof(LspDiag));
+                lsp_diag_count = saved_count;
+
+                if (dep->program)
+                    resolve_imports(proj, dep);
+            }
+        }
+    }
+}
+
+static void scan_hyi_stdlib(LspProject *proj, const char *stdlib_dir, const char *module_prefix)
+{
+    lsp_log("[lsp_analysis] scan_hyi_stdlib: %s (module: %s)", stdlib_dir, module_prefix);
+    DIR *d = opendir(stdlib_dir);
+    if (!d)
+        return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL)
+    {
+        if (ent->d_name[0] == '.')
+            continue;
+
+        int nlen = strlen(ent->d_name);
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", stdlib_dir, ent->d_name);
+        normalise_path(full);
+
+        struct stat st;
+        if (lstat(full, &st) != 0)
+            continue;
+
+        if (S_ISLNK(st.st_mode))
+            continue;
+
+        if (S_ISDIR(st.st_mode))
+        {
+            char sub_module[256];
+            if (module_prefix[0])
+            {
+                snprintf(sub_module, sizeof(sub_module), "%s.%s", module_prefix, ent->d_name);
+            }
+            else
+            {
+                snprintf(sub_module, sizeof(sub_module), "%s", ent->d_name);
+            }
+            scan_hyi_stdlib(proj, full, sub_module);
+        }
+        else if (S_ISREG(st.st_mode) && nlen > 4 && strcmp(ent->d_name + nlen - 4, ".hyi") == 0)
+        {
+            char file_module[128];
+            size_t base_len = (size_t)nlen - 4;
+            if (base_len >= sizeof(file_module))
+                base_len = sizeof(file_module) - 1;
+            memcpy(file_module, ent->d_name, base_len);
+            file_module[base_len] = '\0';
+
+            char full_module[256];
+            if (module_prefix[0])
+            {
+                snprintf(full_module, sizeof(full_module), "%s.%s", module_prefix, file_module);
+            }
+            else
+            {
+                snprintf(full_module, sizeof(full_module), "%s", file_module);
+            }
+
+            /* Delegate to scan_hyi_vendor_file for full parsing (fns, classes, structs) */
+            scan_hyi_vendor_file(proj, full, full_module);
+        }
+    }
+    closedir(d);
+}
+
+
+static void resolve_imports(LspProject *proj, ProjectFile *pf)
+{
+    lsp_log("[lsp_analysis] resolve_imports: %s", pf && pf->filepath ? pf->filepath : "<null>");
+    if (!pf->program)
+        return;
+
+    char *file_dir = dir_of(pf->filepath);
+
+    for (int i = 0; i < pf->program->include_count; i++)
+    {
+        const char *inc = pf->program->includes[i];
+
+        /* std.* are runtime stubs — skip */
+        if (strncmp(inc, "std.", 4) == 0)
+            continue;
+
+        /* vendors.* — resolve .hyi (and optionally .hy) from the vendors dir */
+        if (strncmp(inc, "vendors.", 8) == 0)
+        {
+            resolve_vendor_import(proj, inc);
+            continue;
+        }
+
+        /* Resolve relative to the importing file's directory */
+        char *dep_path = module_to_filepath(file_dir, inc);
+        normalise_path(dep_path);
+
+        /* If we don't have this file in the index yet, add and parse it */
+        ProjectFile *dep = lsp_project_find_file(proj, dep_path);
+        if (!dep)
+        {
+            dep = lsp_project_get_or_add_file(proj, dep_path);
+            if (dep && !dep->program)
+            {
+                /* Parse from disk — capture diagnostics into dep's own buffer */
+                LspDiag saved[LSP_DIAG_MAX];
+                int saved_count = lsp_diag_count;
+                memcpy(saved, lsp_diags, saved_count * sizeof(LspDiag));
+                lsp_diag_clear();
+
+                dep->program = parse_file_from_disk(dep_path);
+
+                /* Capture dep's parse diagnostics */
+                dep->diag_count = lsp_diag_count < LSP_DIAG_MAX
+                                      ? lsp_diag_count
+                                      : LSP_DIAG_MAX;
+                memcpy(dep->diags, lsp_diags,
+                       dep->diag_count * sizeof(LspDiag));
+
+                /* Restore the caller's diagnostics */
+                lsp_diag_clear();
+                memcpy(lsp_diags, saved, saved_count * sizeof(LspDiag));
+                lsp_diag_count = saved_count;
+
+                if (dep->program)
+                    resolve_imports(proj, dep);
+            }
+        }
+
+        free(dep_path);
+    }
+
+    free(file_dir);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   Project API implementation
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+LspProject *lsp_project_create(const char *root_dir)
+{
+    lsp_log("[lsp_analysis] lsp_project_create: root_dir=%s", root_dir);
+    LspProject *proj = calloc(1, sizeof(LspProject));
+    if (!proj)
+        return NULL;
+
+    proj->stdlib_completion_count = 0;
+
+    snprintf(proj->root_dir, sizeof(proj->root_dir), "%s",
+             root_dir ? root_dir : ".");
+
+    scan_dir(proj, proj->root_dir);
+
+    const char *stdlib_path = "/usr/local/lib/hylian/std";
+    scan_hyi_stdlib(proj, stdlib_path, "std");
+
+    /* Also try the repo-local runtime std path */
+    char local_std[1024];
+    snprintf(local_std, sizeof(local_std), "%s/runtime/std", proj->root_dir);
+    scan_hyi_stdlib(proj, local_std, "std");
+
+    /* Scan vendors directory upfront for any .hyi files */
+    char vendors_path[1024];
+    snprintf(vendors_path, sizeof(vendors_path), "%s/vendors", proj->root_dir);
+    normalise_path(vendors_path);
+    DIR *vd = opendir(vendors_path);
+    if (vd)
+    {
+        struct dirent *vent;
+        while ((vent = readdir(vd)) != NULL)
+        {
+            if (vent->d_name[0] == '.')
+                continue;
+
+            /* Check for subdirectory: vendors/{alias}/{alias}.hyi */
+            char sub_path[1024];
+            snprintf(sub_path, sizeof(sub_path), "%s/%s", vendors_path, vent->d_name);
+            normalise_path(sub_path);
+
+            struct stat vst;
+            if (lstat(sub_path, &vst) != 0)
+                continue;
+
+            if (S_ISLNK(vst.st_mode))
+                continue;
+
+            if (S_ISDIR(vst.st_mode))
+            {
+                char hyi_path[1024];
+                snprintf(hyi_path, sizeof(hyi_path), "%s/%s.hyi", sub_path, vent->d_name);
+                normalise_path(hyi_path);
+                FILE *tf = fopen(hyi_path, "r");
+                if (tf)
+                {
+                    fclose(tf);
+                    scan_hyi_vendor_file(proj, hyi_path, vent->d_name);
+                }
+            }
+            else if (S_ISREG(vst.st_mode))
+            {
+                /* vendors/{alias}.hyi directly in vendors/ */
+                int nlen = strlen(vent->d_name);
+                if (nlen > 4 && strcmp(vent->d_name + nlen - 4, ".hyi") == 0)
+                {
+                    char alias[128];
+                    int alen = nlen - 4;
+                    if (alen >= (int)sizeof(alias)) alen = (int)sizeof(alias) - 1;
+                    memcpy(alias, vent->d_name, alen);
+                    alias[alen] = '\0';
+                    scan_hyi_vendor_file(proj, sub_path, alias);
+                }
+            }
+        }
+        closedir(vd);
+    }
+
+    for (int i = 0; i < proj->file_count; i++)
+    {
+        ProjectFile *pf = &proj->files[i];
+        if (!pf->program)
+        {
+            LspDiag saved[LSP_DIAG_MAX];
+            int saved_count = lsp_diag_count;
+            memcpy(saved, lsp_diags, saved_count * sizeof(LspDiag));
+            lsp_diag_clear();
+
+            pf->program = parse_file_from_disk(pf->filepath);
+
+            pf->diag_count = lsp_diag_count < LSP_DIAG_MAX
+                                 ? lsp_diag_count
+                                 : LSP_DIAG_MAX;
+            memcpy(pf->diags, lsp_diags, pf->diag_count * sizeof(LspDiag));
+
+            lsp_diag_clear();
+            memcpy(lsp_diags, saved, saved_count * sizeof(LspDiag));
+            lsp_diag_count = saved_count;
+        }
+    }
+
+    lsp_project_rebuild_index(proj);
+    return proj;
+}
+
+void lsp_project_free(LspProject *proj)
+{
+    lsp_log("[lsp_analysis] lsp_project_free");
+    if (!proj)
+        return;
+    for (int i = 0; i < proj->file_count; i++)
+        free(proj->files[i].source);
+    free(proj);
+}
+
+ProjectFile *lsp_project_find_file(LspProject *proj, const char *filepath)
+{
+    lsp_log("[lsp_analysis] lsp_project_find_file: %s", filepath);
+    for (int i = 0; i < proj->file_count; i++)
+        if (strcmp(proj->files[i].filepath, filepath) == 0)
+            return &proj->files[i];
+    return NULL;
+}
+
+ProjectFile *lsp_project_get_or_add_file(LspProject *proj, const char *filepath)
+{
+    lsp_log("[lsp_analysis] lsp_project_get_or_add_file: %s", filepath);
+    ProjectFile *existing = lsp_project_find_file(proj, filepath);
+    if (existing)
+        return existing;
+    if (proj->file_count >= MAX_PROJECT_FILES)
+        return NULL;
+    ProjectFile *pf = &proj->files[proj->file_count++];
+    memset(pf, 0, sizeof(*pf));
+    snprintf(pf->filepath, sizeof(pf->filepath), "%s", filepath);
+    return pf;
+}
+
+void lsp_project_update_file(LspProject *proj,
+                             const char *filepath,
+                             const char *source)
+{
+    lsp_log("[lsp_analysis] lsp_project_update_file: %s", filepath);
+    ProjectFile *pf = lsp_project_get_or_add_file(proj, filepath);
+    if (!pf)
+        return;
+
+    /* Store the new source text */
+    free(pf->source);
+    pf->source = strdup(source);
+    pf->dirty = 0;
+
+    /* Re-parse, capturing diagnostics into this file's own buffer */
+    lsp_diag_clear();
+    pf->program = parse_source(filepath, source);
+
+    /* Run typecheck — also pushes to lsp_diag */
+    if (pf->program)
+    {
+        TCExternalFunc *exts = NULL;
+        int ext_count = 0;
+        
+
+        /* 1. Builtins */
+        for (int i = 0; hylian_builtins[i].name; i++)
+        {
+            char ret[64], name[128];
+            parse_c_sig(hylian_builtins[i].detail, ret, name);
+            exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+            exts[ext_count].name = strdup(hylian_builtins[i].name);
+            exts[ext_count].return_type = strdup(ret);
+            exts[ext_count].param_count = 0;
+            exts[ext_count].is_module = 0;
+            ext_count++;
+        }
+
+        /* 2. Stdlib functions from .hyi (both full and short names) */
+        for (int i = 0; i < proj->stdlib_completion_count; i++)
+        {
+            CompletionItem *it = &proj->stdlib_completions[i];
+            if (it->kind != COMPLETE_FUNCTION)
+                continue;
+
+            char ret[64], name[128];
+            parse_c_sig(it->detail, ret, name);
+
+            int already = 0;
+            for (int k = 0; k < ext_count; k++)
+            {
+                if (strcmp(exts[k].name, it->label) == 0)
+                {
+                    already = 1;
+                    break;
+                }
+            }
+            if (!already)
+            {
+                exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                exts[ext_count].name = strdup(it->label);
+                exts[ext_count].return_type = strdup(ret);
+                exts[ext_count].param_count = 0;
+                exts[ext_count].is_module = 0;
+                ext_count++;
+            }
+        }
+
+        /* 3. User-defined functions from all project files */
+        for (int f = 0; f < proj->file_count; f++)
+        {
+            ProgramNode *prog = proj->files[f].program;
+            if (!prog)
+                continue;
+            for (int d = 0; d < prog->decl_count; d++)
+            {
+                ASTNode *decl = prog->declarations[d];
+                if (!decl)
+                    continue;
+                if (decl->type == NODE_FUNC)
+                {
+                    FuncNode *fn = (FuncNode *)decl;
+                    char ret[64];
+                    type_to_str(fn->return_type, ret, sizeof(ret));
+                    int already = 0;
+                    for (int k = 0; k < ext_count; k++)
+                    {
+                        if (strcmp(exts[k].name, fn->name) == 0)
+                        {
+                            already = 1;
+                            break;
+                        }
+                    }
+                    if (!already)
+                    {
+                        exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                        exts[ext_count].name = strdup(fn->name);
+                        exts[ext_count].return_type = strdup(ret);
+                        exts[ext_count].param_count = 0;
+                        exts[ext_count].is_module = 0;
+                        ext_count++;
+                    }
+                }
+                /* 4. Class methods registered as plain names (for bare calls inside class bodies) */
+                if (decl->type == NODE_CLASS)
+                {
+                    ClassNode *cn = (ClassNode *)decl;
+                    for (int m = 0; m < cn->method_count; m++)
+                    {
+                        MethodNode *mn = cn->methods[m];
+                        if (!mn)
+                            continue;
+                        char ret[64];
+                        type_to_str(mn->return_type, ret, sizeof(ret));
+                        int already = 0;
+                        for (int k = 0; k < ext_count; k++)
+                        {
+                            if (strcmp(exts[k].name, mn->name) == 0)
+                            {
+                                already = 1;
+                                break;
+                            }
+                        }
+                        if (!already)
+                        {
+                            exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                            exts[ext_count].name = strdup(mn->name);
+                            exts[ext_count].return_type = strdup(ret);
+                            exts[ext_count].param_count = 0;
+                            exts[ext_count].is_module = 0;
+                            ext_count++;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 5. Module names and their public functions from all project files */
+        for (int f = 0; f < proj->file_count; f++)
+        {
+            ProgramNode *prog = proj->files[f].program;
+            if (!prog) continue;
+            for (int d = 0; d < prog->decl_count; d++)
+            {
+                ASTNode *decl = prog->declarations[d];
+                if (!decl || decl->type != NODE_MODULE) continue;
+                ModuleNode *mn = (ModuleNode *)decl;
+
+                /* Add the module name as a namespace marker */
+                int already = 0;
+                for (int k = 0; k < ext_count; k++)
+                    if (exts[k].is_module && strcmp(exts[k].name, mn->name) == 0) { already = 1; break; }
+                if (!already)
+                {
+                    exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                    exts[ext_count].name        = strdup(mn->name);
+                    exts[ext_count].return_type = strdup("void");
+                    exts[ext_count].param_count = 0;
+                    exts[ext_count].is_module   = 1;
+                    ext_count++;
+                }
+
+                /* Add each function as ModuleName__funcname */
+                for (int fi = 0; fi < mn->func_count; fi++)
+                {
+                    FuncNode *fn = mn->funcs[fi];
+                    if (!fn) continue;
+                    char mangled[256];
+                    snprintf(mangled, sizeof(mangled), "%s__%s", mn->name, fn->name);
+                    int fdup = 0;
+                    for (int k = 0; k < ext_count; k++)
+                        if (!exts[k].is_module && strcmp(exts[k].name, mangled) == 0) { fdup = 1; break; }
+                    if (!fdup)
+                    {
+                        char ret[64];
+                        type_to_str(fn->return_type, ret, sizeof(ret));
+                        exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                        exts[ext_count].name        = strdup(mangled);
+                        exts[ext_count].return_type = strdup(ret);
+                        exts[ext_count].param_count = fn->param_count;
+                        exts[ext_count].is_module   = 0;
+                        ext_count++;
+                    }
+                }
+            }
+        }
+
+        lsp_typecheck_with_externals(pf->program, filepath, exts, ext_count);
+
+        for (int i = 0; i < ext_count; i++)
+        {
+            free((char *)exts[i].name);
+            free((char *)exts[i].return_type);
+        }
+        free(exts);
+    }
+
+    pf->diag_count = lsp_diag_count < LSP_DIAG_MAX
+                         ? lsp_diag_count
+                         : LSP_DIAG_MAX;
+    memcpy(pf->diags, lsp_diags, pf->diag_count * sizeof(LspDiag));
+
+    /* Resolve imports — ensures dependency files are in the index */
+    resolve_imports(proj, pf);
+
+    /* Rebuild the merged symbol table */
+    lsp_project_rebuild_index(proj);
+}
+
+void lsp_project_rebuild_index(LspProject *proj)
+{
+    lsp_log("[lsp_analysis] lsp_project_rebuild_index");
+    proj->global_completion_count = 0;
+
+    for (int i = 0; hylian_keywords[i]; i++)
+    {
+        add_completion_to(proj->global_completions,
+                          &proj->global_completion_count, MAX_COMPLETIONS,
+                          hylian_keywords[i], COMPLETE_KEYWORD, "keyword", NULL);
+    }
+    for (int i = 0; hylian_builtins[i].name; i++)
+    {
+        add_completion_to(proj->global_completions,
+                          &proj->global_completion_count, MAX_COMPLETIONS,
+                          hylian_builtins[i].name, COMPLETE_FUNCTION,
+                          hylian_builtins[i].detail, "built-in function");
+    }
+
+    for (int i = 0; i < proj->file_count; i++)
+    {
+        ProjectFile *pf = &proj->files[i];
+        if (!pf->program)
+            continue;
+
+        const char *label = pf->filepath;
+        int rlen = (int)strlen(proj->root_dir);
+        if (strncmp(pf->filepath, proj->root_dir, rlen) == 0 &&
+            pf->filepath[rlen] == '/')
+            label = pf->filepath + rlen + 1;
+
+        index_program(pf->program, label,
+                      proj->global_completions,
+                      &proj->global_completion_count, MAX_COMPLETIONS);
+    }
+
+    /* Re-add stdlib completions so they survive every rebuild */
+    for (int i = 0; i < proj->stdlib_completion_count; i++)
+    {
+        add_completion_to(proj->global_completions,
+                          &proj->global_completion_count, MAX_COMPLETIONS,
+                          proj->stdlib_completions[i].label,
+                          proj->stdlib_completions[i].kind,
+                          proj->stdlib_completions[i].detail,
+                          proj->stdlib_completions[i].documentation);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   Document API implementation
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+LspState *lsp_analyze(LspProject *proj,
+                      const char *filepath,
+                      const char *source)
+{
+    lsp_log("[lsp_analysis] lsp_analyze: %s", filepath);
+    LspState *st = calloc(1, sizeof(LspState));
+    if (!st)
+        return NULL;
+
+    st->project = proj;
+    snprintf(st->filepath, sizeof(st->filepath), "%s",
+             filepath ? filepath : "<unknown>");
+
+    if (source)
+    {
+        lsp_project_update_file(proj, filepath, source);
+    }
+
+    st->file = lsp_project_find_file(proj, filepath);
+    if (!st->file)
+    {
+        /* File wasn't in the index yet (e.g. no root_dir set) — add it */
+        st->file = lsp_project_get_or_add_file(proj, filepath);
+        if (st->file && source)
+        {
+            lsp_diag_clear();
+            st->file->program = parse_source(filepath, source);
+            if (st->file->program)
+                lsp_typecheck(st->file->program, filepath);
+            st->file->diag_count =
+                lsp_diag_count < LSP_DIAG_MAX ? lsp_diag_count : LSP_DIAG_MAX;
+            memcpy(st->file->diags, lsp_diags,
+                   st->file->diag_count * sizeof(LspDiag));
+        }
+    }
+
+    return st;
+}
+
+void lsp_state_free(LspState *st)
+{
+    lsp_log("[lsp_analysis] lsp_state_free");
+    free(st);
+}
+
+
+static char *word_at(const char *source, int line, int col)
+{
+    int cur_line = 0;
+    const char *p = source;
+    while (*p && cur_line < line)
+    {
+        if (*p == '\n')
+            cur_line++;
+        p++;
+    }
+    if (cur_line < line)
+        return NULL;
+
+    int cur_col = 0;
+    while (*p && *p != '\n' && cur_col < col)
+    {
+        p++;
+        cur_col++;
+    }
+
+    const char *word_end = p;
+    while (p > source && (isalnum((unsigned char)*(p - 1)) || *(p - 1) == '_'))
+        p--;
+    const char *word_start = p;
+    while (*word_end && (isalnum((unsigned char)*word_end) || *word_end == '_'))
+        word_end++;
+
+    int len = (int)(word_end - word_start);
+    if (len <= 0)
+        return NULL;
+    char *w = malloc(len + 1);
+    memcpy(w, word_start, len);
+    w[len] = '\0';
+    return w;
+}
+
+/* Returns 1 if the cursor is immediately after "identifier." and fills
+   obj_word_out with the identifier name. */
+static int cursor_after_dot(const char *source, int line, int col,
+                            char *obj_word_out, int obj_word_sz)
+{
+    int cur_line = 0;
+    const char *p = source;
+    while (*p && cur_line < line)
+    {
+        if (*p == '\n')
+            cur_line++;
+        p++;
+    }
+    int cur_col = 0;
+    const char *line_start = p;
+    while (*p && *p != '\n' && cur_col < col)
+    {
+        p++;
+        cur_col++;
+    }
+
+    const char *q = p;
+    while (q > line_start && (isalnum((unsigned char)*(q - 1)) || *(q - 1) == '_'))
+        q--;
+
+    if (q > line_start && *(q - 1) == '.')
+    {
+        const char *dot = q - 1;
+        const char *obj_end = dot;
+        while (obj_end > line_start &&
+               (isalnum((unsigned char)*(obj_end - 1)) || *(obj_end - 1) == '_'))
+            obj_end--;
+        int len = (int)(dot - obj_end);
+        if (len > 0 && obj_word_out)
+        {
+            int copy = len < obj_word_sz - 1 ? len : obj_word_sz - 1;
+            memcpy(obj_word_out, obj_end, copy);
+            obj_word_out[copy] = '\0';
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Searches function parameters and body var decls for `var_name`.
+   Returns the type name string (points into AST — do not free), or NULL. */
+static const char *resolve_var_type(ProgramNode *prog, const char *var_name)
+{
+    if (!prog)
+        return NULL;
+    for (int i = 0; i < prog->decl_count; i++)
+    {
+        ASTNode *d = prog->declarations[i];
+        if (!d)
+            continue;
+
+        if (d->type == NODE_FUNC)
+        {
+            FuncNode *fn = (FuncNode *)d;
+            for (int p = 0; p < fn->param_count && fn->params[p]; p++)
+            {
+                VarDeclNode *vd = (VarDeclNode *)fn->params[p];
+                if (strcmp(vd->var_name, var_name) == 0)
+                    return vd->var_type.name;
+            }
+            for (int b = 0; b < fn->body_count && fn->body[b]; b++)
+            {
+                if (fn->body[b]->type == NODE_VAR_DECL)
+                {
+                    VarDeclNode *vd = (VarDeclNode *)fn->body[b];
+                    if (strcmp(vd->var_name, var_name) == 0)
+                        return vd->var_type.name;
+                }
+            }
+        }
+        if (d->type == NODE_CLASS)
+        {
+            ClassNode *cn = (ClassNode *)d;
+            for (int m = 0; m < cn->method_count; m++)
+            {
+                MethodNode *mn = cn->methods[m];
+                if (!mn)
+                    continue;
+                for (int p = 0; p < mn->param_count && mn->params[p]; p++)
+                {
+                    VarDeclNode *vd = (VarDeclNode *)mn->params[p];
+                    if (strcmp(vd->var_name, var_name) == 0)
+                        return vd->var_type.name;
+                }
+                for (int b = 0; b < mn->body_count && mn->body[b]; b++)
+                {
+                    if (mn->body[b]->type == NODE_VAR_DECL)
+                    {
+                        VarDeclNode *vd = (VarDeclNode *)mn->body[b];
+                        if (strcmp(vd->var_name, var_name) == 0)
+                            return vd->var_type.name;
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static ClassNode *find_class_in_project(LspProject *proj, const char *class_name)
+{
+    if (!proj || !class_name)
+        return NULL;
+    for (int f = 0; f < proj->file_count; f++)
+    {
+        ProgramNode *prog = proj->files[f].program;
+        if (!prog)
+            continue;
+        for (int i = 0; i < prog->decl_count; i++)
+        {
+            ASTNode *d = prog->declarations[i];
+            if (d && d->type == NODE_CLASS)
+            {
+                ClassNode *cn = (ClassNode *)d;
+                if (strcmp(cn->name, class_name) == 0)
+                    return cn;
+            }
+        }
+    }
+    return NULL;
+}
+
+static EnumNode *find_enum_in_project(LspProject *proj, const char *enum_name) {
+    if (!proj || !enum_name) return NULL;
+    for (int f = 0; f < proj->file_count; f++) {
+        ProgramNode *prog = proj->files[f].program;
+        if (!prog) continue;
+        for (int i = 0; i < prog->decl_count; i++) {
+            ASTNode *d = prog->declarations[i];
+            if (d && d->type == NODE_ENUM) {
+                EnumNode *en = (EnumNode *)d;
+                if (strcmp(en->name, enum_name) == 0) return en;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void collect_locals(ProgramNode *prog, int line,
+                           CompletionItem *out, int *count, int max)
+{
+    if (!prog)
+        return;
+    (void)line;
+    for (int i = 0; i < prog->decl_count; i++)
+    {
+        ASTNode *d = prog->declarations[i];
+        if (!d)
+            continue;
+
+        if (d->type == NODE_FUNC)
+        {
+            FuncNode *fn = (FuncNode *)d;
+            for (int p = 0; p < fn->param_count && fn->params[p]; p++)
+            {
+                VarDeclNode *vd = (VarDeclNode *)fn->params[p];
+                char det[64];
+                type_to_str(vd->var_type, det, sizeof(det));
+                add_completion_to(out, count, max, vd->var_name,
+                                  COMPLETE_VARIABLE, det, "parameter");
+            }
+            for (int b = 0; b < fn->body_count && fn->body[b]; b++)
+            {
+                if (fn->body[b]->type == NODE_VAR_DECL)
+                {
+                    VarDeclNode *vd = (VarDeclNode *)fn->body[b];
+                    char det[64];
+                    type_to_str(vd->var_type, det, sizeof(det));
+                    add_completion_to(out, count, max, vd->var_name,
+                                      COMPLETE_VARIABLE, det, "local variable");
+                }
+                else if (fn->body[b]->type == NODE_SWITCH)
+                {
+                    SwitchNode *sw = (SwitchNode *)fn->body[b];
+                    for (int ai = 0; ai < sw->case_count; ai++) {
+                        SwitchCaseNode *arm = sw->cases[ai];
+                        if (!arm) continue;
+                        for (int ab = 0; ab < arm->body_count; ab++) {
+                            if (arm->body[ab] && arm->body[ab]->type == NODE_VAR_DECL) {
+                                VarDeclNode *vd = (VarDeclNode *)arm->body[ab];
+                                char det[64];
+                                type_to_str(vd->var_type, det, sizeof(det));
+                                add_completion_to(out, count, max, vd->var_name,
+                                                  COMPLETE_VARIABLE, det, "local variable (switch arm)");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (d->type == NODE_CLASS)
+        {
+            ClassNode *cn = (ClassNode *)d;
+            add_completion_to(out, count, max, "self",
+                              COMPLETE_VARIABLE, cn->name, "implicit self");
+            for (int m = 0; m < cn->method_count; m++)
+            {
+                MethodNode *mn = cn->methods[m];
+                if (!mn)
+                    continue;
+                for (int p = 0; p < mn->param_count && mn->params[p]; p++)
+                {
+                    VarDeclNode *vd = (VarDeclNode *)mn->params[p];
+                    char det[64];
+                    type_to_str(vd->var_type, det, sizeof(det));
+                    add_completion_to(out, count, max, vd->var_name,
+                                      COMPLETE_VARIABLE, det, "parameter");
+                }
+                for (int b = 0; b < mn->body_count && mn->body[b]; b++)
+                {
+                    if (mn->body[b]->type == NODE_VAR_DECL)
+                    {
+                        VarDeclNode *vd = (VarDeclNode *)mn->body[b];
+                        char det[64];
+                        type_to_str(vd->var_type, det, sizeof(det));
+                        add_completion_to(out, count, max, vd->var_name,
+                                          COMPLETE_VARIABLE, det, "local variable");
+                    }
+                    else if (mn->body[b]->type == NODE_SWITCH)
+                    {
+                        SwitchNode *sw = (SwitchNode *)mn->body[b];
+                        for (int ai = 0; ai < sw->case_count; ai++) {
+                            SwitchCaseNode *arm = sw->cases[ai];
+                            if (!arm) continue;
+                            for (int ab = 0; ab < arm->body_count; ab++) {
+                                if (arm->body[ab] && arm->body[ab]->type == NODE_VAR_DECL) {
+                                    VarDeclNode *vd = (VarDeclNode *)arm->body[ab];
+                                    char det[64];
+                                    type_to_str(vd->var_type, det, sizeof(det));
+                                    add_completion_to(out, count, max, vd->var_name,
+                                                      COMPLETE_VARIABLE, det, "local variable (switch arm)");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+/* Known stdlib modules */
+static const char *stdlib_modules[] = {
+    "std.io",
+    "std.strings",
+    "std.errors",
+    "std.system.env",
+    "std.system.filesystem",
+    NULL};
+
+/* Returns 1 if the cursor (line, col) is inside an unclosed `include { }` block.
+   Also fills prefix_out with whatever partial module name is being typed. */
+static int cursor_in_include(const char *source, int line, int col,
+                             char *prefix_out, int prefix_sz)
+{
+    if (!source)
+        return 0;
+
+    /* Find the offset of the cursor */
+    int cur_line = 0;
+    const char *p = source;
+    while (*p && cur_line < line)
+    {
+        if (*p++ == '\n')
+            cur_line++;
+    }
+    int cur_col = 0;
+    while (*p && *p != '\n' && cur_col < col)
+    {
+        p++;
+        cur_col++;
+    }
+    const char *cursor = p;
+
+    /* Scan backward looking for `include` followed by `{` with no closing `}` */
+    const char *q = cursor;
+    int brace_depth = 0;
+    while (q > source)
+    {
+        q--;
+        if (*q == '}')
+            brace_depth++;
+        else if (*q == '{')
+        {
+            if (brace_depth > 0)
+            {
+                brace_depth--;
+                continue;
+            }
+            /* found an unmatched { — check if preceded by `include` */
+            const char *r = q - 1;
+            while (r >= source && (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r'))
+                r--;
+            /* r should point at the last char of "include" */
+            if (r - source >= 6 && strncmp(r - 6, "include", 7) == 0 &&
+                (r - 6 == source || !isalnum((unsigned char)*(r - 7))))
+            {
+                /* We're inside include { ... }. Extract the partial word at cursor. */
+                if (prefix_out && prefix_sz > 0)
+                {
+                    const char *word_start = cursor;
+                    while (word_start > source &&
+                           (isalnum((unsigned char)*(word_start - 1)) ||
+                            *(word_start - 1) == '.' || *(word_start - 1) == '_'))
+                        word_start--;
+                    int len = (int)(cursor - word_start);
+                    if (len >= prefix_sz)
+                        len = prefix_sz - 1;
+                    memcpy(prefix_out, word_start, len);
+                    prefix_out[len] = '\0';
+                }
+                return 1;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Convert an absolute .hy filepath to a dot-separated module name relative
+   to root_dir. e.g. /proj/Game/Player.hy -> "Game.Player" */
+static void filepath_to_module(const char *root_dir, const char *filepath,
+                               char *buf, int bufsz)
+{
+    int rlen = (int)strlen(root_dir);
+    const char *rel = filepath;
+    if (strncmp(filepath, root_dir, rlen) == 0 && filepath[rlen] == '/')
+        rel = filepath + rlen + 1;
+
+    int len = (int)strlen(rel);
+    /* strip .hy suffix */
+    if (len > 3 && strcmp(rel + len - 3, ".hy") == 0)
+        len -= 3;
+
+    int copy = len < bufsz - 1 ? len : bufsz - 1;
+    for (int i = 0; i < copy; i++)
+        buf[i] = (rel[i] == '/') ? '.' : rel[i];
+    buf[copy] = '\0';
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   Public: lsp_complete_linkle  (linkle.hy build-file completions)
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Scan backward from the cursor offset to find what block we are currently
+ * inside.  Returns one of:
+ *   ""          - top level (not inside any block)
+ *   "project"   - inside project { }
+ *   "build"     - inside build { }
+ *   "vendors"   - inside vendors { }
+ *   "packages"  - inside packages { }
+ *   "workspace" - inside workspace { }
+ *   "target"    - inside a target() { } block
+ *
+ * Also sets *after_colon to 1 when the cursor is positioned right after
+ * a colon + optional whitespace (value position), and fills *last_key with
+ * the key name that precedes the colon.
+ */
+static const char *linkle_current_block(const char *source, int cursor_off,
+                                        int *after_colon, char *last_key,
+                                        int last_key_sz)
+{
+    *after_colon = 0;
+    if (last_key && last_key_sz > 0) last_key[0] = '\0';
+
+    /* Walk the source up to the cursor tracking brace depth */
+    /* We collect a small stack of block-names (up to 8 deep) */
+    static const char *block_names[] = {
+        "project", "build", "vendors", "packages", "workspace", NULL
+    };
+
+    /* Simple state machine: we need the innermost unmatched '{' and the
+       identifier that preceded it. */
+    /* Strategy: find all '{' and '}' up to cursor, track depth, record
+       the name before each '{'. */
+    typedef struct { int depth; char name[32]; } Frame;
+    Frame stack[16];
+    int   sp = 0;
+    int   depth = 0;
+
+    const char *p = source;
+    const char *end = source + cursor_off;
+
+    /* skip line comments */
+    while (p < end) {
+        /* skip line comment */
+        if (*p == '/' && p+1 < end && *(p+1) == '/') {
+            while (p < end && *p != '\n') p++;
+            continue;
+        }
+        /* skip string */
+        if (*p == '"') {
+            p++;
+            while (p < end && *p != '"') {
+                if (*p == '\\') p++;
+                p++;
+            }
+            if (p < end) p++;
+            continue;
+        }
+        if (*p == '{') {
+            depth++;
+            /* look back for the name before this brace */
+            const char *q = p - 1;
+            while (q >= source && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) q--;
+            /* skip a closing paren: target() { */
+            if (q >= source && *q == ')') {
+                while (q >= source && *q != '(') q--;
+                if (q > source) q--;
+                while (q >= source && (*q == ' ' || *q == '\t')) q--;
+            }
+            /* collect the word */
+            const char *we = q + 1;
+            while (q >= source && (isalnum((unsigned char)*q) || *q == '_')) q--;
+            const char *ws = q + 1;
+            int nlen = (int)(we - ws);
+            if (sp < 16) {
+                int copy = nlen < 31 ? nlen : 31;
+                memcpy(stack[sp].name, ws, copy);
+                stack[sp].name[copy] = '\0';
+                stack[sp].depth = depth;
+                sp++;
+            }
+            p++;
+            continue;
+        }
+        if (*p == '}') {
+            if (sp > 0 && stack[sp-1].depth == depth) sp--;
+            depth--;
+            p++;
+            continue;
+        }
+        p++;
+    }
+
+    /* Determine the innermost block name */
+    const char *block = "";
+    if (sp > 0) block = stack[sp-1].name;
+
+    /* Detect after-colon: scan backward from cursor skipping spaces */
+    const char *q = end - 1;
+    while (q >= source && (*q == ' ' || *q == '\t')) q--;
+    if (q >= source && *q == ':') {
+        *after_colon = 1;
+        /* Find the key name before the colon */
+        const char *ke = q;
+        q--;
+        while (q >= source && (*q == ' ' || *q == '\t')) q--;
+        const char *kend = q + 1;
+        while (q >= source && (isalnum((unsigned char)*q) || *q == '_')) q--;
+        const char *kstart = q + 1;
+        int klen = (int)(kend - kstart);
+        if (last_key && klen > 0 && klen < last_key_sz) {
+            memcpy(last_key, kstart, klen);
+            last_key[klen] = '\0';
+        }
+        (void)ke;
+    }
+
+    /* Validate block name against known blocks + "target" */
+    for (int i = 0; block_names[i]; i++)
+        if (strcmp(block, block_names[i]) == 0) return block;
+    if (block[0] && strcmp(block, "target") != 0) {
+        /* could be the target name (user-defined) — treat as target block */
+        if (sp >= 2) {
+            /* parent is a named-target frame — just return "target" */
+        }
+    }
+    if (strcmp(block, "target") == 0) return "target";
+    /* If depth == 0 we're at the top level */
+    if (depth == 0 && sp == 0) return "";
+    return block;
+}
+
+/* Offset of the cursor in the source string */
+static int linkle_cursor_offset(const char *source, int line, int col)
+{
+    int cur_line = 0;
+    const char *p = source;
+    while (*p && cur_line < line) {
+        if (*p++ == '\n') cur_line++;
+    }
+    int cur_col = 0;
+    while (*p && *p != '\n' && cur_col < col) { p++; cur_col++; }
+    return (int)(p - source);
+}
+
+/* Word being typed at the cursor (partial identifier) */
+static void linkle_partial_word(const char *source, int offset,
+                                char *buf, int bufsz)
+{
+    if (bufsz <= 0) return;
+    buf[0] = '\0';
+    if (offset <= 0) return;
+    const char *p = source + offset;
+    const char *start = p;
+    while (start > source &&
+           (isalnum((unsigned char)*(start-1)) || *(start-1) == '_' || *(start-1) == '.')) {
+        start--;
+    }
+    int len = (int)(p - start);
+    if (len <= 0) return;
+    int copy = len < bufsz - 1 ? len : bufsz - 1;
+    memcpy(buf, start, copy);
+    buf[copy] = '\0';
+}
+
+/* Filter helper: returns 1 if label starts with prefix (or prefix is empty) */
+static int linkle_matches(const char *label, const char *prefix)
+{
+    if (!prefix || prefix[0] == '\0') return 1;
+    return strncmp(label, prefix, strlen(prefix)) == 0;
+}
+
+int lsp_complete_linkle(const char *source, int line, int col,
+                        CompletionItem *out, int max_out)
+{
+    if (!source || !out || max_out <= 0) return 0;
+    int count = 0;
+
+    int offset = linkle_cursor_offset(source, line, col);
+    char partial[128];
+    linkle_partial_word(source, offset, partial, sizeof(partial));
+
+    int after_colon = 0;
+    char last_key[64] = "";
+    const char *block = linkle_current_block(source, offset,
+                                              &after_colon, last_key, sizeof(last_key));
+
+    /* ── After a colon: suggest values ── */
+    if (after_colon) {
+        /* target: field in build block */
+        if (strcmp(block, "build") == 0 && strcmp(last_key, "target") == 0) {
+            static const char *targets[] = {
+                "linux", "macos", "windows", "kernel", "limine", NULL
+            };
+            for (int i = 0; targets[i] && count < max_out; i++) {
+                if (!linkle_matches(targets[i], partial)) continue;
+                out[count] = (CompletionItem){0};
+                snprintf(out[count].label,  sizeof(out[count].label),  "%s", targets[i]);
+                snprintf(out[count].detail, sizeof(out[count].detail),  "build target");
+                out[count].kind = COMPLETE_VARIABLE;
+                count++;
+            }
+            return count;
+        }
+
+        /* version: in project block — just a snippet hint */
+        if (strcmp(block, "project") == 0 && strcmp(last_key, "version") == 0) {
+            static const char *vsn[] = { "0.1.0", "1.0.0", NULL };
+            for (int i = 0; vsn[i] && count < max_out; i++) {
+                if (!linkle_matches(vsn[i], partial)) continue;
+                out[count] = (CompletionItem){0};
+                snprintf(out[count].label,  sizeof(out[count].label),  "%s", vsn[i]);
+                snprintf(out[count].detail, sizeof(out[count].detail),  "version string");
+                out[count].kind = COMPLETE_VARIABLE;
+                count++;
+            }
+            return count;
+        }
+
+        /* No special value completion for other keys — return empty */
+        return 0;
+    }
+
+    /* ── Block-level key completions ── */
+
+    if (strcmp(block, "project") == 0) {
+        typedef struct { const char *key; const char *doc; } KV;
+        static const KV keys[] = {
+            { "name",        "Project name (string)" },
+            { "version",     "Semantic version, e.g. \"0.1.0\"" },
+            { "author",      "Author name or email (string)" },
+            { "description", "Short description shown on the package registry" },
+            { "repo",        "URL of the source repository (e.g. https://github.com/user/repo)" },
+            { NULL, NULL }
+        };
+        for (int i = 0; keys[i].key && count < max_out; i++) {
+            if (!linkle_matches(keys[i].key, partial)) continue;
+            out[count] = (CompletionItem){0};
+            snprintf(out[count].label,  sizeof(out[count].label),  "%s", keys[i].key);
+            snprintf(out[count].detail, sizeof(out[count].detail),  "%s: \"...\"\n", keys[i].key);
+            snprintf(out[count].documentation, sizeof(out[count].documentation), "%s", keys[i].doc);
+            out[count].kind = COMPLETE_FIELD;
+            count++;
+        }
+        return count;
+    }
+
+    if (strcmp(block, "build") == 0) {
+        typedef struct { const char *key; const char *doc; } KV;
+        static const KV keys[] = {
+            { "src",           "Source directory (default: \"src\")" },
+            { "main",          "Entry-point file name without extension (default: \"main\")" },
+            { "out",           "Output directory for build artifacts (default: \"build\")" },
+            { "bin",           "Output binary name (defaults to project name)" },
+            { "target",        "Compilation target: linux | macos | windows | kernel | limine" },
+            { "libs",          "Extra link libraries, e.g. [\"-lm\", \"-lpthread\"]" },
+            { "flags",         "Extra compiler / assembler flags" },
+            { "linker_script", "Path to a custom .ld linker script (freestanding targets)" },
+            { NULL, NULL }
+        };
+        for (int i = 0; keys[i].key && count < max_out; i++) {
+            if (!linkle_matches(keys[i].key, partial)) continue;
+            out[count] = (CompletionItem){0};
+            snprintf(out[count].label,  sizeof(out[count].label),  "%s", keys[i].key);
+            snprintf(out[count].detail, sizeof(out[count].detail),  "%s: \"...\"", keys[i].key);
+            snprintf(out[count].documentation, sizeof(out[count].documentation), "%s", keys[i].doc);
+            out[count].kind = COMPLETE_FIELD;
+            count++;
+        }
+        return count;
+    }
+
+    if (strcmp(block, "vendors") == 0) {
+        /* Inside vendors {}, user types  alias: "path".
+           Offer a snippet hint since we don't know their vendor aliases. */
+        if (count < max_out && partial[0] == '\0') {
+            out[count] = (CompletionItem){0};
+            snprintf(out[count].label,  sizeof(out[count].label),  "myvendor");
+            snprintf(out[count].detail, sizeof(out[count].detail),  "alias: \"path/to/vendor\"");
+            snprintf(out[count].documentation, sizeof(out[count].documentation),
+                     "Add a vendor alias. The path is relative to the project root.");
+            out[count].kind = COMPLETE_FIELD;
+            count++;
+        }
+        return count;
+    }
+
+    if (strcmp(block, "packages") == 0) {
+        /* packages { name: "version" } — just a hint */
+        if (count < max_out && partial[0] == '\0') {
+            out[count] = (CompletionItem){0};
+            snprintf(out[count].label,  sizeof(out[count].label),  "my-package");
+            snprintf(out[count].detail, sizeof(out[count].detail),  "my-package: \"0.1.0\"");
+            snprintf(out[count].documentation, sizeof(out[count].documentation),
+                     "Add a registry package dependency.");
+            out[count].kind = COMPLETE_FIELD;
+            count++;
+        }
+        return count;
+    }
+
+    if (strcmp(block, "workspace") == 0) {
+        if (linkle_matches("members", partial) && count < max_out) {
+            out[count] = (CompletionItem){0};
+            snprintf(out[count].label,  sizeof(out[count].label),  "members");
+            snprintf(out[count].detail, sizeof(out[count].detail),  "members: [\"pkg1\", \"pkg2\"]");
+            snprintf(out[count].documentation, sizeof(out[count].documentation),
+                     "List of member package directories (relative to workspace root).");
+            out[count].kind = COMPLETE_FIELD;
+            count++;
+        }
+        return count;
+    }
+
+    if (strcmp(block, "target") == 0) {
+        /* Inside a target() {} block — suggest run() */
+        if (linkle_matches("run", partial) && count < max_out) {
+            out[count] = (CompletionItem){0};
+            snprintf(out[count].label,  sizeof(out[count].label),  "run");
+            snprintf(out[count].detail, sizeof(out[count].detail),  "run(\"shell command\")");
+            snprintf(out[count].documentation, sizeof(out[count].documentation),
+                     "Execute a shell command as part of this target.");
+            out[count].kind = COMPLETE_FUNCTION;
+            count++;
+        }
+        return count;
+    }
+
+    /* ── Top-level block keywords ── */
+    typedef struct { const char *kw; const char *detail; const char *doc; } TopKW;
+    static const TopKW top_kws[] = {
+        { "project",
+          "project { name: \"...\", version: \"...\", author: \"...\", description: \"...\", repo: \"...\" }",
+          "Declare project metadata (name, version, author, description, repo)." },
+        { "build",
+          "build { src: \"src\", main: \"main\", out: \"build\", target: \"linux\" }",
+          "Build settings: source directory, entry point, output path, target platform." },
+        { "vendors",
+          "vendors { alias: \"path/to/vendor\" }",
+          "Map local vendor library aliases to their source directories." },
+        { "packages",
+          "packages { my-pkg: \"0.1.0\" }",
+          "Declare registry package dependencies." },
+        { "workspace",
+          "workspace { members: [\"pkg1\", \"pkg2\"] }",
+          "Declare a multi-package workspace. Cannot be combined with project/build blocks." },
+        { "target",
+          "target my_task() { run(\"...\") }",
+          "Define a custom build target / task invoked with  linkle target <name>." },
+        { NULL, NULL, NULL }
+    };
+    for (int i = 0; top_kws[i].kw && count < max_out; i++) {
+        if (!linkle_matches(top_kws[i].kw, partial)) continue;
+        out[count] = (CompletionItem){0};
+        snprintf(out[count].label,  sizeof(out[count].label),  "%s", top_kws[i].kw);
+        snprintf(out[count].detail, sizeof(out[count].detail),  "%s", top_kws[i].detail);
+        snprintf(out[count].documentation, sizeof(out[count].documentation),
+                 "%s", top_kws[i].doc);
+        out[count].kind = COMPLETE_KEYWORD;
+        count++;
+    }
+    return count;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   Public: lsp_complete
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+int lsp_complete(LspState *st,
+                 const char *source, int line, int col,
+                 CompletionItem *out, int max_out)
+{
+    if (!st || !out || max_out <= 0)
+        return 0;
+
+    LspProject *proj = st->project;
+    int count = 0;
+
+    /* ── Include block completion ── */
+    char inc_prefix[256] = "";
+    if (cursor_in_include(source, line, col, inc_prefix, sizeof(inc_prefix)))
+    {
+        /* Stdlib modules */
+        for (int i = 0; stdlib_modules[i] && count < max_out; i++)
+        {
+            if (inc_prefix[0] == '\0' ||
+                strncmp(stdlib_modules[i], inc_prefix, strlen(inc_prefix)) == 0)
+            {
+                add_completion_to(out, &count, max_out,
+                                  stdlib_modules[i], COMPLETE_MODULE,
+                                  "stdlib module", NULL);
+            }
+        }
+        /* User project files */
+        if (proj)
+        {
+            for (int f = 0; f < proj->file_count && count < max_out; f++)
+            {
+                char mod[512];
+                filepath_to_module(proj->root_dir, proj->files[f].filepath,
+                                   mod, sizeof(mod));
+                if (mod[0] == '\0')
+                    continue;
+                /* skip std.* paths that ended up here */
+                if (strncmp(mod, "std.", 4) == 0)
+                    continue;
+                if (inc_prefix[0] == '\0' ||
+                    strncmp(mod, inc_prefix, strlen(inc_prefix)) == 0)
+                {
+                    add_completion_to(out, &count, max_out,
+                                      mod, COMPLETE_MODULE,
+                                      "project file", NULL);
+                }
+            }
+        }
+        return count;
+    }
+
+    /* ── Member access completion (after a '.') ── */
+    char obj_name[128] = "";
+    if (cursor_after_dot(source, line, col, obj_name, sizeof(obj_name)) && obj_name[0])
+    {
+        /* Resolve the type of obj_name from the current file first,
+           then from the rest of the project. */
+        const char *class_name = NULL;
+
+        /* Check current file */
+        ProgramNode *cur_prog = st->file ? st->file->program : NULL;
+        if (cur_prog)
+            class_name = resolve_var_type(cur_prog, obj_name);
+
+        /* Check other project files if not found */
+        if (!class_name && proj)
+        {
+            for (int f = 0; f < proj->file_count && !class_name; f++)
+            {
+                if (st->file && &proj->files[f] == st->file)
+                    continue;
+                class_name = resolve_var_type(proj->files[f].program, obj_name);
+            }
+        }
+
+        if (class_name) {
+            /* ── array<T> built-in members ── */
+            if (strcmp(class_name, "array") == 0) {
+                static const struct {
+                    const char    *label;
+                    const char    *detail;
+                    CompletionKind kind;
+                } arr_members[] = {
+                    { "len",  "int len",           COMPLETE_FIELD  },
+                    { "cap",  "int cap",           COMPLETE_FIELD  },
+                    { "push", "void push(T val)",  COMPLETE_METHOD },
+                    { "pop",  "T pop()",           COMPLETE_METHOD },
+                };
+                static const int arr_member_count =
+                    (int)(sizeof(arr_members) / sizeof(arr_members[0]));
+                for (int m = 0; m < arr_member_count && count < max_out; m++) {
+                    out[count] = (CompletionItem){0};
+                    snprintf(out[count].label,  sizeof(out[count].label),
+                             "%s", arr_members[m].label);
+                    snprintf(out[count].detail, sizeof(out[count].detail),
+                             "%s", arr_members[m].detail);
+                    out[count].kind = arr_members[m].kind;
+                    count++;
+                }
+                return count;
+            }
+
+            /* ── Enum variant members ── */
+            EnumNode *en = find_enum_in_project(proj, class_name);
+            if (en) {
+                for (int v = 0; v < en->variant_count && count < max_out; v++) {
+                    out[count] = (CompletionItem){0};
+                    snprintf(out[count].label,  sizeof(out[count].label),
+                             "%s", en->variants[v].name);
+                    snprintf(out[count].detail, sizeof(out[count].detail),
+                             "%s::%s = %d",
+                             en->name, en->variants[v].name,
+                             en->variants[v].value);
+                    out[count].kind = COMPLETE_VARIABLE;
+                    count++;
+                }
+                if (count > 0) return count;
+            }
+
+            /* Find the class definition across the whole project */
+            ClassNode *cn = find_class_in_project(proj, class_name);
+            if (cn)
+            {
+                /* Emit public fields */
+                for (int f = 0; f < cn->field_count && count < max_out; f++)
+                {
+                    FieldNode *fld = cn->fields[f];
+                    if (!fld || !fld->is_public)
+                        continue;
+                    char ft[64];
+                    type_to_str(fld->field_type, ft, sizeof(ft));
+                    char det[128];
+                    snprintf(det, sizeof(det), "%s: %s", fld->name, ft);
+                    out[count] = (CompletionItem){0};
+                    snprintf(out[count].label, sizeof(out[count].label), "%s", fld->name);
+                    snprintf(out[count].detail, sizeof(out[count].detail), "%s", det);
+                    out[count].kind = COMPLETE_FIELD;
+                    count++;
+                }
+                /* Emit methods */
+                for (int m = 0; m < cn->method_count && count < max_out; m++)
+                {
+                    MethodNode *mn = cn->methods[m];
+                    if (!mn)
+                        continue;
+                    char ret[64];
+                    type_to_str(mn->return_type, ret, sizeof(ret));
+                    char sig[256];
+                    build_sig(sig, sizeof(sig), ret, mn->name,
+                              mn->params, mn->param_count);
+                    out[count] = (CompletionItem){0};
+                    snprintf(out[count].label, sizeof(out[count].label), "%s", mn->name);
+                    snprintf(out[count].detail, sizeof(out[count].detail), "%s", sig);
+                    out[count].kind = COMPLETE_METHOD;
+                    count++;
+                }
+                if (count > 0)
+                    return count;
+            }
+        }
+        /* Fall through to global if we couldn't resolve the type */
+    }
+
+    /* ── Global completions ── */
+
+    /* Locals from the current file first */
+    if (st->file)
+        collect_locals(st->file->program, line, out, &count, max_out);
+
+    /* Project-wide global symbols (keywords, builtins, all declared funcs/classes) */
+    if (proj)
+    {
+        /* Gather includes for this file, if available */
+        int include_count = 0;
+        const char *includes[64] = {0};
+        if (st->file && st->file->program)
+        {
+            for (int i = 0; i < st->file->program->include_count && i < 64; i++)
+            {
+                includes[include_count++] = st->file->program->includes[i];
+                log_include_processing(st->file->program->includes[i], st->file->filepath);
+            }
+        }
+
+        for (int i = 0; i < proj->global_completion_count && count < max_out; i++)
+        {
+            CompletionItem *src = &proj->global_completions[i];
+            /* Deduplicate against what we already emitted as locals */
+            int dup = 0;
+            for (int j = 0; j < count; j++)
+            {
+                if (out[j].kind == src->kind && strcmp(out[j].label, src->label) == 0)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup)
+                continue;
+
+            /* Only suggest short-name stdlib functions if the module is included */
+            if (src->kind == COMPLETE_FUNCTION)
+            {
+                if (strncmp(src->label, "std.", 4) != 0)
+                {
+                    /* Not a fully qualified stdlib function, check if it's a short name from stdlib */
+                    int is_stdlib_short = 0;
+                    char fq_label[256];
+                    for (int k = 0; k < proj->global_completion_count; k++)
+                    {
+                        CompletionItem *fq = &proj->global_completions[k];
+                        if (fq->kind == COMPLETE_FUNCTION && strncmp(fq->label, "std.", 4) == 0)
+                        {
+                            const char *dot = strrchr(fq->label, '.');
+                            if (dot && strcmp(dot + 1, src->label) == 0)
+                            {
+                                is_stdlib_short = 1;
+                                size_t mod_len = dot - fq->label;
+                                char mod[128];
+                                if (mod_len < sizeof(mod))
+                                {
+                                    memcpy(mod, fq->label, mod_len);
+                                    mod[mod_len] = '\0';
+                                    int found = 0;
+                                    for (int inc = 0; inc < include_count; inc++)
+                                    {
+                                        if (strcmp(includes[inc], mod) == 0)
+                                        {
+                                            found = 1;
+                                            break;
+                                        }
+                                    }
+                                    log_function_resolution(src->label, mod, st->file->filepath);
+                                    if (!found)
+                                        goto skip_completion;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            out[count++] = *src;
+            continue;
+        skip_completion:;
+        }
+    }
+
+    return count;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   Public: lsp_hover
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+HoverResult lsp_hover(LspState *st,
+                      const char *source, int line, int col)
+{
+    HoverResult res = {0, ""};
+    if (!st)
+        return res;
+
+    char *word = word_at(source, line, col);
+    if (!word)
+        return res;
+
+    LspProject *proj = st->project;
+
+    /* ── Search order: current file, then all other project files ── */
+
+    /* Build a search list: current file first */
+    ProgramNode *search[MAX_PROJECT_FILES + 1];
+    const char *search_file[MAX_PROJECT_FILES + 1];
+    int search_count = 0;
+
+    if (st->file && st->file->program)
+    {
+        search[search_count] = st->file->program;
+        search_file[search_count] = st->file->filepath;
+        search_count++;
+    }
+    if (proj)
+    {
+        for (int f = 0; f < proj->file_count; f++)
+        {
+            if (st->file && &proj->files[f] == st->file)
+                continue;
+            if (!proj->files[f].program)
+                continue;
+            search[search_count] = proj->files[f].program;
+            search_file[search_count] = proj->files[f].filepath;
+            search_count++;
+        }
+    }
+
+    for (int si = 0; si < search_count; si++)
+    {
+        ProgramNode *prog = search[si];
+        const char *src_file = search_file[si];
+
+        /* Compute a short label for the source file */
+        const char *src_label = src_file;
+        if (proj)
+        {
+            int rlen = (int)strlen(proj->root_dir);
+            if (strncmp(src_file, proj->root_dir, rlen) == 0 &&
+                src_file[rlen] == '/')
+                src_label = src_file + rlen + 1;
+        }
+
+        for (int i = 0; i < prog->decl_count; i++)
+        {
+            ASTNode *d = prog->declarations[i];
+            if (!d)
+                continue;
+
+            /* ── Top-level function ── */
+            if (d->type == NODE_FUNC)
+            {
+                FuncNode *fn = (FuncNode *)d;
+                if (strcmp(fn->name, word) != 0)
+                    continue;
+
+                char ret[64];
+                type_to_str(fn->return_type, ret, sizeof(ret));
+                char sig[256];
+                build_sig(sig, sizeof(sig), ret, fn->name,
+                          fn->params, fn->param_count);
+                snprintf(res.content, sizeof(res.content),
+                         "```hylian\n%s\n```\n*from `%s`*", sig, src_label);
+                res.found = 1;
+                free(word);
+                return res;
+            }
+
+            /* ── Enum type or variant ── */
+            if (d->type == NODE_ENUM) {
+                EnumNode *en = (EnumNode *)d;
+                if (strcmp(en->name, word) == 0) {
+                    snprintf(res.content, sizeof(res.content),
+                             "```hylian\n%senum %s\n```\n*from `%s`*",
+                             en->is_public ? "public " : "", en->name, src_label);
+                    res.found = 1;
+                    free(word);
+                    return res;
+                }
+                for (int v = 0; v < en->variant_count; v++) {
+                    if (strcmp(en->variants[v].name, word) == 0) {
+                        snprintf(res.content, sizeof(res.content),
+                                 "```hylian\n%s::%s = %d\n```\n*variant of `%s` from `%s`*",
+                                 en->name, en->variants[v].name,
+                                 en->variants[v].value,
+                                 en->name, src_label);
+                        res.found = 1;
+                        free(word);
+                        return res;
+                    }
+                }
+            }
+
+            /* ── Class, method, or field ── */
+            if (d->type == NODE_CLASS)
+            {
+                ClassNode *cn = (ClassNode *)d;
+
+                if (strcmp(cn->name, word) == 0)
+                {
+                    snprintf(res.content, sizeof(res.content),
+                             "```hylian\n%sclass %s\n```\n*from `%s`*",
+                             cn->is_public ? "public " : "", cn->name, src_label);
+                    res.found = 1;
+                    free(word);
+                    return res;
+                }
+
+                for (int m = 0; m < cn->method_count; m++)
+                {
+                    MethodNode *mn = cn->methods[m];
+                    if (!mn || strcmp(mn->name, word) != 0)
+                        continue;
+
+                    char ret[64];
+                    type_to_str(mn->return_type, ret, sizeof(ret));
+                    char sig[256];
+                    build_sig(sig, sizeof(sig), ret, mn->name,
+                              mn->params, mn->param_count);
+                    snprintf(res.content, sizeof(res.content),
+                             "```hylian\n%s::%s\n```\n*method of `%s` from `%s`*",
+                             cn->name, sig + strlen(ret) + 1,
+                             cn->name, src_label);
+                    res.found = 1;
+                    free(word);
+                    return res;
+                }
+
+                for (int f = 0; f < cn->field_count; f++)
+                {
+                    FieldNode *fld = cn->fields[f];
+                    if (!fld || strcmp(fld->name, word) != 0)
+                        continue;
+
+                    char ft[64];
+                    type_to_str(fld->field_type, ft, sizeof(ft));
+                    snprintf(res.content, sizeof(res.content),
+                             "```hylian\n%s%s %s.%s\n```\n*field of `%s` from `%s`*",
+                             fld->is_public ? "public " : "private ",
+                             ft, cn->name, fld->name,
+                             cn->name, src_label);
+                    res.found = 1;
+                    free(word);
+                    return res;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < proj->global_completion_count; i++)
+    {
+        CompletionItem *it = &proj->global_completions[i];
+        if (it->kind == COMPLETE_FUNCTION && strcmp(it->label, word) == 0)
+        {
+            /* Check if it's a C stdlib function (has module prefix) */
+            if (strncmp(it->label, "std.", 4) == 0)
+            {
+                snprintf(res.content, sizeof(res.content),
+                         "```c\n%s\n```\n*C stdlib: %s*",
+                         it->detail, it->documentation);
+                res.found = 1;
+                free(word);
+                return res;
+            }
+        }
+    }
+
+    /* ── array<T> method hover (fallback when no other definition matched) ── */
+    if (!res.found) {
+        static const struct { const char *name; const char *sig; } arr_hover[] = {
+            { "push", "void push(T val)" },
+            { "pop",  "T pop()"          },
+            { NULL, NULL }
+        };
+        for (int i = 0; arr_hover[i].name; i++) {
+            if (strcmp(word, arr_hover[i].name) == 0) {
+                snprintf(res.content, sizeof(res.content),
+                         "```hylian\n%s\n```\n*array\\<T\\> method*",
+                         arr_hover[i].sig);
+                res.found = 1;
+                break;
+            }
+        }
+    }
+
+    free(word);
+    return res;
+}

@@ -1,0 +1,37 @@
+# Website lives in its own repo (LinkNavi/hylian-web)
+Website/
+
+# Vendored and editor dependencies (have their own git repos)
+Din/
+lsp/editors/nvim/
+lsp/vendor/tree-sitter/
+lsp/vendor/tree-sitter-c/
+
+# Build artefacts
+*.o
+*.out
+hylian
+
+# Compiler generated files
+compiler/lex.yy.c
+compiler/parser.tab.c
+compiler/parser.tab.h
+
+# LSP generated files
+lsp/src/lex_lsp.yy.c
+lsp/src/parser_lsp.tab.c
+lsp/src/parser_lsp.tab.h
+lsp/hylian-lsp
+
+# Editor extension build output
+lsp/editors/zed/target
+
+# Hylian source files used as test inputs
+*.hy
+
+# mdBook output
+docs/book/
+
+# Python cache
+__pycache__/
+*.pyc

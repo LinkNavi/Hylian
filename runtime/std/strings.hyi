@@ -1,0 +1,65 @@
+// Hylian standard library interface — std.strings
+// Hylian runtime string interface
+//
+// Usage:
+//   include {
+//       std.strings,
+//   }
+module std.strings
+
+// Returns the length of a string.
+fn length(s: str) -> int
+
+// Returns true if the string is null or empty.
+fn is_empty(s: str) -> bool
+
+// Returns true if the string contains the given substring.
+fn contains(s: str, needle: str) -> bool
+
+// Returns true if the string starts with the given prefix.
+fn starts_with(s: str, prefix: str) -> bool
+
+// Returns true if the string ends with the given suffix.
+fn ends_with(s: str, suffix: str) -> bool
+
+// Returns the index of the first occurrence of needle, or -1 if not found.
+fn index_of(s: str, needle: str) -> int
+
+// Returns a substring from start (inclusive) to end (exclusive).
+fn slice(s: str, start: int, end: int) -> str
+
+// Returns the string with leading and trailing whitespace removed.
+fn trim(s: str) -> str
+
+// Returns the string with leading whitespace removed.
+fn trim_start(s: str) -> str
+
+// Returns the string with trailing whitespace removed.
+fn trim_end(s: str) -> str
+
+// Returns the string converted to uppercase.
+fn to_upper(s: str) -> str
+
+// Returns the string converted to lowercase.
+fn to_lower(s: str) -> str
+
+// Returns the string with all occurrences of old replaced by new.
+fn replace(s: str, old: str, new: str) -> str
+
+// Splits the string by delim. Returns a list of substrings.
+fn split(s: str, delim: str) -> str[]
+
+// Joins a list of strings with the given delimiter.
+fn join(parts: str[], count: int, delim: str) -> str
+
+// Parses a decimal string into an integer. Returns false on failure.
+fn to_int(s: str, out: int&) -> bool
+
+// Parses a string into a float. Returns false on failure.
+fn to_float(s: str, out: float&) -> bool
+
+// Converts an integer to its decimal string representation.
+fn from_int(n: int) -> str
+
+// Returns true if two strings are equal.
+fn equals(a: str, b: str) -> bool

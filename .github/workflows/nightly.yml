@@ -1,0 +1,62 @@
+# .github/workflows/nightly.yml
+# Triggered on every push to main.
+# Builds the toolchain and publishes a nightly release to hylian.lol.
+
+name: Nightly Release
+
+on:
+  push:
+    branches: [main]
+
+  # Allow manual dispatch for testing
+  workflow_dispatch:
+
+jobs:
+  nightly:
+    name: Build & Publish Nightly
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Dependencies ─────────────────────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            nasm \
+            bison \
+            flex \
+            gcc \
+            make \
+            ld \
+            python3
+
+      # ── Build compiler ───────────────────────────────────────────────────────
+      - name: Build compiler
+        run: bash build.sh
+
+      # ── Build stdlib / runtime ───────────────────────────────────────────────
+      - name: Build stdlib
+        run: python3 build_runtime.py
+
+      # ── Verify artifacts ─────────────────────────────────────────────────────
+      - name: Verify build artifacts
+        run: |
+          test -f ./hylian || (echo "Missing compiler binary" && exit 1)
+          test -d ./runtime || (echo "Missing runtime directory" && exit 1)
+          test -f ./linkle.py || (echo "Missing linkle.py" && exit 1)
+          echo "All build artifacts present."
+
+      # ── Publish nightly ──────────────────────────────────────────────────────
+      - name: Publish nightly release
+        env:
+          HYLIAN_REGISTRY: ${{ vars.HYLIAN_REGISTRY || 'https://www.hylian.lol' }}
+        run: |
+          # Write the release token into the config file hylian-release reads
+          mkdir -p ~/.hylian
+          echo "token=${{ secrets.HYLIAN_RELEASE_TOKEN }}" > ~/.hylian/config
+
+          python3 hylian-release.py publish nightly
