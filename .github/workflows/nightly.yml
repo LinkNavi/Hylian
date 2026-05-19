@@ -35,7 +35,7 @@ jobs:
             flex \
             gcc \
             make \
-            ld \
+            binutils \
             python3
 
       # ── Build compiler ───────────────────────────────────────────────────────
