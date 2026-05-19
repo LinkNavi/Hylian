@@ -177,6 +177,68 @@ static void lower_stmt(ASTNode *node, LowerState *s);
 static void lower_stmts(ASTNode **stmts, int count, LowerState *s);
 
 /*
+ * Compute the byte width of a struct field, mirroring codegen_asm.c's
+ * field_total_byte_width(). Handles primitives, nested class types, and
+ * fixed-size array fields (e.g. uint8[56] = 56 bytes). Crucially, this must
+ * agree with the codegen — otherwise nested struct field chains compute
+ * the wrong cumulative offset and end up reading garbage memory.
+ */
+static int lower_field_byte_width(LowerState *s, FieldNode *f) {
+    if (!f) return 8;
+    int prim = 8;
+    const char *elem_name = NULL;
+
+    if (f->field_type.kind == TYPE_ARRAY && f->field_type.fixed_size > 0 &&
+        f->field_type.elem_type_count > 0 && f->field_type.elem_types) {
+        elem_name = f->field_type.elem_types[0].name;
+    } else {
+        elem_name = f->field_type.name ? f->field_type.name : "int";
+    }
+
+    if (elem_name) {
+        if      (strcmp(elem_name, "int8")   == 0 || strcmp(elem_name, "uint8")  == 0) prim = 1;
+        else if (strcmp(elem_name, "int16")  == 0 || strcmp(elem_name, "uint16") == 0) prim = 2;
+        else if (strcmp(elem_name, "int32")  == 0 || strcmp(elem_name, "uint32") == 0 ||
+                 strcmp(elem_name, "float32") == 0) prim = 4;
+        /* All other names default to 8 bytes (int, int64, ptr, str, float, ...). */
+
+        /* If the element is itself a class, use the class's full size. */
+        if (s && s->mod) {
+            for (int i = 0; i < s->mod->class_count; i++) {
+                ClassNode *cn = s->mod->classes[i];
+                if (cn && cn->name && strcmp(cn->name, elem_name) == 0) {
+                    /* Match codegen's packing math: non-packed classes round
+                       up to multiple of 16; unions take the max field width.
+                       For nested-field offset purposes we mirror that exactly. */
+                    int sz = 0;
+                    int max_w = 0;
+                    for (int j = 0; j < cn->field_count; j++) {
+                        int w = lower_field_byte_width(s, cn->fields[j]);
+                        if (cn->is_union) { if (w > max_w) max_w = w; }
+                        else { sz += w; }
+                    }
+                    if (cn->is_union) {
+                        sz = max_w ? max_w : 8;
+                        if (sz % 8 != 0) sz += 8 - sz % 8;
+                    } else {
+                        if (sz == 0) sz = 8;
+                        if (!cn->is_packed && sz % 16 != 0)
+                            sz += 16 - sz % 16;
+                    }
+                    prim = sz;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (f->field_type.kind == TYPE_ARRAY && f->field_type.fixed_size > 0)
+        return prim * f->field_type.fixed_size;
+    return prim;
+}
+
+
+/*
  * Walk a chain of NODE_MEMBER_ACCESS nodes on a stack struct (no-ctor class)
  * and return a temp whose value is the base address of the innermost struct
  * object (the named variable). Also accumulates the byte offset of all the
@@ -244,7 +306,8 @@ static int lower_stack_struct_addrof(ASTNode *node, LowerState *s,
             }
         }
         if (!cls) return -1;
-        /* Compute field offset (mirroring field_byte_width from codegen_asm.c) */
+        /* Walk fields with the correct width helper so nested classes and
+           fixed-size arrays contribute their real size, not 8 bytes. */
         int foff = -1;
         const char *ftype = NULL;
         int running = 0;
@@ -252,11 +315,7 @@ static int lower_stack_struct_addrof(ASTNode *node, LowerState *s,
             FieldNode *f = cls->fields[i];
             if (!f) continue;
             const char *tname = f->field_type.name ? f->field_type.name : "int";
-            int w = 8; /* default */
-            if (strcmp(tname, "int8")   == 0 || strcmp(tname, "uint8")  == 0) w = 1;
-            else if (strcmp(tname, "int16")  == 0 || strcmp(tname, "uint16") == 0) w = 2;
-            else if (strcmp(tname, "int32")  == 0 || strcmp(tname, "uint32") == 0 ||
-                     strcmp(tname, "float32") == 0) w = 4;
+            int w = lower_field_byte_width(s, f);
             if (f->name && strcmp(f->name, ma->member) == 0) {
                 /* For union classes all fields are at offset 0 */
                 foff  = cls->is_union ? 0 : running;

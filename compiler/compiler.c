@@ -416,9 +416,23 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
     /* Determine the directory this file lives in — used to resolve its imports */
     char *file_dir = dir_of(filepath);
 
-    /* Walk the include list and resolve non-std paths */
-    for (int i = 0; i < program->include_count; i++) {
-        const char *inc = program->includes[i];
+    /* Snapshot the include list before walking it. As we resolve dependencies
+       and merge them into `program`, `program->includes` will grow with
+       transitive includes — but we only want to resolve the ORIGINAL includes
+       of this file here. Without the snapshot, we'd reprocess transitive deps
+       (and potentially infinite-loop on diamond imports) because the loop
+       bound `program->include_count` keeps growing as we merge. */
+    int   orig_include_count = program->include_count;
+    char **orig_includes = NULL;
+    if (orig_include_count > 0) {
+        orig_includes = malloc(orig_include_count * sizeof(char *));
+        for (int i = 0; i < orig_include_count; i++)
+            orig_includes[i] = program->includes[i];
+    }
+
+    /* Walk the snapshotted include list and resolve non-std paths */
+    for (int i = 0; i < orig_include_count; i++) {
+        const char *inc = orig_includes[i];
 
         /* std.* paths are resolved as .hyi interface files from runtime/std/
            so the typecheck pass knows about their function signatures.
@@ -604,28 +618,15 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
 
         if (!dep) continue; /* error already printed */
 
-        /* Merge dep declarations first so forward declarations resolve correctly */
-        ProgramNode *merged = make_program();
-
-        for (int j = 0; j < dep->include_count; j++) {
-            int dup = 0;
-            for (int k = 0; k < merged->include_count; k++)
-                if (strcmp(merged->includes[k], dep->includes[j]) == 0) { dup = 1; break; }
-            if (!dup) {
-                merged->includes = realloc(merged->includes, (merged->include_count + 1) * sizeof(char *));
-                merged->includes[merged->include_count++] = dep->includes[j];
-            }
-        }
-
-        for (int j = 0; j < dep->decl_count; j++) {
-            merged->declarations = realloc(merged->declarations, (merged->decl_count + 1) * sizeof(ASTNode *));
-            merged->declarations[merged->decl_count++] = dep->declarations[j];
-        }
-        merge_programs(merged, program);
-
-        program = merged;
+        /* Merge dep into `program` in-place. Previously this built a new
+           `merged` ProgramNode and reassigned `program = merged`, but that
+           silently re-pointed the loop iterator at a different include list
+           (with dep's transitive includes prepended), causing duplicate
+           processing and lost decls on files with 2+ includes. */
+        merge_programs(program, dep);
     }
 
+    if (orig_includes) free(orig_includes);
     free(file_dir);
     return program;
 }

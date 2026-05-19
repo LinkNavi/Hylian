@@ -414,6 +414,16 @@ static int temp_is_float[MAX_TEMP_SLOTS];
 
 static int frame_bytes;
 static int interp_buf_offset; /* 0 = no pre-allocated buffer */
+/* Pool of fixed 32-byte buffers for int_to_str return values.
+   Without this, every int_to_str call did its own `sub rsp, 32` that was
+   never reclaimed until function return — in a loop that means O(N) stack
+   growth per iteration and eventual SIGSEGV. We now count int_to_str calls
+   in prescan, reserve N*32 bytes once in the frame, and hand out slots
+   sequentially during codegen. The emission counter is reset per-function. */
+#define INT_TO_STR_BUF_BYTES 32
+static int int_to_str_total_bufs;     /* count discovered in prescan        */
+static int int_to_str_pool_offset;    /* rbp offset of byte 0 of first buf  */
+static int int_to_str_next_buf;       /* next buffer index to hand out      */
 
 #define MAX_STATIC_VARS 8192
 typedef struct {
@@ -475,6 +485,9 @@ static void prescan_function(const IRModule *mod, int begin_idx, int end_idx) {
   named_count = 0;
   max_temp_id = -1;
   interp_buf_offset = 0;
+  int_to_str_total_bufs = 0;
+  int_to_str_pool_offset = 0;
+  int_to_str_next_buf = 0;
   /* Clear named_slots so that multi-slot gaps (from structs/unions that
      occupy more than one 8-byte slot) don't contain stale names from a
      previous function's prescan. */
@@ -513,6 +526,13 @@ static void prescan_function(const IRModule *mod, int begin_idx, int end_idx) {
     if ((ins->op == IR_PRINT || ins->op == IR_PRINTLN) &&
         ins->extra_int == PRINT_ARG_INTERP)
       needs_interp = 1;
+
+    /* Reserve one persistent 32-byte buffer per int_to_str call so the
+       returned char* remains valid for the rest of the function without
+       leaking stack on each call. */
+    if (ins->op == IR_CALL && ins->str_extra &&
+        strcmp(ins->str_extra, "int_to_str") == 0)
+      int_to_str_total_bufs++;
 
     /* Track float-typed temps */
     if (ins->dest.kind == IROP_TEMP && ins->dest.temp_id >= 0 &&
@@ -566,6 +586,13 @@ static void prescan_function(const IRModule *mod, int begin_idx, int end_idx) {
     frame_bytes = interp_buf_offset;
   } else {
     frame_bytes = slot_bytes;
+  }
+  /* int_to_str buffer pool: N * 32-byte slots, placed after interp buffer.
+     pool_offset is the rbp-relative offset of byte 0 of the FIRST buffer
+     (i.e. lowest address); buffer i lives at [rbp - (pool_offset - i*32)]. */
+  if (int_to_str_total_bufs > 0) {
+    int_to_str_pool_offset = frame_bytes + int_to_str_total_bufs * INT_TO_STR_BUF_BYTES;
+    frame_bytes = int_to_str_pool_offset;
   }
   frame_bytes = (frame_bytes + 15) & ~15;
   if (frame_bytes < 16)
@@ -1164,33 +1191,31 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
   case IR_CALL: {
     /* Special case: int_to_str(n) -> str
        The C ABI function hylian_int_to_str(n, buf, buflen) writes into a
-       caller-supplied buffer and returns the length.  When called from Hylian
-       as a value-returning expression we need to allocate a stack buffer,
-       pass it, null-terminate the result, and hand back the pointer — not
-       the length — so that the resulting str is a valid null-terminated C
-       string that callers (including raylib's DrawText / TextLength) can use.
-
-       The 32-byte buffer is left on the stack and is NOT reclaimed here —
-       it lives until the enclosing function returns via `mov rsp, rbp`.
-       r14 is saved/restored purely to satisfy any callee-save conventions
-       around the call; it is not used as the buffer pointer. */
+       caller-supplied buffer and returns the length. We hand it one slot
+       from the per-function buffer pool reserved in the prologue, then
+       return the buffer's address as a stable null-terminated str. The
+       slot lives until function exit (reclaimed by `mov rsp, rbp`).
+       Previously every call did its own `sub rsp, 32` that was never
+       reclaimed until function return — a loop calling int_to_str N times
+       would leak 32*N bytes of stack and eventually crash. */
     if (ins->str_extra && strcmp(ins->str_extra, "int_to_str") == 0) {
+      int buf_idx = int_to_str_next_buf++;
+      /* Buffer i lives at [rbp - (pool_offset - i*32)]; lowest address is
+         the FIRST buffer (offset == pool_offset), highest is the last.
+         Use lea to get a stable pointer. */
+      int buf_off = int_to_str_pool_offset - buf_idx * INT_TO_STR_BUF_BYTES;
       load_operand_reg(&ins->args[0], "rax", out);
-      fprintf(out, "    push r14\n");
-      fprintf(out, "    sub rsp, 32\n");               /* 32-byte stack buffer */
-      fprintf(out, "    mov r14, rsp\n");              /* stash buf ptr in r14 */
-      fprintf(out, "    mov %s, rax\n", arg_reg(0));   /* arg0 = n             */
-      fprintf(out, "    mov %s, r14\n", arg_reg(1));   /* arg1 = &buf[0]       */
-      fprintf(out, "    mov %s, 31\n",  arg_reg(2));   /* arg2 = buflen        */
+      fprintf(out, "    lea r11, [rbp - %d]\n", buf_off);       /* r11 = buf */
+      fprintf(out, "    mov %s, rax\n", arg_reg(0));            /* arg0 = n  */
+      fprintf(out, "    mov %s, r11\n", arg_reg(1));            /* arg1 = buf */
+      fprintf(out, "    mov %s, 31\n",  arg_reg(2));            /* arg2 = len */
       if (is_win64()) fprintf(out, "    sub rsp, 32\n");
       fprintf(out, "    call %s\n", sym("hylian_int_to_str"));
       if (is_win64()) fprintf(out, "    add rsp, 32\n");
-      /* rax = length written; null-terminate the string */
-      fprintf(out, "    mov byte [r14 + rax], 0\n");
-      /* Return the stable buffer pointer */
-      fprintf(out, "    mov rax, r14\n");
-      fprintf(out, "    pop r14\n");
-      /* Leave the 32-byte buffer on the stack — reclaimed by `mov rsp, rbp` */
+      /* rax = length written; null-terminate at buf[rax] */
+      fprintf(out, "    lea r11, [rbp - %d]\n", buf_off);
+      fprintf(out, "    mov byte [r11 + rax], 0\n");
+      fprintf(out, "    mov rax, r11\n");                       /* result = buf ptr */
       store_dest_rax(&ins->dest, out);
       break;
     }
