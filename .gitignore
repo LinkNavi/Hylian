@@ -31,7 +31,7 @@ lsp/editors/zed/target
 
 # mdBook output
 docs/book/
-
+vendors/
 # Python cache
 __pycache__/
 *.pyc

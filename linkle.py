@@ -48,6 +48,94 @@ VALID_TARGETS = ("linux", "macos", "windows", "kernel", "limine")
 REGISTRY_URL = os.environ.get("HYLIAN_REGISTRY", "https://hylian.lol")
 
 
+# ── Semver helpers ────────────────────────────────────────────────────────────
+
+
+def _parse_semver(v):
+    """Parse "MAJOR.MINOR.PATCH" into a (int, int, int) tuple, or None."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", v.strip())
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _semver_satisfies(installed_str, required_str):
+    """
+    Return True when `installed_str` satisfies the `required_str` constraint.
+
+    Supported constraint prefixes:
+      "1.2.3"   — exact match
+      "^1.2.3"  — compatible (same major, installed >= required)
+      "~1.2.3"  — patch-level (same major+minor, installed >= required)
+      ">=1.2.3" — installed >= required
+      ">1.2.3"  — installed > required
+      "<=1.2.3" — installed <= required
+      "<1.2.3"  — installed < required
+
+    Returns True if the constraint cannot be parsed (fail-open so unknown
+    formats don't break existing projects).
+    """
+    installed = _parse_semver(installed_str)
+    if installed is None:
+        return True  # can't compare, allow
+
+    constraint = required_str.strip()
+
+    if constraint.startswith("^"):
+        req = _parse_semver(constraint[1:])
+        if req is None:
+            return True
+        return installed[0] == req[0] and installed >= req
+
+    if constraint.startswith("~"):
+        req = _parse_semver(constraint[1:])
+        if req is None:
+            return True
+        return installed[0] == req[0] and installed[1] == req[1] and installed >= req
+
+    if constraint.startswith(">="):
+        req = _parse_semver(constraint[2:])
+        if req is None:
+            return True
+        return installed >= req
+
+    if constraint.startswith(">"):
+        req = _parse_semver(constraint[1:])
+        if req is None:
+            return True
+        return installed > req
+
+    if constraint.startswith("<="):
+        req = _parse_semver(constraint[2:])
+        if req is None:
+            return True
+        return installed <= req
+
+    if constraint.startswith("<"):
+        req = _parse_semver(constraint[1:])
+        if req is None:
+            return True
+        return installed < req
+
+    # Plain version — exact match
+    req = _parse_semver(constraint)
+    if req is None:
+        return True
+    return installed == req
+
+
+def _best_version(versions, constraint):
+    """
+    Given a list of version strings (newest-first from the registry) and a
+    semver constraint string, return the newest version that satisfies the
+    constraint, or None if none do.
+    """
+    for v in versions:
+        if _semver_satisfies(v, constraint):
+            return v
+    return None
+
+
 def _token_path():
     """Return the path of the Hylian config file that stores the API token."""
     return os.path.expanduser("~/.hylian/config")
@@ -574,6 +662,8 @@ def _is_fresh(obj, src):
 # ── Stdlib module registry ────────────────────────────────────────────────────
 
 STD_MODULES = [
+    # std.mem is always linked — codegen unconditionally emits extern arena_init/arena_alloc/arena_free
+    {"include": "__always__", "stem": "mem", "link_libs": []},
     {"include": "std.io", "stem": "io", "link_libs": []},
     {"include": "std.errors", "stem": "errors", "link_libs": []},
     {"include": "std.strings", "stem": "strings", "link_libs": []},
@@ -689,7 +779,7 @@ def _collect_runtime_objs(includes, target, verbose):
     objs = []
     extra_libs = []
     for mod in STD_MODULES:
-        if mod["include"] not in needed:
+        if mod["include"] != "__always__" and mod["include"] not in needed:
             continue
         objs.append(_runtime_obj(mod["stem"], target, verbose))
         for lib in mod.get("link_libs", []):
@@ -788,6 +878,36 @@ def _scan_includes(hy_file):
 # ── .hyi parser ───────────────────────────────────────────────────────────────
 
 
+def _pkg_config_libs(pkg_name):
+    """
+    Run pkg-config for the given package name and return a list of linker flags.
+    Falls back to ["-l<pkg_name>"] if pkg-config is unavailable or the package
+    is not found, so builds degrade gracefully rather than hard-failing.
+    """
+    if not shutil.which("pkg-config"):
+        warn(f"pkg-config not found; falling back to -l{pkg_name} for '{pkg_name}'")
+        return [f"-l{pkg_name}"]
+
+    try:
+        r = subprocess.run(
+            ["pkg-config", "--libs", pkg_name],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            warn(
+                f"pkg-config --libs {pkg_name} failed "
+                f"(exit {r.returncode}); falling back to -l{pkg_name}\n"
+                f"  {r.stderr.strip()}"
+            )
+            return [f"-l{pkg_name}"]
+        flags = r.stdout.strip().split()
+        return flags if flags else [f"-l{pkg_name}"]
+    except Exception as exc:
+        warn(f"pkg-config error for '{pkg_name}': {exc}; falling back to -l{pkg_name}")
+        return [f"-l{pkg_name}"]
+
+
 def _parse_hyi(path):
     result = {"module": "", "link_libs": [], "externs": [], "classes": {}}
     if not os.path.exists(path):
@@ -812,6 +932,12 @@ def _parse_hyi(path):
             flag = f"-l:{m.group(1)}"
             if flag not in result["link_libs"]:
                 result["link_libs"].append(flag)
+            continue
+        m = re.match(r'^pkg\s+"([^"]+)"$', line)
+        if m:
+            for flag in _pkg_config_libs(m.group(1)):
+                if flag not in result["link_libs"]:
+                    result["link_libs"].append(flag)
             continue
         # const NAME = VALUE — bindgen emits these for enum constants
         # linkle doesn't need to emit externs for consts (they're inlined),
@@ -859,9 +985,25 @@ def _resolve_vendors(cfg, project_root, obj_dir, target, verbose):
     if not cfg.vendors:
         return extra_objs, extra_libs, vendor_externs
 
+    # ── Alias collision check ─────────────────────────────────────────────────
+    seen_aliases = {}
+    for vendor in cfg.vendors:
+        a = vendor["alias"]
+        if a in seen_aliases:
+            raise BuildError(
+                f"vendor alias '{a}' is declared twice in linkle.hy:\n"
+                f"  first:  {seen_aliases[a]}\n"
+                f"  second: {vendor['path']}\n"
+                f"  Rename one of them to a unique alias."
+            )
+        seen_aliases[a] = vendor["path"]
+
     vendor_obj_dir = os.path.join(obj_dir, "vendors")
     os.makedirs(vendor_obj_dir, exist_ok=True)
     hylian_bin = _find_hylian_bin()
+
+    # Collect all externs across every vendor so we can warn on symbol clashes.
+    all_externs = {}  # symbol_name -> alias that first declared it
 
     for vendor in cfg.vendors:
         alias = vendor["alias"]
@@ -878,6 +1020,18 @@ def _resolve_vendors(cfg, project_root, obj_dir, target, verbose):
             )
 
         hyi = _parse_hyi(hyi_file)
+
+        # ── Symbol collision check ────────────────────────────────────────────
+        for sym in hyi["externs"]:
+            if sym in all_externs:
+                warn(
+                    f"symbol conflict: '{sym}' is declared in both "
+                    f"vendors.{all_externs[sym]} and vendors.{alias} — "
+                    f"the linker will use whichever .so is found first"
+                )
+            else:
+                all_externs[sym] = alias
+
         vendor_externs[f"vendors.{alias}"] = {
             "externs": hyi["externs"],
             "classes": hyi["classes"],
@@ -1544,11 +1698,20 @@ def cmd_login(token_str):
     ok(f"Token saved to {_token_path()}")
 
 
-def cmd_add(pkg_spec, project_root, cfg):
+def _fetch_and_install_pkg(
+    pkg_name, pkg_version_constraint, project_root, cfg, _visited=None
+):
     """
-    Download a package from the registry and add it to linkle.hy.
+    Core of `linkle add`: download one package, extract it, update linkle.hy,
+    then recursively install any transitive dependencies declared in deps.json.
 
-    pkg_spec is either "name" (fetches latest) or "name@1.2.3".
+    `pkg_version_constraint` is either None (use latest), an exact version
+    string like "1.2.3", or a constraint like "^1.2.0".
+
+    `_visited` is a set of package names already processed in this run,
+    used to break dependency cycles.
+
+    Returns the resolved version string that was installed.
     """
     import io
     import json
@@ -1556,20 +1719,17 @@ def cmd_add(pkg_spec, project_root, cfg):
     import urllib.error
     import urllib.request
 
-    if "@" in pkg_spec:
-        pkg_name, pkg_version = pkg_spec.split("@", 1)
-    else:
-        pkg_name = pkg_spec
-        pkg_version = None
+    if _visited is None:
+        _visited = set()
 
-    # Validate name
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_\-.]{1,63}$", pkg_name):
-        err(f"Invalid package name: {pkg_name}")
-        sys.exit(1)
+    if pkg_name in _visited:
+        dim(f"  (skipping {pkg_name} — already processed this run)")
+        return None
+    _visited.add(pkg_name)
 
     step(f"Resolving {pkg_name}")
 
-    # Fetch package metadata
+    # ── Fetch registry metadata ───────────────────────────────────────────────
     meta_url = f"{REGISTRY_URL}/api/packages/{pkg_name}"
     try:
         with urllib.request.urlopen(meta_url) as resp:
@@ -1584,16 +1744,46 @@ def cmd_add(pkg_spec, project_root, cfg):
         err(f"Could not reach registry: {e}")
         sys.exit(1)
 
-    if pkg_version is None:
-        # Use latest (first in list, server returns newest first)
-        if not meta.get("versions"):
-            err(f"Package '{pkg_name}' has no published versions")
+    available_versions = [v["version"] for v in meta.get("versions", [])]
+    if not available_versions:
+        err(f"Package '{pkg_name}' has no published versions")
+        sys.exit(1)
+
+    # ── Version resolution ────────────────────────────────────────────────────
+    if pkg_version_constraint is None:
+        # No constraint — use latest
+        pkg_version = available_versions[0]
+    else:
+        # Try to find the best match for the constraint
+        pkg_version = _best_version(available_versions, pkg_version_constraint)
+        if pkg_version is None:
+            err(
+                f"No version of '{pkg_name}' satisfies constraint "
+                f"'{pkg_version_constraint}' (available: {', '.join(available_versions)})"
+            )
             sys.exit(1)
-        pkg_version = meta["versions"][0]["version"]
+
+    # ── Version conflict check against what's already declared ───────────────
+    existing_pkg = next((p for p in cfg.packages if p["name"] == pkg_name), None)
+    if existing_pkg:
+        installed_ver = existing_pkg["version"]
+        if not _semver_satisfies(installed_ver, pkg_version_constraint or pkg_version):
+            err(
+                f"Version conflict for '{pkg_name}':\n"
+                f"  already declared: {installed_ver}\n"
+                f"  required:         {pkg_version_constraint or pkg_version}\n"
+                f"  Run: linkle add {pkg_name}@{pkg_version} to upgrade explicitly."
+            )
+            sys.exit(1)
+        # Already at a compatible version — skip download but still check deps
+        info(
+            f"{pkg_name} {installed_ver} already satisfies '{pkg_version_constraint or pkg_version}'"
+        )
+        pkg_version = installed_ver
 
     info(f"Downloading {pkg_name} v{pkg_version}")
 
-    # Download tarball
+    # ── Download tarball ──────────────────────────────────────────────────────
     dl_url = f"{REGISTRY_URL}/api/packages/{pkg_name}/{pkg_version}/download"
     try:
         with urllib.request.urlopen(dl_url) as resp:
@@ -1605,61 +1795,188 @@ def cmd_add(pkg_spec, project_root, cfg):
         err(f"Could not reach registry: {e}")
         sys.exit(1)
 
-    # Extract into vendors/<pkg_name>/
+    # ── Extract tarball ───────────────────────────────────────────────────────
     vendors_dir = os.path.join(project_root, "vendors", pkg_name)
     os.makedirs(vendors_dir, exist_ok=True)
+
+    sub_vendor_aliases = []  # non-empty => multi-vendor package
+    transitive_deps = {}  # {name: constraint} from deps.json
+
     with tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:gz") as tar:
+        # Pass 1 — read manifests (vendors.list and deps.json)
         for member in tar.getmembers():
-            # Strip leading directory component if present
             parts = member.name.split("/", 1)
-            member.name = parts[1] if len(parts) > 1 and parts[1] else parts[0]
-            if member.name:
-                tar.extract(member, vendors_dir)
+            inner = parts[1] if len(parts) > 1 else parts[0]
+            if inner == "vendors.list":
+                f = tar.extractfile(member)
+                if f:
+                    sub_vendor_aliases = [
+                        line.strip()
+                        for line in f.read().decode().splitlines()
+                        if line.strip()
+                    ]
+            elif inner == "deps.json":
+                f = tar.extractfile(member)
+                if f:
+                    try:
+                        transitive_deps = json.loads(f.read().decode())
+                    except Exception:
+                        warn(
+                            f"{pkg_name}: could not parse deps.json — skipping transitive deps"
+                        )
+
+        # Pass 2 — extract real source files
+        for member in tar.getmembers():
+            parts = member.name.split("/", 1)
+            inner = parts[1] if len(parts) > 1 and parts[1] else parts[0]
+            if inner in ("vendors.list", "deps.json") or not inner:
+                continue
+            member.name = inner
+            tar.extract(member, vendors_dir)
 
     ok(f"Extracted to vendors/{pkg_name}/")
 
-    # Update linkle.hy — add to packages block if not already present
+    # ── Alias collision check ─────────────────────────────────────────────────
+    existing_aliases = {v["alias"]: v["path"] for v in cfg.vendors}
+
+    if sub_vendor_aliases:
+        collisions = []
+        for alias in sub_vendor_aliases:
+            if alias in existing_aliases:
+                existing_path = existing_aliases[alias]
+                expected_path = f"vendors/{pkg_name}/vendors/{alias}"
+                if existing_path != expected_path:
+                    collisions.append((alias, existing_path))
+
+        if collisions:
+            err(f"Alias collision(s) installing '{pkg_name}':")
+            for alias, existing_path in collisions:
+                err(f"  alias '{alias}' is already used by: {existing_path}")
+            err(
+                f"  Rename the conflicting entry in your vendors {{}} block to a "
+                f"unique alias before adding this package."
+            )
+            sys.exit(1)
+    else:
+        if pkg_name in existing_aliases:
+            existing_path = existing_aliases[pkg_name]
+            expected_path = f"vendors/{pkg_name}"
+            if existing_path != expected_path:
+                err(
+                    f"Alias collision: '{pkg_name}' is already used by: {existing_path}\n"
+                    f"  Rename that entry in your vendors {{}} block to a unique alias."
+                )
+                sys.exit(1)
+
+    # ── Update linkle.hy ──────────────────────────────────────────────────────
     config_path = os.path.join(project_root, "linkle.hy")
     with open(config_path, "r") as f:
         src = f.read()
 
-    # Check if already in packages block
-    already = any(p["name"] == pkg_name for p in cfg.packages)
-    if not already:
-        # Append a packages block at the end if none, or insert into existing
-        new_entry = f'    {pkg_name}: "{pkg_version}",\n'
-        if "packages {" in src or "packages{" in src:
-            # Insert inside existing block before closing }
+    # packages block
+    already_in_packages = any(p["name"] == pkg_name for p in cfg.packages)
+    if not already_in_packages:
+        new_pkg_entry = f'    {pkg_name}: "{pkg_version}",\n'
+        if re.search(r"packages\s*\{", src):
             src = re.sub(
                 r"(packages\s*\{[^}]*?)(\})",
-                lambda m: m.group(1) + new_entry + m.group(2),
+                lambda m: m.group(1) + new_pkg_entry + m.group(2),
                 src,
                 count=1,
                 flags=re.DOTALL,
             )
         else:
-            src += f"\npackages {{\n{new_entry}}}\n"
+            src += f"\npackages {{\n{new_pkg_entry}}}\n"
 
-        # Also add vendors entry
-        vend_entry = f'    {pkg_name}: "vendors/{pkg_name}",\n'
-        if re.search(r"vendors\s*\{", src):
-            src = re.sub(
-                r"(vendors\s*\{[^}]*?)(\})",
-                lambda m: m.group(1) + vend_entry + m.group(2),
-                src,
-                count=1,
-                flags=re.DOTALL,
-            )
-        else:
-            src += f"\nvendors {{\n{vend_entry}}}\n"
+    # vendors block
+    added_aliases = []
+    if sub_vendor_aliases:
+        new_vend_entries = ""
+        for alias in sub_vendor_aliases:
+            if alias not in existing_aliases:
+                new_vend_entries += (
+                    f'    {alias}: "vendors/{pkg_name}/vendors/{alias}",\n'
+                )
+                added_aliases.append(alias)
+        if new_vend_entries:
+            if re.search(r"vendors\s*\{", src):
+                src = re.sub(
+                    r"(vendors\s*\{[^}]*?)(\})",
+                    lambda m: m.group(1) + new_vend_entries + m.group(2),
+                    src,
+                    count=1,
+                    flags=re.DOTALL,
+                )
+            else:
+                src += f"\nvendors {{\n{new_vend_entries}}}\n"
+    else:
+        if pkg_name not in existing_aliases:
+            vend_entry = f'    {pkg_name}: "vendors/{pkg_name}",\n'
+            if re.search(r"vendors\s*\{", src):
+                src = re.sub(
+                    r"(vendors\s*\{[^}]*?)(\})",
+                    lambda m: m.group(1) + vend_entry + m.group(2),
+                    src,
+                    count=1,
+                    flags=re.DOTALL,
+                )
+            else:
+                src += f"\nvendors {{\n{vend_entry}}}\n"
+        added_aliases = [pkg_name]
 
-        with open(config_path, "w") as f:
-            f.write(src)
+    with open(config_path, "w") as f:
+        f.write(src)
+
+    if not already_in_packages:
         ok(f"Added {pkg_name} v{pkg_version} to linkle.hy")
     else:
-        info(f"{pkg_name} already in linkle.hy")
+        info(f"{pkg_name} already in packages, updated vendors entries")
 
-    ok(f"Done — include it with: include {{ vendors.{pkg_name}, }}")
+    for alias in added_aliases:
+        ok(f"Done — include it with: include {{ vendors.{alias}, }}")
+
+    # ── Transitive dependencies ───────────────────────────────────────────────
+    if transitive_deps:
+        info(f"Resolving {len(transitive_deps)} transitive dep(s) for {pkg_name}…")
+        # Re-read cfg so each recursive call sees the latest linkle.hy state
+        updated_cfg = parse_config(config_path)
+        for dep_name, dep_constraint in transitive_deps.items():
+            if not re.match(r"^[a-zA-Z][a-zA-Z0-9_\-.]{1,63}$", dep_name):
+                warn(
+                    f"  skipping invalid dep name '{dep_name}' from {pkg_name}/deps.json"
+                )
+                continue
+            _fetch_and_install_pkg(
+                dep_name,
+                dep_constraint or None,
+                project_root,
+                updated_cfg,
+                _visited,
+            )
+            # Refresh cfg again after each dep so alias/package sets stay current
+            updated_cfg = parse_config(config_path)
+
+    return pkg_version
+
+
+def cmd_add(pkg_spec, project_root, cfg):
+    """
+    Download a package from the registry and add it to linkle.hy.
+
+    pkg_spec is either "name" (fetches latest) or "name@1.2.3".
+    """
+    if "@" in pkg_spec:
+        pkg_name, pkg_version_constraint = pkg_spec.split("@", 1)
+    else:
+        pkg_name = pkg_spec
+        pkg_version_constraint = None
+
+    # Validate name
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_\-.]{1,63}$", pkg_name):
+        err(f"Invalid package name: {pkg_name}")
+        sys.exit(1)
+
+    _fetch_and_install_pkg(pkg_name, pkg_version_constraint, project_root, cfg)
 
 
 def cmd_publish(project_root, cfg):
@@ -1700,34 +2017,98 @@ def cmd_publish(project_root, cfg):
 
     step(f"Publishing {name} v{version}")
 
-    # Collect files: src dir + any .hyi/.c/.h in project root
+    # Collect files to publish.
+    #
+    # Two modes:
+    #   1. Vendor/library project: has a `vendors {}` block in linkle.hy.
+    #      Pack every declared sub-vendor directory (vendors/<alias>/) so
+    #      consumers get all .hyi / .hy / .c / .h files they need.
+    #      Also include a "vendors.list" manifest so cmd_add knows the aliases.
+    #
+    #   2. Plain application/library: pack src/ + any root-level .hyi/.h files
+    #      (original behaviour).
     src_dir = os.path.join(project_root, cfg.build_src)
-    files = []
+    files = []  # list of (filesystem_path, arcname_inside_tarball)
+    vendor_aliases = []  # populated in mode 1
+    deps_bytes = None  # populated in mode 1 if the package has deps
 
-    # .hy source files
-    for root, _, fnames in os.walk(src_dir):
-        for fn in fnames:
-            if fn.endswith((".hy", ".hyi", ".c", ".h")):
-                files.append(os.path.join(root, fn))
+    if cfg.vendors:
+        # Mode 1 — vendor package: ship each declared sub-vendor directory.
+        for vend in cfg.vendors:
+            alias = vend["alias"]
+            vpath = os.path.join(project_root, vend["path"])
+            if not os.path.isdir(vpath):
+                warn(f"vendor '{alias}' path not found, skipping: {vpath}")
+                continue
+            vendor_aliases.append(alias)
+            for root, _, fnames in os.walk(vpath):
+                for fn in fnames:
+                    if fn.endswith((".hy", ".hyi", ".c", ".h")):
+                        fspath = os.path.join(root, fn)
+                        # arcname: <pkg_name>/vendors/<alias>/...
+                        rel = os.path.relpath(fspath, project_root)
+                        files.append((fspath, os.path.join(name, rel)))
 
-    # .hyi files in project root (for library packages)
-    for fn in os.listdir(project_root):
-        fpath = os.path.join(project_root, fn)
-        if os.path.isfile(fpath) and fn.endswith((".hyi", ".h")):
-            files.append(fpath)
+        if not files:
+            err("No vendor source files found to publish (check your vendors {} block)")
+            sys.exit(1)
 
-    if not files:
-        err("No source files found to publish")
-        sys.exit(1)
+        # Embed a deps.json if this package itself depends on registry packages.
+        # Format: { "pkgname": "^1.0.0", ... }
+        if cfg.packages:
+            import json as _json
+
+            deps_dict = {p["name"]: p["version"] for p in cfg.packages}
+            deps_bytes = _json.dumps(deps_dict, indent=2).encode()
+            # Will be added to the tarball below alongside vendors.list
+        else:
+            deps_bytes = None
+    else:
+        # Mode 2 — plain project: pack src/ + root .hyi/.h files.
+        for root, _, fnames in os.walk(src_dir):
+            for fn in fnames:
+                if fn.endswith((".hy", ".hyi", ".c", ".h")):
+                    fspath = os.path.join(root, fn)
+                    files.append(
+                        (
+                            fspath,
+                            os.path.join(name, os.path.relpath(fspath, project_root)),
+                        )
+                    )
+
+        for fn in os.listdir(project_root):
+            fpath = os.path.join(project_root, fn)
+            if os.path.isfile(fpath) and fn.endswith((".hyi", ".h")):
+                files.append((fpath, os.path.join(name, fn)))
+
+        if not files:
+            err("No source files found to publish")
+            sys.exit(1)
 
     info(f"Packing {len(files)} file(s)")
 
     # Build tarball in memory
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for fpath in files:
-            arcname = os.path.join(name, os.path.relpath(fpath, project_root))
-            tar.add(fpath, arcname=arcname)
+        for fspath, arcname in files:
+            tar.add(fspath, arcname=arcname)
+
+        # If this is a vendor package, embed a small manifest listing the
+        # sub-vendor aliases so cmd_add can register them all without having
+        # to parse any .hyi files.
+        if vendor_aliases:
+            manifest = "\n".join(vendor_aliases) + "\n"
+            manifest_bytes = manifest.encode()
+            info_obj = tarfile.TarInfo(name=f"{name}/vendors.list")
+            info_obj.size = len(manifest_bytes)
+            tar.addfile(info_obj, io.BytesIO(manifest_bytes))
+
+        # Embed deps.json if this package has registry dependencies.
+        if vendor_aliases and deps_bytes:
+            deps_info = tarfile.TarInfo(name=f"{name}/deps.json")
+            deps_info.size = len(deps_bytes)
+            tar.addfile(deps_info, io.BytesIO(deps_bytes))
+
     tarball_bytes = buf.getvalue()
 
     info(f"Tarball size: {len(tarball_bytes)} bytes")

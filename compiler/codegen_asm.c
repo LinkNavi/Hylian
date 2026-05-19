@@ -420,6 +420,8 @@ typedef struct {
   char *name;
   char *type_name;
   long  int_val;
+  double float_val; /* used when type is float/float32/float64 */
+  int   is_float;   /* 1 if the initializer is a float constant */
   char *str_val;   /* NULL = integer value */
   int   is_const;  /* bit 0 of extra_int */
   int   array_size; /* extra_int >> 1; 0 = not a fixed array */
@@ -678,8 +680,70 @@ static void emit_interp_segments(const InterpSegment *segs, int seg_count,
           fprintf(out, "    mov r14, rdi\n");
         }
       } else {
-        fprintf(out, "    ; interp expr '%s' not in scope — skipped\n",
-                varname);
+        /* Not a local — fall back to static/global variables */
+        int svi = static_var_find(varname);
+        if (svi >= 0) {
+          const char *vtype = static_vars[svi].type_name;
+          int sv_is_float = static_vars[svi].is_float || is_float_type_name(vtype);
+          int is_str = vtype && strcmp(vtype, "str") == 0;
+          fprintf(out, "    ; interp expr (global): %s (%s)\n", varname,
+                  vtype ? vtype : "int");
+          if (static_vars[svi].is_const && !sv_is_float && !is_str)
+            fprintf(out, "    mov rax, %s\n", nasm_safe_label(varname));
+          else if (sv_is_float) {
+            fprintf(out, "    movsd xmm0, [rel %s]\n", nasm_safe_label(varname));
+            fprintf(out, "    movq rax, xmm0\n");
+          } else
+            fprintf(out, "    mov rax, [rel %s]\n", nasm_safe_label(varname));
+          if (is_str) {
+            fprintf(out, "    push r14\n");
+            fprintf(out, "    mov %s, rax\n", arg_reg(0));
+            if (is_win64()) fprintf(out, "    sub rsp, 32\n");
+            fprintf(out, "    call %s\n", sym("strlen"));
+            if (is_win64()) fprintf(out, "    add rsp, 32\n");
+            fprintf(out, "    mov rcx, rax\n");
+            fprintf(out, "    pop r14\n");
+            fprintf(out, "    mov rsi, [rel %s]\n", nasm_safe_label(varname));
+            fprintf(out, "    mov rdi, r14\n");
+            fprintf(out, "    rep movsb\n");
+            fprintf(out, "    mov r14, rdi\n");
+          } else if (sv_is_float) {
+            fprintf(out, "    push r14\n");
+            fprintf(out, "    sub rsp, 32\n");
+            fprintf(out, "    movq xmm0, rax\n");
+            fprintf(out, "    mov %s, rsp\n", arg_reg(0));
+            fprintf(out, "    mov %s, 32\n",  arg_reg(1));
+            if (is_win64()) fprintf(out, "    sub rsp, 32\n");
+            fprintf(out, "    call %s\n", sym("hylian_float_to_str"));
+            if (is_win64()) fprintf(out, "    add rsp, 32\n");
+            fprintf(out, "    mov rcx, rax\n");
+            fprintf(out, "    mov rsi, rsp\n");
+            fprintf(out, "    add rsp, 32\n");
+            fprintf(out, "    pop r14\n");
+            fprintf(out, "    mov rdi, r14\n");
+            fprintf(out, "    rep movsb\n");
+            fprintf(out, "    mov r14, rdi\n");
+          } else {
+            fprintf(out, "    push r14\n");
+            fprintf(out, "    sub rsp, 32\n");
+            fprintf(out, "    mov %s, rax\n", arg_reg(0));
+            fprintf(out, "    mov %s, rsp\n", arg_reg(1));
+            fprintf(out, "    mov %s, 32\n",  arg_reg(2));
+            if (is_win64()) fprintf(out, "    sub rsp, 32\n");
+            fprintf(out, "    call %s\n", sym("hylian_int_to_str"));
+            if (is_win64()) fprintf(out, "    add rsp, 32\n");
+            fprintf(out, "    mov rcx, rax\n");
+            fprintf(out, "    mov rsi, rsp\n");
+            fprintf(out, "    add rsp, 32\n");
+            fprintf(out, "    pop r14\n");
+            fprintf(out, "    mov rdi, r14\n");
+            fprintf(out, "    rep movsb\n");
+            fprintf(out, "    mov r14, rdi\n");
+          }
+        } else {
+          fprintf(out, "    ; interp expr '%s' not in scope — skipped\n",
+                  varname);
+        }
       }
     }
   }
@@ -751,9 +815,15 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
       {
         int svi = static_var_find(ins->str_extra);
         if (svi >= 0) {
-          if (static_vars[svi].is_const)
+          int sv_is_float = static_vars[svi].is_float ||
+                            is_float_type_name(static_vars[svi].type_name);
+          if (static_vars[svi].is_const && !sv_is_float)
             fprintf(out, "    mov rax, %s\n", nasm_safe_label(ins->str_extra));
-          else
+          else if (sv_is_float) {
+            /* Load float static/const via movsd so the bit pattern is preserved */
+            fprintf(out, "    movsd xmm0, [rel %s]\n", nasm_safe_label(ins->str_extra));
+            fprintf(out, "    movq rax, xmm0\n");
+          } else
             fprintf(out, "    mov rax, [rel %s]\n", nasm_safe_label(ins->str_extra));
           store_dest_rax(&ins->dest, out);
           break;
@@ -764,9 +834,14 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
     } else {
       int svi = static_var_find(ins->str_extra);
       if (svi >= 0) {
-        if (static_vars[svi].is_const)
+        int sv_is_float = static_vars[svi].is_float ||
+                          is_float_type_name(static_vars[svi].type_name);
+        if (static_vars[svi].is_const && !sv_is_float)
           fprintf(out, "    mov rax, %s\n", nasm_safe_label(ins->str_extra));
-        else
+        else if (sv_is_float) {
+          fprintf(out, "    movsd xmm0, [rel %s]\n", nasm_safe_label(ins->str_extra));
+          fprintf(out, "    movq rax, xmm0\n");
+        } else
           fprintf(out, "    mov rax, [rel %s]\n", nasm_safe_label(ins->str_extra));
         store_dest_rax(&ins->dest, out);
         break;
@@ -1087,6 +1162,39 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
     break;
 
   case IR_CALL: {
+    /* Special case: int_to_str(n) -> str
+       The C ABI function hylian_int_to_str(n, buf, buflen) writes into a
+       caller-supplied buffer and returns the length.  When called from Hylian
+       as a value-returning expression we need to allocate a stack buffer,
+       pass it, null-terminate the result, and hand back the pointer — not
+       the length — so that the resulting str is a valid null-terminated C
+       string that callers (including raylib's DrawText / TextLength) can use.
+
+       The 32-byte buffer is left on the stack and is NOT reclaimed here —
+       it lives until the enclosing function returns via `mov rsp, rbp`.
+       r14 is saved/restored purely to satisfy any callee-save conventions
+       around the call; it is not used as the buffer pointer. */
+    if (ins->str_extra && strcmp(ins->str_extra, "int_to_str") == 0) {
+      load_operand_reg(&ins->args[0], "rax", out);
+      fprintf(out, "    push r14\n");
+      fprintf(out, "    sub rsp, 32\n");               /* 32-byte stack buffer */
+      fprintf(out, "    mov r14, rsp\n");              /* stash buf ptr in r14 */
+      fprintf(out, "    mov %s, rax\n", arg_reg(0));   /* arg0 = n             */
+      fprintf(out, "    mov %s, r14\n", arg_reg(1));   /* arg1 = &buf[0]       */
+      fprintf(out, "    mov %s, 31\n",  arg_reg(2));   /* arg2 = buflen        */
+      if (is_win64()) fprintf(out, "    sub rsp, 32\n");
+      fprintf(out, "    call %s\n", sym("hylian_int_to_str"));
+      if (is_win64()) fprintf(out, "    add rsp, 32\n");
+      /* rax = length written; null-terminate the string */
+      fprintf(out, "    mov byte [r14 + rax], 0\n");
+      /* Return the stable buffer pointer */
+      fprintf(out, "    mov rax, r14\n");
+      fprintf(out, "    pop r14\n");
+      /* Leave the 32-byte buffer on the stack — reclaimed by `mov rsp, rbp` */
+      store_dest_rax(&ins->dest, out);
+      break;
+    }
+
     int nreg = max_reg_args();
     int nargs = ins->arg_count;
     int reg_args = nargs < nreg ? nargs : nreg;
@@ -1141,25 +1249,64 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
         pad = (16 - ((stack_args * 8) % 16)) % 16;
         if (pad) fprintf(out, "    sub rsp, %d  ; align\n", pad);
       }
-      /* Push register args in order (arg0 first, deepest on stack) */
+      /* Push integer register args in order (arg0 first, deepest on stack).
+         Float args are loaded directly into xmm registers instead. */
+      int xmm_idx = 0;
       for (int i = 0; i < reg_args; i++) {
+        if (TEMP_IS_FLOAT(ins->args[i])) continue;
         load_operand_reg(&ins->args[i], "rax", out);
         fprintf(out, "    push rax\n");
+      }
+      /* Load float register args into xmm0..xmm7 in argument order.
+         Hylian floats are 64-bit doubles internally, but C functions declared
+         with `float` parameters expect a 32-bit single in xmm.  We always
+         truncate double→float32 via cvtsd2ss so the bit pattern in xmm
+         matches what the C callee will read with `movss`. */
+      for (int i = 0; i < reg_args; i++) {
+        if (!TEMP_IS_FLOAT(ins->args[i])) continue;
+        load_operand_reg(&ins->args[i], "rax", out);
+        fprintf(out, "    movq xmm%d, rax\n", xmm_idx);
+        fprintf(out, "    cvtsd2ss xmm%d, xmm%d\n", xmm_idx, xmm_idx);
+        xmm_idx++;
       }
       /* Push stack args right-to-left */
       for (int i = nargs - 1; i >= nreg; i--) {
         load_operand_reg(&ins->args[i], "rax", out);
         fprintf(out, "    push rax\n");
       }
-      /* Pop register args into their SysV registers.
-         They were pushed in order 0..reg_args-1 so they come off in reverse. */
-      for (int i = reg_args - 1; i >= 0; i--)
-        fprintf(out, "    pop %s\n", arg_reg(i));
+      /* Pop integer register args into their SysV registers (rdi, rsi, rdx, …).
+         They were pushed in integer-only order (floats skipped), so we pop them
+         into sequential integer arg registers 0, 1, 2, … — NOT the absolute
+         argument position, because float args consume an xmm slot, not an
+         integer register slot. */
+      {
+        /* Build the ordered list of integer register indices for each pushed arg.
+           Integer args occupy integer reg slots 0,1,2,… sequentially;
+           float args do NOT consume an integer reg slot. */
+        int pop_targets[6];
+        int pt_count = 0;
+        int int_slot = 0;
+        for (int i = 0; i < reg_args; i++) {
+          if (!TEMP_IS_FLOAT(ins->args[i]))
+            pop_targets[pt_count++] = int_slot++;
+          else
+            int_slot = int_slot; /* float: no integer slot consumed */
+        }
+        /* Args were pushed in order 0..reg_args-1 (ints only), so they come
+           off the stack in reverse: pop into highest slot first. */
+        for (int i = pt_count - 1; i >= 0; i--)
+          fprintf(out, "    pop %s\n", arg_reg(pop_targets[i]));
+      }
       const char *cname = ins->str_extra ? rewrite_call_name(ins->str_extra) : "unknown";
       fprintf(out, "    call %s\n", sym(cname));
       if (stack_args > 0 || pad)
         fprintf(out, "    add rsp, %d\n", stack_args * 8 + pad);
     }
+    /* If the callee returns bool (C _Bool), only `al` is set; upper bytes of
+       rax may contain garbage from the callee's frame.  extra_int is stamped
+       by lower.c via tc_func_return_is_bool() when this is the case. */
+    if (ins->extra_int)
+      fprintf(out, "    movzx rax, al\n");
     store_dest_rax(&ins->dest, out);
     break;
   }
@@ -1809,7 +1956,7 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
 
   case IR_CAST:
     load_operand_reg(&ins->src1, "rax", out);
-    /* Truncate for smaller types */
+    /* Truncate / convert for target type */
     if (ins->str_extra) {
       if (strcmp(ins->str_extra, "uint8") == 0 || strcmp(ins->str_extra, "int8") == 0)
         fprintf(out, "    and rax, 0xFF\n");
@@ -1817,7 +1964,22 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
         fprintf(out, "    and rax, 0xFFFF\n");
       else if (strcmp(ins->str_extra, "uint32") == 0 || strcmp(ins->str_extra, "int32") == 0)
         fprintf(out, "    mov eax, eax\n");
-      /* uint64/int64/usize/int/pointer types: no truncation needed */
+      else if (strcmp(ins->str_extra, "float") == 0 ||
+               strcmp(ins->str_extra, "float32") == 0 ||
+               strcmp(ins->str_extra, "float64") == 0) {
+        /* int → float: numeric conversion via SSE2 */
+        fprintf(out, "    cvtsi2sd xmm0, rax\n");
+        fprintf(out, "    movq rax, xmm0\n");
+      } else if (strcmp(ins->str_extra, "int") == 0 ||
+                 strcmp(ins->str_extra, "int64") == 0 ||
+                 strcmp(ins->str_extra, "uint64") == 0 ||
+                 strcmp(ins->str_extra, "usize") == 0 ||
+                 strcmp(ins->str_extra, "isize") == 0) {
+        /* float → int: truncate via SSE2 (cvttsd2si = truncate-toward-zero) */
+        fprintf(out, "    movq xmm0, rax\n");
+        fprintf(out, "    cvttsd2si rax, xmm0\n");
+      }
+      /* other pointer/handle types: no conversion needed */
     }
     store_dest_rax(&ins->dest, out);
     break;
@@ -1995,9 +2157,14 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
       sv->type_name = ins->str_extra2;
       sv->str_val   = NULL;
       sv->int_val   = 0;
+      sv->float_val = 0.0;
+      sv->is_float  = 0;
       if (ins->src1.kind == IROP_CONST_INT)
         sv->int_val = ins->src1.int_val;
-      else if (ins->src1.kind == IROP_CONST_STR)
+      else if (ins->src1.kind == IROP_CONST_FLOAT) {
+        sv->float_val = ins->src1.float_val;
+        sv->is_float  = 1;
+      } else if (ins->src1.kind == IROP_CONST_STR)
         sv->str_val = ins->src1.str_val;
       sv->is_const   = ins->extra_int & 1;
       sv->array_size = ins->extra_int >> 1;
@@ -2195,6 +2362,17 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
       if (!strstr(vendor_link_flags, flag))
         strncat(vendor_link_flags, flag, sizeof(vendor_link_flags) - strlen(vendor_link_flags) - 1);
     }
+
+    /* pkg:<name> — emitted by compiler.c when it parses a .hyi pkg directive.
+       Emit a $(pkg-config --libs <name>) shell substitution in the link comment
+       so the hint is portable across platforms. */
+    if (strncmp(inc, "pkg:", 4) == 0) {
+      const char *pkg_name = inc + 4;
+      char flag[512];
+      snprintf(flag, sizeof(flag), " $(pkg-config --libs %s)", pkg_name);
+      if (!strstr(vendor_link_flags, flag))
+        strncat(vendor_link_flags, flag, sizeof(vendor_link_flags) - strlen(vendor_link_flags) - 1);
+    }
   }
 
   if (!freestanding && !is_limine) {
@@ -2387,9 +2565,40 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
     }
     const char *svname = nasm_safe_label(sv->name);
     if (sv->str_val) {
-      char *escaped = nasm_escape_string(sv->str_val);
-      fprintf(out, "    %s: db %s, 0\n", svname, escaped);
+      int is_str_type = sv->type_name && strcmp(sv->type_name, "str") == 0;
+      /* Strip surrounding double-quotes if present — the AST stores string
+         literal values as `"Alice"` (with quotes), but nasm_escape_string
+         expects the raw content without them. */
+      const char *raw = sv->str_val;
+      char *unquoted = NULL;
+      size_t rlen = strlen(raw);
+      if (rlen >= 2 && raw[0] == '"' && raw[rlen - 1] == '"') {
+        unquoted = malloc(rlen - 1);
+        memcpy(unquoted, raw + 1, rlen - 2);
+        unquoted[rlen - 2] = '\0';
+        raw = unquoted;
+      }
+      char *escaped = nasm_escape_string(raw);
+      free(unquoted);
+      if (is_str_type) {
+        /* str statics must be a pointer-sized slot holding the address of the
+           string bytes.  Emit the bytes under a private label, then emit the
+           variable itself as a dq pointer so that `mov rax, [rel name]` loads
+           a valid char* rather than the raw character bytes. */
+        fprintf(out, "    __strdata_%s: db %s, 0\n", svname, escaped);
+        fprintf(out, "    %s: dq __strdata_%s\n", svname, svname);
+      } else {
+        /* Non-str type with a string initialiser (unusual, keep old behaviour) */
+        fprintf(out, "    %s: db %s, 0\n", svname, escaped);
+      }
       free(escaped);
+      continue;
+    }
+    /* Const float: emit as a dq bit-pattern so it can be loaded with movsd */
+    if (sv->is_const && (sv->is_float || is_float_type_name(sv->type_name))) {
+      union { double d; unsigned long long u; } cv;
+      cv.d = sv->is_float ? sv->float_val : (double)sv->int_val;
+      fprintf(out, "    %s: dq 0x%016llx  ; %g\n", svname, cv.u, cv.d);
       continue;
     }
     /* Const integer: emit as EQU symbolic constant */
@@ -2401,6 +2610,19 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
     ClassInfo *ci_sv = sv->type_name ? class_find(sv->type_name) : NULL;
     if (ci_sv) {
       fprintf(out, "    %s: times %d db 0\n", svname, ci_sv->size);
+      continue;
+    }
+    /* Float statics: emit dq with the IEEE 754 bit pattern of the initializer */
+    if (is_float_type_name(sv->type_name)) {
+      union { double d; unsigned long long u; } fv;
+      fv.d = sv->is_float ? sv->float_val : (double)sv->int_val;
+      if (strcmp(sv->type_name, "float32") == 0) {
+        union { float f; unsigned int u; } f32;
+        f32.f = (float)fv.d;
+        fprintf(out, "    %s: dd 0x%08x  ; %g\n", svname, f32.u, (double)f32.f);
+      } else {
+        fprintf(out, "    %s: dq 0x%016llx  ; %g\n", svname, fv.u, fv.d);
+      }
       continue;
     }
     /* Primitive types: pick directive matching the type width. */

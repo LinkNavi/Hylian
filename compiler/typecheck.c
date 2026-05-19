@@ -719,6 +719,15 @@ static void register_func(const char *name, Type return_type, ASTNode **params,
   }
 }
 
+int tc_func_return_is_bool(const char *name) {
+  if (!name) return 0;
+  FuncInfo *fi = func_lookup(name);
+  if (!fi) return 0;
+  return fi->return_type.kind == TYPE_SIMPLE &&
+         fi->return_type.name &&
+         strcmp(fi->return_type.name, "bool") == 0;
+}
+
 static void register_field(const char *class_name, const char *fname,
                            Type ftype) {
   if (field_count >= 1024)

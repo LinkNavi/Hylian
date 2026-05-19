@@ -1,6 +1,7 @@
 #include "lower.h"
 #include "ir.h"
 #include "ast.h"
+#include "typecheck.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -760,6 +761,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->str_extra = strdup(resolved_name);
             ins->args      = arg_ops;
             ins->arg_count = nargs;
+            ins->extra_int = tc_func_return_is_bool(resolved_name);
             return t;
         }
     }
@@ -814,6 +816,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     ins2->str_extra = mname2;
                     ins2->args      = arg_ops2;
                     ins2->arg_count = nargs2;
+                    ins2->extra_int = tc_func_return_is_bool(mname2);
                     return t2;
                 }
             }
@@ -840,6 +843,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->str_extra = mname;
             ins->args      = arg_ops;
             ins->arg_count = total;
+            ins->extra_int = tc_func_return_is_bool(mname);
             return t;
         }
     }
@@ -1545,10 +1549,27 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
             LiteralNode *lit = (LiteralNode *)sv->initializer;
             if (lit->lit_type == LIT_INT)
                 ins->src1 = irop_const_int(atol(lit->value));
+            else if (lit->lit_type == LIT_FLOAT)
+                ins->src1 = irop_const_float(atof(lit->value));
             else if (lit->lit_type == LIT_STRING)
                 ins->src1 = irop_const_str(strdup(lit->value));
             else
                 ins->src1 = irop_const_int(0);
+        } else if (sv->initializer && sv->initializer->type == NODE_UNARY_OP) {
+            /* Handle unary minus applied to a literal: -520.0, -1, etc. */
+            UnaryOpNode *un = (UnaryOpNode *)sv->initializer;
+            if (strcmp(un->op, "-") == 0 && un->operand &&
+                un->operand->type == NODE_LITERAL) {
+                LiteralNode *lit = (LiteralNode *)un->operand;
+                if (lit->lit_type == LIT_FLOAT)
+                    ins->src1 = irop_const_float(-atof(lit->value));
+                else if (lit->lit_type == LIT_INT)
+                    ins->src1 = irop_const_int(-atol(lit->value));
+                else
+                    ins->src1 = irop_const_int(0);
+            } else {
+                ins->src1 = irop_const_int(0);
+            }
         } else if (sv->initializer && sv->initializer->type == NODE_IDENTIFIER) {
             /* Resolve identifier — scan already-emitted IR_STATIC_VAR instructions */
             const char *ref_name = ((IdentifierNode *)sv->initializer)->name;
@@ -1764,10 +1785,26 @@ IRModule *lower_program(ProgramNode *prog) {
                 LiteralNode *lit = (LiteralNode *)sv->initializer;
                 if (lit->lit_type == LIT_INT)
                     ins->src1 = irop_const_int(atol(lit->value));
+                else if (lit->lit_type == LIT_FLOAT)
+                    ins->src1 = irop_const_float(atof(lit->value));
                 else if (lit->lit_type == LIT_STRING)
                     ins->src1 = irop_const_str(strdup(lit->value));
                 else
                     ins->src1 = irop_const_int(0);
+            } else if (sv->initializer && sv->initializer->type == NODE_UNARY_OP) {
+                UnaryOpNode *un = (UnaryOpNode *)sv->initializer;
+                if (strcmp(un->op, "-") == 0 && un->operand &&
+                    un->operand->type == NODE_LITERAL) {
+                    LiteralNode *lit = (LiteralNode *)un->operand;
+                    if (lit->lit_type == LIT_FLOAT)
+                        ins->src1 = irop_const_float(-atof(lit->value));
+                    else if (lit->lit_type == LIT_INT)
+                        ins->src1 = irop_const_int(-atol(lit->value));
+                    else
+                        ins->src1 = irop_const_int(0);
+                } else {
+                    ins->src1 = irop_const_int(0);
+                }
             } else if (sv->initializer && sv->initializer->type == NODE_IDENTIFIER) {
                 /* Resolve identifier via the pre-scan table */
                 const char *ref_name = ((IdentifierNode *)sv->initializer)->name;
@@ -1862,10 +1899,26 @@ IRModule *lower_program(ProgramNode *prog) {
                     LiteralNode *lit = (LiteralNode *)sv->initializer;
                     if (lit->lit_type == LIT_INT)
                         ins->src1 = irop_const_int(atol(lit->value));
+                    else if (lit->lit_type == LIT_FLOAT)
+                        ins->src1 = irop_const_float(atof(lit->value));
                     else if (lit->lit_type == LIT_STRING)
                         ins->src1 = irop_const_str(strdup(lit->value));
                     else
                         ins->src1 = irop_const_int(0);
+                } else if (sv->initializer && sv->initializer->type == NODE_UNARY_OP) {
+                    UnaryOpNode *un = (UnaryOpNode *)sv->initializer;
+                    if (strcmp(un->op, "-") == 0 && un->operand &&
+                        un->operand->type == NODE_LITERAL) {
+                        LiteralNode *lit = (LiteralNode *)un->operand;
+                        if (lit->lit_type == LIT_FLOAT)
+                            ins->src1 = irop_const_float(-atof(lit->value));
+                        else if (lit->lit_type == LIT_INT)
+                            ins->src1 = irop_const_int(-atol(lit->value));
+                        else
+                            ins->src1 = irop_const_int(0);
+                    } else {
+                        ins->src1 = irop_const_int(0);
+                    }
                 } else if (sv->initializer && sv->initializer->type == NODE_IDENTIFIER) {
                     const char *ref_name = ((IdentifierNode *)sv->initializer)->name;
                     long resolved = 0;

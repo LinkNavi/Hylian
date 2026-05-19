@@ -81,9 +81,13 @@ static char *trim(char *s) {
 
 /* Parse a .hyi file into a synthetic ProgramNode.
    Also writes the first "link" library name into *out_link (heap-allocated),
-   or leaves it NULL if there is no link directive. */
-static ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link) {
-    *out_link = NULL;
+   and collects all "pkg" directive names into out_pkgs / out_pkg_count.
+   Callers must free *out_link and each out_pkgs[i] entry. */
+static ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link,
+                                            char ***out_pkgs, int *out_pkg_count) {
+    *out_link      = NULL;
+    *out_pkgs      = NULL;
+    *out_pkg_count = 0;
 
     FILE *f = fopen(filepath, "r");
     if (!f) return NULL;
@@ -110,6 +114,22 @@ static ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link
                         strncpy(*out_link, q, len);
                         (*out_link)[len] = '\0';
                     }
+                }
+            }
+            continue;
+        }
+        if (strncmp(s, "pkg ", 4) == 0) {
+            char *q = strchr(s + 4, '"');
+            if (q) {
+                q++; /* skip opening quote */
+                char *end = strchr(q, '"');
+                if (end) {
+                    int len = (int)(end - q);
+                    char *pkg_name = malloc(len + 1);
+                    strncpy(pkg_name, q, len);
+                    pkg_name[len] = '\0';
+                    *out_pkgs = realloc(*out_pkgs, (*out_pkg_count + 1) * sizeof(char *));
+                    (*out_pkgs)[(*out_pkg_count)++] = pkg_name;
                 }
             }
             continue;
@@ -437,8 +457,11 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
 
             if (hyi_path && !already_visited(hyi_path)) {
                 mark_visited(hyi_path);
-                char *link_lib = NULL;
-                ProgramNode *dep = parse_hyi_into_program(hyi_path, &link_lib);
+                char *link_lib  = NULL;
+                char **pkg_names = NULL;
+                int    pkg_count = 0;
+                ProgramNode *dep = parse_hyi_into_program(hyi_path, &link_lib,
+                                                           &pkg_names, &pkg_count);
                 if (dep) {
                     /* Keep the original std.* include in place for codegen */
                     dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
@@ -446,13 +469,16 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
                     merge_programs(program, dep);
                 }
                 if (link_lib) free(link_lib);
+                for (int pi = 0; pi < pkg_count; pi++) free(pkg_names[pi]);
+                free(pkg_names);
             }
             if (hyi_path) free(hyi_path);
             continue;
         }
 
-        /* link:* synthetic includes are codegen linker hints, not files */
+        /* link:* and pkg:* synthetic includes are codegen linker hints, not files */
         if (strncmp(inc, "link:", 5) == 0) continue;
+        if (strncmp(inc, "pkg:",  4) == 0) continue;
 
         /* vendors.* paths are resolved as .hyi interface files */
         if (strncmp(inc, "vendors.", 8) == 0) {
@@ -512,8 +538,11 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
             if (already_visited(hyi_path)) { free(hyi_path); continue; }
             mark_visited(hyi_path);
 
-            char *link_lib = NULL;
-            ProgramNode *dep = parse_hyi_into_program(hyi_path, &link_lib);
+            char *link_lib  = NULL;
+            char **pkg_names = NULL;
+            int    pkg_count = 0;
+            ProgramNode *dep = parse_hyi_into_program(hyi_path, &link_lib,
+                                                       &pkg_names, &pkg_count);
 
             if (!dep) {
                 fprintf(stderr, "hylian: cannot open vendor interface '%s'\n", hyi_path);
@@ -534,6 +563,18 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
                 dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
                 dep->includes[dep->include_count++] = link_inc;
             }
+
+            /* Surface each pkg directive as a synthetic include "pkg:<name>"
+               so codegen can emit it in the link hint comment. */
+            for (int pi = 0; pi < pkg_count; pi++) {
+                int pkg_inc_len = 4 + strlen(pkg_names[pi]) + 1; /* "pkg:" + name + NUL */
+                char *pkg_inc = malloc(pkg_inc_len);
+                snprintf(pkg_inc, pkg_inc_len, "pkg:%s", pkg_names[pi]);
+                free(pkg_names[pi]);
+                dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
+                dep->includes[dep->include_count++] = pkg_inc;
+            }
+            free(pkg_names);
 
             /* Also carry the original vendors.* include string forward so
                codegen can see it in the final program's include list. */

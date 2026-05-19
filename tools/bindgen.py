@@ -185,6 +185,54 @@ _SDL_TYPEDEFS: dict[str, str] = {
 }
 
 
+def _is_small_value_struct(cursor_type: "clang.Type") -> bool:
+    """
+    Return True if this RECORD type should be passed by value packed into a
+    single integer register rather than via pointer.
+
+    Criteria (mirrors the System V AMD64 ABI "integer class" rule):
+      - Total size ≤ 8 bytes
+      - Every field is a plain scalar (integer or float) — no pointer fields,
+        no nested structs that themselves contain pointers, no arrays of > 8
+        bytes total.
+
+    Examples that return True:  Color {r,g,b,a uint8} (4 bytes)
+                                 Vector2 {x,y float32} (8 bytes)
+    Examples that return False: SDL_Event (large), SDL_Rect (16 bytes)
+    """
+    try:
+        size = cursor_type.get_size()
+        if size <= 0 or size > 8:
+            return False
+        # Walk every field and reject anything pointer-like
+        for field in cursor_type.get_fields():
+            fk = field.type.get_canonical().kind
+            _SCALAR_KINDS = {
+                clang.TypeKind.BOOL,
+                clang.TypeKind.CHAR_U,
+                clang.TypeKind.UCHAR,
+                clang.TypeKind.CHAR_S,
+                clang.TypeKind.SCHAR,
+                clang.TypeKind.SHORT,
+                clang.TypeKind.USHORT,
+                clang.TypeKind.INT,
+                clang.TypeKind.UINT,
+                clang.TypeKind.LONG,
+                clang.TypeKind.ULONG,
+                clang.TypeKind.LONGLONG,
+                clang.TypeKind.ULONGLONG,
+                clang.TypeKind.FLOAT,
+                clang.TypeKind.DOUBLE,
+                clang.TypeKind.INT128,
+                clang.TypeKind.UINT128,
+            }
+            if fk not in _SCALAR_KINDS:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _map_type(
     cursor_type: "clang.Type",
     opaque_set: set[str],
@@ -267,11 +315,16 @@ def _map_type(
     if kind == clang.TypeKind.ENUM:
         return "int"
 
-    # Record (struct/union) — inline struct in param, use *void
+    # Record (struct/union) — inline struct in param
     if kind == clang.TypeKind.RECORD:
         sname = re.sub(r"^(struct|union)\s+", "", cursor_type.spelling).strip()
         if sname in opaque_set:
             return sname
+        # Small plain-data structs (e.g. Color, Vector2) are passed by value
+        # packed into a single integer register on x86-64 — map to int so the
+        # caller packs the fields and passes an integer directly.
+        if _is_small_value_struct(cursor_type):
+            return "int"
         return "*void"
 
     # Array types → *void (C arrays in params decay to pointers anyway)
@@ -396,6 +449,8 @@ def _map_field_type(
 
     if kind == clang.TypeKind.RECORD:
         sname = re.sub(r"^(struct|union)\s+", "", cursor_type.spelling).strip()
+        # Small value structs used as field types keep their struct name so
+        # the enclosing struct layout stays correct.
         return sname if sname else "ptr"
 
     if kind == clang.TypeKind.ENUM:
@@ -947,6 +1002,7 @@ def emit_hyi(
     header: str,
     out_path: str | None,
     extra_defines: list[str] | None = None,
+    pkg_libs: list[str] | None = None,
 ) -> str:
     lines = []
 
@@ -963,7 +1019,9 @@ def emit_hyi(
     # Link directives
     for lib in link_libs:
         lines.append(f'link "{lib}"')
-    if link_libs:
+    for pkg in pkg_libs or []:
+        lines.append(f'pkg "{pkg}"')
+    if link_libs or pkg_libs:
         lines.append("")
 
     # Opaque class declarations (just the names, used as handles)
@@ -1083,27 +1141,37 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
+              # raylib
+              python3 tools/bindgen.py /usr/include/raylib.h \\
+                  --module vendors.raylib --pkg raylib \\
+                  --out vendors/raylib/raylib.hyi
+
               # SDL2 — everything
               python3 tools/bindgen.py /usr/include/SDL2/SDL.h \\
-                  --module vendors.sdl2 --link libSDL2-2.0.so.0 \\
-                  --out Bindings/sdl2/sdl2.hyi
+                  --module vendors.sdl2 --pkg sdl2 \\
+                  --out vendors/sdl2/sdl2.hyi
 
               # SDL2 — only window + renderer functions
               python3 tools/bindgen.py /usr/include/SDL2/SDL.h \\
-                  --module vendors.sdl2 --link libSDL2-2.0.so.0 \\
+                  --module vendors.sdl2 --pkg sdl2 \\
                   --filter SDL_Create --filter SDL_Destroy --filter SDL_Render \\
-                  --out Bindings/sdl2/sdl2.hyi
+                  --out vendors/sdl2/sdl2.hyi
 
               # OpenGL
               python3 tools/bindgen.py /usr/include/GL/gl.h \\
-                  --module vendors.gl --link libGL.so.1 \\
-                  --out Bindings/gl/gl.hyi
+                  --module vendors.gl --pkg gl \\
+                  --out vendors/gl/gl.hyi
 
-              # libpng with extra include dir
+              # vendored static lib + system pkg (e.g. raylib built from source)
+              python3 tools/bindgen.py /usr/include/raylib.h \\
+                  --module vendors.raylib --link vendors/raylib/libraylib.a --pkg gl --pkg x11 \\
+                  --out vendors/raylib/raylib.hyi
+
+              # libpng with extra include dir (no pkg-config, use --link)
               python3 tools/bindgen.py /usr/include/png.h \\
                   --module vendors.png --link libpng16.so.16 \\
                   --include /usr/include \\
-                  --out Bindings/png/png.hyi
+                  --out vendors/png/png.hyi
         """),
     )
     p.add_argument("header", help="Path to the C header file to parse")
@@ -1113,7 +1181,14 @@ def main():
         "-l",
         action="append",
         default=[],
-        help="Shared library soname (can be repeated)",
+        help="Shared library soname to emit as a link directive (can be repeated)",
+    )
+    p.add_argument(
+        "--pkg",
+        action="append",
+        default=[],
+        dest="pkg_libs",
+        help="pkg-config package name to emit as a pkg directive (can be repeated)",
     )
     p.add_argument("--out", "-o", help="Output .hyi path (default: stdout)")
     p.add_argument(
@@ -1204,6 +1279,7 @@ def main():
         header=header,
         out_path=args.out,
         extra_defines=extra_defines,
+        pkg_libs=args.pkg_libs,
     )
 
 

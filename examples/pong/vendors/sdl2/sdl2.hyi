@@ -4,7 +4,7 @@
 
 module vendors.sdl2
 
-link "libSDL2-2.0.so.0"
+pkg "sdl2"
 
 // ── Opaque handle types ────────────────────────────────────────────────
 // These are pointer-sized opaque handles (passed by pointer in C).
