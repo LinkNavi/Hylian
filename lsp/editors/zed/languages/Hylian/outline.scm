@@ -8,6 +8,20 @@
 ;
 ; ─────────────────────────────────────────────────────────────────────────────
 
+; ── Union classes ─────────────────────────────────────────────────────────────
+
+(union_class_decl
+  name: (identifier) @name) @item
+
+; ── Union fields (public) ─────────────────────────────────────────────────────
+
+(union_class_decl
+  name: (identifier) @context
+  (union_class_body
+    (union_field_decl
+      "public"
+      name: (identifier) @name))) @item
+
 ; ── Top-level functions ───────────────────────────────────────────────────────
 
 (func_decl

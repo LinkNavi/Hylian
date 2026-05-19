@@ -34,6 +34,7 @@ typedef enum {
     NODE_INDEX,
     NODE_INDEX_ASSIGN,
     NODE_ASM_BLOCK,
+    NODE_UNSAFE,    /* unsafe { ... } block */
     NODE_TUPLE,     /* tuple literal: (a, b, c) */
     NODE_ENUM,      /* enum Color { Red, Green, Blue } */
     NODE_SWITCH,    /* switch (expr) { case v: { } ... default: { } } */
@@ -281,6 +282,12 @@ typedef struct { ASTNode base; } ContinueNode;
 typedef struct { ASTNode base; char *body; } AsmBlockNode;
 
 typedef struct {
+    ASTNode   base;
+    ASTNode **body;
+    int       body_count;
+} UnsafeBlockNode;
+
+typedef struct {
     ASTNode base;
     Type var_type;
     char *var_name;
@@ -346,6 +353,7 @@ InterpStringNode *make_interp_string(const char *raw); /* raw = full string with
 DeferNode *make_defer(ASTNode *expr);
 BreakNode *make_break();
 ContinueNode *make_continue();
+UnsafeBlockNode *make_unsafe_block(ASTNode **body, int body_count);
 
 typedef struct {
     ASTNode base;

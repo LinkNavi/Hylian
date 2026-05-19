@@ -8,6 +8,7 @@
 #include "lsp_log.h"
 
 static const char *current_tc_file = "<unknown>";
+static int in_unsafe = 0;
 
 static void tc_error(int line, const char *fmt, ...) {
     lsp_log("[typecheck] ERROR at line %d", line);
@@ -545,6 +546,18 @@ static void infer_stmt(ASTNode *node) {
         ReturnNode *ret = (ReturnNode *)node;
         if (ret->value)
             infer_expr(ret->value);
+        break;
+    }
+
+    case NODE_UNSAFE: {
+        UnsafeBlockNode *ub = (UnsafeBlockNode *)node;
+        int prev_unsafe = in_unsafe;
+        in_unsafe = 1;
+        scope_push();
+        for (int i = 0; i < ub->body_count; i++)
+            infer_stmt(ub->body[i]);
+        scope_pop();
+        in_unsafe = prev_unsafe;
         break;
     }
 

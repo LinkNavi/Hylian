@@ -1,0 +1,11 @@
+module std.mem
+
+fn arena_init(a: *void)
+fn arena_alloc(a: *void, size: usize) -> *void
+fn arena_free(a: *void)
+fn arena_new() -> *void
+fn arena_delete(a: *void)
+
+fn malloc(size: usize) -> *void
+fn free(ptr: *void)
+fn realloc(ptr: *void, size: usize) -> *void

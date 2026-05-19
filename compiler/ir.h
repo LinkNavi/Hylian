@@ -119,6 +119,7 @@ IR_RESTORE_REGS,    // pop all GPRs (ISR exit);  extra_int=1 → skip error-code
 IR_IRET,            // iretq — return from interrupt
 IR_OUTB,   // outb port, val  — src1=port src2=val
 IR_INB,    // inb port        — dest=result src1=port
+    IR_ARENA_ALLOC, /* dest = arena_alloc(__arena__, size): str_extra=class_name, extra_int=size */
     IR_OPCODE_COUNT
 } IROpcode;
 

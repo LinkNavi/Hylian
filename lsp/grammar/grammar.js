@@ -22,6 +22,7 @@ module.exports = grammar({
           $.include_stmt,
           $.ccpinclude_stmt,
           $.class_decl,
+          $.union_class_decl,
           $.func_decl,
           $.static_var_stmt,
           $.const_var_stmt,
@@ -136,6 +137,29 @@ module.exports = grammar({
         "{",
         optional($.class_body),
         "}",
+      ),
+
+    // ── Union class declarations ─────────────────────────────────────────────
+    // `union class Foo { ... }` — all fields share offset 0, size = max field
+    union_class_decl: ($) =>
+      seq(
+        optional("public"),
+        "union",
+        "class",
+        field("name", $.identifier),
+        "{",
+        optional($.union_class_body),
+        "}",
+      ),
+
+    union_class_body: ($) => repeat1($.union_field_decl),
+
+    union_field_decl: ($) =>
+      seq(
+        optional(choice("public", "private")),
+        field("type", $.type),
+        field("name", $.identifier),
+        ";",
       ),
 
     class_body: ($) => repeat1($.class_member),

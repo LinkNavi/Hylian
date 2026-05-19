@@ -1226,6 +1226,58 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
     break;
   }
 
+  case IR_ARENA_ALLOC: {
+    /* dest = arena_alloc(&__arena__, sizeof(ClassName))
+     * src1 = arena pointer (from IR_ADDROF __arena__)
+     * str_extra = class name
+     * args / arg_count = constructor arguments (forwarded after alloc)
+     */
+    ClassInfo *ci_arena = ins->str_extra ? class_find(ins->str_extra) : NULL;
+    if (!ci_arena) {
+      fprintf(out, "    ; arena_alloc: class '%s' not registered\n",
+              ins->str_extra ? ins->str_extra : "?");
+      fprintf(out, "    xor rax, rax\n");
+      store_dest_rax(&ins->dest, out);
+      break;
+    }
+    fprintf(out, "    ; arena new %s (size=%d)\n", ci_arena->name, ci_arena->size);
+    /* arena_alloc(arena_ptr, size) */
+    load_operand_reg(&ins->src1, arg_reg(0), out);
+    fprintf(out, "    mov %s, %d\n", arg_reg(1), ci_arena->size);
+    if (is_win64()) fprintf(out, "    sub rsp, 32\n");
+    fprintf(out, "    call %s\n", sym("arena_alloc"));
+    if (is_win64()) fprintf(out, "    add rsp, 32\n");
+    /* zero the allocation with rep stosb */
+    fprintf(out, "    push rax\n");
+    fprintf(out, "    mov rdi, rax\n");
+    fprintf(out, "    xor al, al\n");
+    fprintf(out, "    mov rcx, %d\n", ci_arena->size);
+    fprintf(out, "    rep stosb\n");
+    fprintf(out, "    pop rax\n");
+    /* call constructor if present */
+    if (ci_arena->has_ctor) {
+      char ctor_name_a[256];
+      snprintf(ctor_name_a, sizeof(ctor_name_a), "%s__ctor", ci_arena->name);
+      int max_ctor_args_a = max_reg_args() - 1;
+      int nargs_a = ins->arg_count > max_ctor_args_a ? max_ctor_args_a : ins->arg_count;
+      fprintf(out, "    push rax\n");
+      for (int i = 0; i < nargs_a; i++) {
+        load_operand_reg(&ins->args[i], "rax", out);
+        fprintf(out, "    push rax\n");
+      }
+      for (int i = nargs_a - 1; i >= 0; i--)
+        fprintf(out, "    pop %s\n", arg_reg(i + 1));
+      fprintf(out, "    pop %s\n", arg_reg(0)); /* self */
+      fprintf(out, "    push %s\n", arg_reg(0)); /* save self */
+      if (is_win64()) fprintf(out, "    sub rsp, 32\n");
+      fprintf(out, "    call %s\n", ctor_name_a);
+      if (is_win64()) fprintf(out, "    add rsp, 32\n");
+      fprintf(out, "    pop rax\n");
+    }
+    store_dest_rax(&ins->dest, out);
+    break;
+  }
+
   case IR_GET_FIELD: {
     const char *cname2 = ins->str_extra;
     const char *fname = ins->str_extra2;
@@ -2057,6 +2109,9 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
        "hylian_replace hylian_split hylian_join hylian_to_int hylian_to_float "
        "hylian_from_int hylian_equals",
        NULL, "str_", 0},
+      {"std.mem", "mem", "mem",
+       "arena_init arena_alloc arena_free arena_new arena_delete malloc free realloc",
+       NULL, NULL, 0},
       {"std.system.filesystem", "fs", "system/filesystem",
        "hylian_file_read hylian_file_write hylian_file_exists hylian_file_size "
        "hylian_mkdir",
@@ -2258,6 +2313,21 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
      bump allocator and inline strlen — still need to declare them as externs
      so the assembler resolves the references at link time. */
   fprintf(out, "extern malloc\nextern realloc\nextern strlen\n");
+  if (!freestanding && !is_limine)
+    fprintf(out, "extern arena_init\nextern arena_alloc\nextern arena_free\n");
+  /* Suppress duplicate arena externs that vendor-scan may have added via IR_CALL */
+  for (int vi = 0; vi < vendor_extern_count; vi++) {
+    if (strcmp(vendor_extern_names[vi], "arena_init") == 0 ||
+        strcmp(vendor_extern_names[vi], "arena_alloc") == 0 ||
+        strcmp(vendor_extern_names[vi], "arena_free") == 0) {
+      free(vendor_extern_names[vi]);
+      /* Shift remaining entries down */
+      for (int vj = vi; vj < vendor_extern_count - 1; vj++)
+        vendor_extern_names[vj] = vendor_extern_names[vj + 1];
+      vendor_extern_count--;
+      vi--;
+    }
+  }
   for (int m = 0; m < STD_N; m++) {
     if (!mod_needed[m] || !STD[m].externs)
       continue;

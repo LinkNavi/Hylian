@@ -547,6 +547,18 @@ static void infer_stmt(ASTNode *node) {
     break;
   }
 
+  case NODE_UNSAFE: {
+    UnsafeBlockNode *ub = (UnsafeBlockNode *)node;
+    int prev_unsafe = in_unsafe;
+    in_unsafe = 1;
+    scope_push();
+    for (int i = 0; i < ub->body_count; i++)
+      infer_stmt(ub->body[i]);
+    scope_pop();
+    in_unsafe = prev_unsafe;
+    break;
+  }
+
   case NODE_IF: {
     IfNode *nd = (IfNode *)node;
     infer_expr(nd->condition);

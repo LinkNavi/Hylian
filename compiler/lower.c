@@ -60,6 +60,9 @@ typedef struct {
     /* Sibling function names in the current module (for intra-module call mangling) */
     const char *module_func_names[64];
     int         module_func_count;
+    /* Arena / unsafe tracking */
+    int         in_unsafe;          /* 1 when inside an unsafe { } block    */
+    int         has_arena;          /* 1 when current function owns an arena */
 } LowerState;
 
 
@@ -972,11 +975,29 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             for (int i = 0; i < nargs; i++)
                 arg_ops[i] = irop_temp(lower_expr(nn->args[i], s));
         }
-        IRInstr *ins = ir_emit(s->mod, IR_NEW);
-        ins->dest      = irop_temp(t);
-        ins->str_extra = strdup(nn->class_name);
-        ins->args      = arg_ops;
-        ins->arg_count = nargs;
+
+        if (s->in_unsafe) {
+            /* Inside unsafe block — emit a plain malloc call, programmer manages memory */
+            IRInstr *ins = ir_emit(s->mod, IR_NEW);
+            ins->dest      = irop_temp(t);
+            ins->str_extra = strdup(nn->class_name);
+            ins->extra_int = 1; /* flag: malloc path (unsafe) */
+            ins->args      = arg_ops;
+            ins->arg_count = nargs;
+        } else {
+            /* Normal path — allocate from the function's implicit arena */
+            int t_aptr = alloc_temp(s);
+            IRInstr *addrof = ir_emit(s->mod, IR_ADDROF);
+            addrof->dest      = irop_temp(t_aptr);
+            addrof->str_extra = strdup("__arena__");
+
+            IRInstr *ins   = ir_emit(s->mod, IR_ARENA_ALLOC);
+            ins->dest      = irop_temp(t);
+            ins->src1      = irop_temp(t_aptr); /* arena pointer */
+            ins->str_extra = strdup(nn->class_name);
+            ins->args      = arg_ops;
+            ins->arg_count = nargs;
+        }
         return t;
     }
 
@@ -1117,6 +1138,15 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
     if (!node) return;
 
     switch (node->type) {
+
+    case NODE_UNSAFE: {
+        UnsafeBlockNode *ub = (UnsafeBlockNode *)node;
+        int prev = s->in_unsafe;
+        s->in_unsafe = 1;
+        lower_stmts(ub->body, ub->body_count, s);
+        s->in_unsafe = prev;
+        break;
+    }
 
     case NODE_VAR_DECL: {
         VarDeclNode *vd = (VarDeclNode *)node;
@@ -1575,6 +1605,8 @@ static void lower_func_body(
     s->next_temp   = 0;
     s->class_name  = class_name;
     s->local_static_alias_count = 0;  /* fresh alias table per function */
+    s->in_unsafe   = 0;
+    s->has_arena   = !is_naked;       /* naked functions skip arena entirely */
 
     /* IR_FUNC_BEGIN */
     IRInstr *begin = ir_emit(s->mod, IR_FUNC_BEGIN);
@@ -1616,8 +1648,42 @@ static void lower_func_body(
                     begin->params[i].type_kind);
     }
 
+    /* Inject hidden arena local + arena_init call for non-naked functions */
+    if (s->has_arena) {
+        /* ALLOCA __arena__ as an opaque 16-byte struct on the stack */
+        emit_alloca(s, "__arena__", "Arena", TYPE_SIMPLE);
+
+        /* arena_init(&__arena__) */
+        int t_aptr = alloc_temp(s);
+        IRInstr *addrof = ir_emit(s->mod, IR_ADDROF);
+        addrof->dest      = irop_temp(t_aptr);
+        addrof->str_extra = strdup("__arena__");
+
+        IRInstr *init_call = ir_emit(s->mod, IR_CALL);
+        init_call->str_extra = strdup("arena_init");
+        init_call->dest      = irop_temp(alloc_temp(s));
+        init_call->args      = malloc(sizeof(IROperand));
+        init_call->args[0]   = irop_temp(t_aptr);
+        init_call->arg_count = 1;
+    }
+
     /* Lower body statements */
     lower_stmts(body, body_count, s);
+
+    /* Emit arena_free(&__arena__) before function end */
+    if (s->has_arena) {
+        int t_aptr2 = alloc_temp(s);
+        IRInstr *addrof2 = ir_emit(s->mod, IR_ADDROF);
+        addrof2->dest      = irop_temp(t_aptr2);
+        addrof2->str_extra = strdup("__arena__");
+
+        IRInstr *free_call = ir_emit(s->mod, IR_CALL);
+        free_call->str_extra = strdup("arena_free");
+        free_call->dest      = irop_temp(alloc_temp(s));
+        free_call->args      = malloc(sizeof(IROperand));
+        free_call->args[0]   = irop_temp(t_aptr2);
+        free_call->arg_count = 1;
+    }
 
     ir_emit(s->mod, IR_FUNC_END);
     s->class_name = NULL;

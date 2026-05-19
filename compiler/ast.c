@@ -301,6 +301,15 @@ BreakNode *make_break() {
     return n;
 }
 
+UnsafeBlockNode *make_unsafe_block(ASTNode **body, int body_count) {
+    UnsafeBlockNode *n = malloc(sizeof(UnsafeBlockNode));
+    n->base.type = NODE_UNSAFE;
+    zero_resolved_type(&n->base);
+    n->body       = body;
+    n->body_count = body_count;
+    return n;
+}
+
 ContinueNode *make_continue() {
     ContinueNode *n = malloc(sizeof(ContinueNode));
     n->base.type = NODE_CONTINUE;

@@ -13,13 +13,15 @@ Hylian is a compiled systems programming language with C-like syntax that compil
 Clone the repository and build the `hylian` compiler binary from source:
 
 ```sh
-cd src
-bison -d parser.y
-flex lexer.l
-gcc lex.yy.c parser.tab.c ast.c codegen_asm.c typecheck.c compiler.c -o ../hylian
+./build.sh
 ```
 
-The compiler binary will be placed at the root of the repository as `./hylian`.
+The compiler binary will be placed at the root of the repository as `./hylian`. The compiler source lives in `compiler/`.
+
+The build script accepts optional flags:
+- `--clean` — remove build artifacts before building
+- `--verbose` / `-v` — show each compilation command
+- `--skip-runtime` — skip rebuilding the runtime standard library objects
 
 ### Creating a Project
 
@@ -56,6 +58,16 @@ nasm -f elf64 hello.asm -o hello.o
 gcc hello.o runtime/std/io.o -o hello -no-pie
 ./hello
 ```
+
+**Compiler flags:**
+
+| Flag | Description |
+|---|---|
+| `-o <output.asm>` | Output file (default: `output.asm`) |
+| `--src-dir <dir>` | Directory to resolve includes from |
+| `--target <linux\|macos\|windows\|limine>` | Compilation target (default: `linux`) |
+| `--freestanding` | Freestanding/kernel mode (no stdlib) |
+| `--dump-ir` | Print IR before and after optimization to stderr |
 
 ### Hello, World!
 
@@ -106,6 +118,7 @@ Error? main() {
 | Const global | `const int MAX = 100;` |
 | Tagged union | `multi<int \| str> x = 42;` |
 | Union tag | `x.tag` (0-based index) |
+| C-style union | `union class Reg { public uint64 qword; public uint32 dword; }` |
 | Tuple / multi-return | `(int, int) divmod(int a, int b) { return a/b, a%b; }` |
 | Reference type | `&int ref = &x;` |
 | Raw pointer type | `*uint32 ptr = cast<*uint32>(addr);` |
@@ -143,13 +156,17 @@ project {
     name: "my-project",
     version: "0.1.0",
     author: "you",
+    description: "...",    // optional
+    repo: "...",           // optional
 }
 
 build {
-    src: "src",        // source directory
-    main: "main",      // entry point file (without .hy)
-    out: "build",      // build output root
-    bin: "my-project", // binary name (defaults to project name)
+    src: "src",                  // source directory
+    main: "main",                // entry point file (without .hy)
+    out: "build",                // build output root
+    bin: "my-project",           // binary name (defaults to project name)
+    target: "linux",             // optional: linux|macos|windows|kernel|limine
+    linker_script: "my.ld",      // optional: for freestanding/kernel targets
 }
 
 // Vendor packages — maps an include alias to a directory under vendors/
@@ -185,10 +202,37 @@ build/
 | Command | Description |
 |---|---|
 | `linkle new <name>` | Scaffold a new project |
+| `linkle new-workspace <name>` | Scaffold a new workspace with kernel + init members |
 | `linkle build` | Compile and link the project |
 | `linkle run` | Build and execute the `run()` target |
 | `linkle <target>` | Execute any named target from `linkle.hy` |
 | `linkle vendor new <name>` | Scaffold a new vendor package under `vendors/` |
+| `linkle add <name[@ver]>` | Download a package from the registry |
+| `linkle publish` | Publish this package to the registry |
+| `linkle login <token>` | Save a registry API token |
+| `linkle update [--channel nightly]` | Update the toolchain |
+| `linkle use <version>` | Pin to a specific toolchain version |
+
+---
+
+## Workspaces
+
+A workspace groups multiple related packages (e.g. a kernel and a userspace init process) under a single root. Create one with:
+
+```sh
+linkle new-workspace my-os
+cd my-os
+```
+
+The workspace root `linkle.hy` uses a `workspace` block instead of a `build` block:
+
+```
+workspace {
+    members: ["kernel", "init"],
+}
+```
+
+Each member directory contains its own `linkle.hy` with its own `project` and `build` blocks. Running `linkle build` from the workspace root builds all members in order.
 
 ---
 
@@ -237,16 +281,19 @@ Full language and standard library documentation lives in the `docs/` directory:
 hylian/
 ├── hylian              # Compiled compiler binary (after build)
 ├── linkle.py           # Build tool source
-├── src/                # Compiler source code (C, lex, bison)
+├── compiler/           # Compiler source code (C, lex, bison)
 │   ├── lexer.l         # Flex lexer
 │   ├── parser.y        # Bison grammar
 │   ├── ast.c / ast.h   # Abstract syntax tree definitions
-│   ├── typecheck.c     # Type checker
-│   ├── codegen_asm.c   # x86-64 NASM code generator
+│   ├── ir.c / ir.h     # Intermediate representation
+│   ├── lower.c / lower.h  # IR lowering pass
+│   ├── opt.c / opt.h   # IR optimization pass
+│   ├── typecheck.c / typecheck.h  # Type checker
+│   ├── codegen_asm.c / codegen_asm.h  # x86-64 NASM code generator
 │   └── compiler.c      # Compiler entry point
 ├── runtime/
 │   └── std/            # Standard library source and precompiled .o files
-├── Docs/
+├── docs/
 │   ├── README.md       # This file
 │   ├── language/       # Language reference documentation
 │   └── stdlib/         # Standard library documentation

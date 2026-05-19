@@ -724,12 +724,10 @@ stmt:
         $$ = (ASTNode*)ab;
     }
     | UNSAFE LBRACE stmt_list RBRACE {
-        /* unsafe block: wrap statements in a scoped if(1) node so the body
-           is reachable by analysis passes without a dedicated AST node */
         NodeList *sl = (NodeList*)$3;
-        IfNode *ub = make_if((ASTNode*)make_literal("true", LIT_BOOL));
-        ub->then_body = sl->items; ub->then_count = sl->count; free(sl);
-        $$ = (ASTNode*)ub; SET_LINE($$);
+        $$ = (ASTNode*)make_unsafe_block(sl->items, sl->count);
+        free(sl);
+        SET_LINE($$);
     }
     /* volatile write: volatile *ptr = expr; */
     | VOLATILE STAR expr ASSIGN expr SEMICOLON {

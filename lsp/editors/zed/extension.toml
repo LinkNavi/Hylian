@@ -12,4 +12,4 @@ languages = ["Hylian"]
 
 [grammars.hylian]
 repository = "https://github.com/LinkNavi/tree-sitter-hylian"
-rev = "e5ccf0d80a5e84a7f98dbb5b4ed734f7c7c1375d"
+rev = "54ac4308679476809129412ab0f56717313be9aa"

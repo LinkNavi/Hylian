@@ -338,6 +338,15 @@ ContinueNode *make_continue() {
     return n;
 }
 
+UnsafeBlockNode *make_unsafe_block(ASTNode **body, int body_count) {
+    UnsafeBlockNode *n = malloc(sizeof(UnsafeBlockNode));
+    n->base.type = NODE_UNSAFE;
+    zero_resolved_type(&n->base);
+    n->body       = body;
+    n->body_count = body_count;
+    return n;
+}
+
 Type make_simple_type(char *name, int nullable) {
     Type t;
     t.kind = TYPE_SIMPLE;

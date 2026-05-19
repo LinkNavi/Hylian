@@ -81,6 +81,32 @@
     }
   },
   {
+    "type": "as_cast_expr",
+    "named": true,
+    "fields": {
+      "expr": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "expression",
+            "named": true
+          }
+        ]
+      },
+      "target_type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "asm_block",
     "named": true,
     "fields": {
@@ -597,6 +623,10 @@
           "named": true
         },
         {
+          "type": "as_cast_expr",
+          "named": true
+        },
+        {
           "type": "binary_expr",
           "named": true
         },
@@ -669,6 +699,10 @@
           "named": true
         },
         {
+          "type": "struct_literal_expr",
+          "named": true
+        },
+        {
           "type": "tuple_expr",
           "named": true
         },
@@ -703,6 +737,32 @@
         "types": [
           {
             "type": "type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "field_init_list",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "expression",
             "named": true
           }
         ]
@@ -1162,6 +1222,11 @@
     }
   },
   {
+    "type": "nil_literal",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "param",
     "named": true,
     "fields": {
@@ -1353,6 +1418,10 @@
         {
           "type": "static_var_stmt",
           "named": true
+        },
+        {
+          "type": "union_class_decl",
+          "named": true
         }
       ]
     }
@@ -1431,6 +1500,10 @@
         },
         {
           "type": "static_array_stmt",
+          "named": true
+        },
+        {
+          "type": "static_var_stmt",
           "named": true
         },
         {
@@ -1547,6 +1620,32 @@
       "types": [
         {
           "type": "static",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "struct_literal_expr",
+    "named": true,
+    "fields": {
+      "class": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "field_init_list",
           "named": true
         }
       ]
@@ -1709,6 +1808,73 @@
         "types": [
           {
             "type": "expression",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "union_class_body",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "union_field_decl",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "union_class_decl",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "union_class_body",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "union_field_decl",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type",
             "named": true
           }
         ]
@@ -2011,6 +2177,10 @@
     "named": false
   },
   {
+    "type": "as",
+    "named": false
+  },
+  {
     "type": "asm_content",
     "named": true
   },
@@ -2156,8 +2326,12 @@
     "named": false
   },
   {
-    "type": "nil_literal",
-    "named": true
+    "type": "nil",
+    "named": false
+  },
+  {
+    "type": "null",
+    "named": false
   },
   {
     "type": "packed",
@@ -2213,6 +2387,10 @@
   },
   {
     "type": "uint8",
+    "named": false
+  },
+  {
+    "type": "union",
     "named": false
   },
   {

@@ -4,6 +4,9 @@
 ; Class bodies
 (class_decl "{" "}" @end) @indent
 
+; Union class bodies
+(union_class_decl "{" "}" @end) @indent
+
 ; if / else
 (if_stmt
   then: (block "}" @end)) @indent

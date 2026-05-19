@@ -820,6 +820,97 @@ packed class IdtEntry {
 
 ---
 
+## `union` Classes
+
+A `union class` is a C-style union — all fields share the same memory offset (offset 0), and the total size of the union equals the size of its largest field. Only one field holds a meaningful value at any given time; writing to one field overwrites the memory shared by all others.
+
+Use `union class` when you need to reinterpret raw bytes as different types — hardware registers, protocol headers, type-punning, or working with external C ABIs that use `union`.
+
+```hylian
+union class IntOrFloat {
+    public int   as_int;
+    public uint32 as_uint;
+}
+```
+
+All four fields above share offset 0. The size of the union is the size of the largest field.
+
+### Declaring a Union
+
+```hylian
+union class Register {
+    public uint64 qword;
+    public uint32 dword;
+    public uint16 word;
+    public uint8  byte;
+}
+```
+
+A `public` prefix on the class exposes it from a module:
+
+```hylian
+public union class IpAddress {
+    public uint32 raw;
+    public uint8  octets;
+}
+```
+
+### Using a Union
+
+Instantiate with `new` and access fields like any other class:
+
+```hylian
+Register reg = new Register();
+reg.qword = 0xDEAD_BEEF_CAFE_1234;
+
+uint32 lo = reg.dword;   // lower 32 bits of qword
+uint16 w  = reg.word;    // lower 16 bits
+uint8  b  = reg.byte;    // lowest byte
+```
+
+Or use a stack-allocated struct literal:
+
+```hylian
+Register reg = Register { qword: 0xFF00_FF00_FF00_FF00 };
+uint8 low_byte = reg.byte;
+```
+
+### Type-Punning Example
+
+A common use is reading the raw bit pattern of a float:
+
+```hylian
+union class FloatBits {
+    public float  f;
+    public uint32 bits;
+}
+
+FloatBits fb = new FloatBits();
+fb.f = 1.0;
+uint32 raw = fb.bits;   // IEEE 754 bit pattern of 1.0 = 0x3F800000
+```
+
+### Hardware Register Overlay
+
+Union classes are well-suited for overlaying a hardware register that can be accessed as different widths:
+
+```hylian
+union class PciConfigWord {
+    public uint32 full;
+    public uint16 lo;
+}
+
+PciConfigWord cfg = new PciConfigWord();
+cfg.full = 0x8086_1234;
+uint16 vendor_id = cfg.lo;   // 0x1234
+```
+
+> **Note:** Unlike `packed class`, a `union class` cannot have a constructor (`ctor`) — initialise fields directly after construction or use a struct literal. Only field declarations are permitted in the body; methods are not supported.
+
+> **Note:** The total allocated size is rounded up to the nearest 8-byte boundary. A union with a single `uint8` field will still occupy 8 bytes.
+
+---
+
 ## `naked` Functions
 
 A `naked` function emits no prologue or epilogue — the compiler will not generate any stack frame setup, register saves, or `ret` instructions around the function body. The programmer is fully responsible for the calling convention.

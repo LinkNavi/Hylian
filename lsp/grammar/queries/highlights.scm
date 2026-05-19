@@ -22,6 +22,7 @@
 
 [
   "class"
+  "union"
   "public"
   "private"
   "enum"
@@ -68,6 +69,9 @@
 (class_decl
   name: (identifier) @type)
 
+(union_class_decl
+  name: (identifier) @type)
+
 (enum_decl
   name: (identifier) @type)
 
@@ -95,6 +99,10 @@
 
 (func_decl
   return_type: (type
+    (identifier) @type))
+
+(union_field_decl
+  type: (type
     (identifier) @type))
 
 ; ── Enum variants ────────────────────────────────────────────────────────────
@@ -152,6 +160,9 @@
 ; ── Fields ───────────────────────────────────────────────────────────────────
 
 (field_decl
+  name: (identifier) @property)
+
+(union_field_decl
   name: (identifier) @property)
 
 (member_expr

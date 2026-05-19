@@ -8,6 +8,10 @@ on:
   push:
     branches: [main]
 
+  # Run every night at midnight UTC
+  schedule:
+    - cron: "0 0 * * *"
+
   # Allow manual dispatch for testing
   workflow_dispatch:
 

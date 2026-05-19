@@ -829,14 +829,9 @@ stmt:
         $$ = (ASTNode*)ab;
     }
 | UNSAFE LBRACE stmt_list RBRACE {
-    // reuse DeferNode layout for now, just wrap the stmts
-    // add a proper UnsafeBlockNode if you want, for now
-    // emit the stmts directly — typecheck handles the safety
     NodeList *sl = (NodeList*)$3;
-    // wrap in a fake if(true) node to scope it
-    IfNode *ub = make_if((ASTNode*)make_literal("true", LIT_BOOL));
-    ub->then_body = sl->items; ub->then_count = sl->count; free(sl);
-    $$ = (ASTNode*)ub;
+    $$ = (ASTNode*)make_unsafe_block(sl->items, sl->count);
+    free(sl);
 }
     | DEFER expr SEMICOLON { $$ = (ASTNode*)make_defer($2); }
     | expr SEMICOLON { $$ = $1; }

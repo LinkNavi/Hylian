@@ -8,15 +8,13 @@ include {
 }
 ```
 
-> **Note:** Functions in `std.strings` are currently called by their full C ABI names (`hylian_length`, `hylian_contains`, etc.) directly from Hylian source. No prefix rewriting is applied for this module.
-
 > **Memory note:** Functions marked *heap-allocated* return a newly allocated string. The caller is responsible for freeing it. This will be handled automatically by a future garbage collector or `defer` statement.
 
 ---
 
 ### Functions
 
-#### `hylian_length(s: str) -> int`
+#### `length(s: str) -> int`
 
 Return the length of a string in bytes.
 
@@ -34,7 +32,7 @@ include {
 
 Error? main() {
     str word = "Hylian";
-    int len = hylian_length(word);
+    int len = length(word);
     println("Length: {{len}}");
     return nil;
 }
@@ -48,7 +46,7 @@ Length: 6
 
 ---
 
-#### `hylian_is_empty(s: str) -> int`
+#### `is_empty(s: str) -> bool`
 
 Check whether a string is null or empty.
 
@@ -56,7 +54,7 @@ Check whether a string is null or empty.
 |---|---|---|
 | `s` | `str` | The string to check |
 
-**Return value:** `1` if `s` is null or has zero length, `0` otherwise.
+**Return value:** `true` if `s` is null or has zero length, `false` otherwise.
 
 ```hylian
 include {
@@ -68,8 +66,8 @@ Error? main() {
     str empty = "";
     str full  = "hello";
 
-    println(hylian_is_empty(empty));
-    println(hylian_is_empty(full));
+    println(is_empty(empty));
+    println(is_empty(full));
 
     return nil;
 }
@@ -78,13 +76,13 @@ Error? main() {
 Output:
 
 ```sh
-1
-0
+true
+false
 ```
 
 ---
 
-#### `hylian_contains(s: str, needle: str) -> int`
+#### `contains(s: str, needle: str) -> bool`
 
 Check whether `needle` appears anywhere inside `s`.
 
@@ -93,7 +91,7 @@ Check whether `needle` appears anywhere inside `s`.
 | `s` | `str` | The string to search within |
 | `needle` | `str` | The substring to look for |
 
-**Return value:** `1` if `needle` is found, `0` otherwise.
+**Return value:** `true` if `needle` is found, `false` otherwise.
 
 ```hylian
 include {
@@ -103,8 +101,8 @@ include {
 
 Error? main() {
     str sentence = "the quick brown fox";
-    println(hylian_contains(sentence, "brown"));
-    println(hylian_contains(sentence, "cat"));
+    println(contains(sentence, "brown"));
+    println(contains(sentence, "cat"));
     return nil;
 }
 ```
@@ -112,13 +110,13 @@ Error? main() {
 Output:
 
 ```sh
-1
-0
+true
+false
 ```
 
 ---
 
-#### `hylian_starts_with(s: str, prefix: str) -> int`
+#### `starts_with(s: str, prefix: str) -> bool`
 
 Check whether `s` begins with `prefix`.
 
@@ -127,7 +125,7 @@ Check whether `s` begins with `prefix`.
 | `s` | `str` | The string to test |
 | `prefix` | `str` | The expected prefix |
 
-**Return value:** `1` if `s` starts with `prefix`, `0` otherwise.
+**Return value:** `true` if `s` starts with `prefix`, `false` otherwise.
 
 ```hylian
 include {
@@ -137,8 +135,8 @@ include {
 
 Error? main() {
     str path = "/home/link/readme.txt";
-    println(hylian_starts_with(path, "/home"));
-    println(hylian_starts_with(path, "/tmp"));
+    println(starts_with(path, "/home"));
+    println(starts_with(path, "/tmp"));
     return nil;
 }
 ```
@@ -146,13 +144,13 @@ Error? main() {
 Output:
 
 ```sh
-1
-0
+true
+false
 ```
 
 ---
 
-#### `hylian_ends_with(s: str, suffix: str) -> int`
+#### `ends_with(s: str, suffix: str) -> bool`
 
 Check whether `s` ends with `suffix`.
 
@@ -161,7 +159,7 @@ Check whether `s` ends with `suffix`.
 | `s` | `str` | The string to test |
 | `suffix` | `str` | The expected suffix |
 
-**Return value:** `1` if `s` ends with `suffix`, `0` otherwise.
+**Return value:** `true` if `s` ends with `suffix`, `false` otherwise.
 
 ```hylian
 include {
@@ -171,8 +169,8 @@ include {
 
 Error? main() {
     str filename = "readme.txt";
-    println(hylian_ends_with(filename, ".txt"));
-    println(hylian_ends_with(filename, ".md"));
+    println(ends_with(filename, ".txt"));
+    println(ends_with(filename, ".md"));
     return nil;
 }
 ```
@@ -180,13 +178,13 @@ Error? main() {
 Output:
 
 ```sh
-1
-0
+true
+false
 ```
 
 ---
 
-#### `hylian_index_of(s: str, needle: str) -> int`
+#### `index_of(s: str, needle: str) -> int`
 
 Find the byte index of the first occurrence of `needle` in `s`.
 
@@ -205,8 +203,8 @@ include {
 
 Error? main() {
     str s = "hello world";
-    int i = hylian_index_of(s, "world");
-    int j = hylian_index_of(s, "zzz");
+    int i = index_of(s, "world");
+    int j = index_of(s, "zzz");
 
     println("world at: {{i}}");
     println("zzz at:   {{j}}");
@@ -224,7 +222,7 @@ zzz at:   -1
 
 ---
 
-#### `hylian_slice(s: str, start: int, end: int) -> str`
+#### `slice(s: str, start: int, end: int) -> str`
 
 Return a heap-allocated copy of the substring `s[start..end)` (start inclusive, end exclusive).
 
@@ -232,7 +230,7 @@ Return a heap-allocated copy of the substring `s[start..end)` (start inclusive, 
 |---|---|---|
 | `s` | `str` | The source string |
 | `start` | `int` | Start byte index (clamped to `0` if negative) |
-| `end` | `int` | End byte index, exclusive (clamped to `hylian_length(s)` if beyond the end) |
+| `end` | `int` | End byte index, exclusive (clamped to `length(s)` if beyond the end) |
 
 **Return value:** *Heap-allocated* substring. Returns an empty heap string if `start >= end`. Returns `nil` on out-of-memory. **Caller must free.**
 
@@ -244,7 +242,7 @@ include {
 
 Error? main() {
     str s = "Hello, Hylian!";
-    str sub = hylian_slice(s, 7, 13);
+    str sub = slice(s, 7, 13);
     println(sub);
     return nil;
 }
@@ -258,7 +256,7 @@ Hylian
 
 ---
 
-#### `hylian_trim(s: str) -> str`
+#### `trim(s: str) -> str`
 
 Strip leading and trailing whitespace from `s`.
 
@@ -276,7 +274,7 @@ include {
 
 Error? main() {
     str padded = "   hello   ";
-    str trimmed = hylian_trim(padded);
+    str trimmed = trim(padded);
     println(trimmed);
     return nil;
 }
@@ -290,7 +288,7 @@ hello
 
 ---
 
-#### `hylian_trim_start(s: str) -> str`
+#### `trim_start(s: str) -> str`
 
 Strip leading (left-side) whitespace from `s`.
 
@@ -308,7 +306,7 @@ include {
 
 Error? main() {
     str s = "   indented";
-    str result = hylian_trim_start(s);
+    str result = trim_start(s);
     println(result);
     return nil;
 }
@@ -322,7 +320,7 @@ indented
 
 ---
 
-#### `hylian_trim_end(s: str) -> str`
+#### `trim_end(s: str) -> str`
 
 Strip trailing (right-side) whitespace from `s`.
 
@@ -340,7 +338,7 @@ include {
 
 Error? main() {
     str s = "trailing spaces   ";
-    str result = hylian_trim_end(s);
+    str result = trim_end(s);
     println("'{{result}}'");
     return nil;
 }
@@ -354,7 +352,7 @@ Output:
 
 ---
 
-#### `hylian_to_upper(s: str) -> str`
+#### `to_upper(s: str) -> str`
 
 Return an uppercase copy of `s`.
 
@@ -372,7 +370,7 @@ include {
 
 Error? main() {
     str s = "Hello, World!";
-    str up = hylian_to_upper(s);
+    str up = to_upper(s);
     println(up);
     return nil;
 }
@@ -386,7 +384,7 @@ HELLO, WORLD!
 
 ---
 
-#### `hylian_to_lower(s: str) -> str`
+#### `to_lower(s: str) -> str`
 
 Return a lowercase copy of `s`.
 
@@ -404,7 +402,7 @@ include {
 
 Error? main() {
     str s = "Hello, World!";
-    str low = hylian_to_lower(s);
+    str low = to_lower(s);
     println(low);
     return nil;
 }
@@ -418,7 +416,7 @@ hello, world!
 
 ---
 
-#### `hylian_replace(s: str, old: str, new: str) -> str`
+#### `replace(s: str, old: str, new: str) -> str`
 
 Return a copy of `s` with every occurrence of `old` replaced by `new`.
 
@@ -438,7 +436,7 @@ include {
 
 Error? main() {
     str s = "foo bar foo baz foo";
-    str result = hylian_replace(s, "foo", "qux");
+    str result = replace(s, "foo", "qux");
     println(result);
     return nil;
 }
@@ -452,7 +450,7 @@ qux bar qux baz qux
 
 ---
 
-#### `hylian_split(s: str, delim: str) -> str[]`
+#### `split(s: str, delim: str) -> str[]`
 
 Split `s` on every occurrence of `delim`, returning a null-terminated array of heap-allocated substrings.
 
@@ -473,7 +471,7 @@ include {
 
 Error? main() {
     str csv = "apple,banana,cherry";
-    str[] parts = hylian_split(csv, ",");
+    str[] parts = split(csv, ",");
 
     int i = 0;
     while (parts[i]) {
@@ -495,7 +493,7 @@ cherry
 
 ---
 
-#### `hylian_join(parts: str[], count: int, delim: str) -> str`
+#### `join(parts: str[], count: int, delim: str) -> str`
 
 Join an array of strings into a single string, with `delim` inserted between each element.
 
@@ -515,7 +513,7 @@ include {
 
 Error? main() {
     str[] words = ["one", "two", "three"];
-    str joined = hylian_join(words, 3, " - ");
+    str joined = join(words, 3, " - ");
     println(joined);
     return nil;
 }
@@ -529,16 +527,16 @@ one - two - three
 
 ---
 
-#### `hylian_to_int(s: str, out: int*) -> int`
+#### `to_int(s: str, out: int&) -> bool`
 
 Parse a decimal integer from `s` and write the result into `out`.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `s` | `str` | The string to parse |
-| `out` | `int*` | Pointer to an `int` that receives the parsed value |
+| `out` | `int&` | Reference to an `int` that receives the parsed value |
 
-**Return value:** `1` on success, `0` if the string is not a valid integer or if any non-numeric characters remain after the number. Unlike `str_to_int` from `std.io`, this function distinguishes a parse failure from a genuine zero result.
+**Return value:** `true` on success, `false` if the string is not a valid integer or if any non-numeric characters remain after the number. This function distinguishes a parse failure from a genuine zero result.
 
 ```hylian
 include {
@@ -548,7 +546,7 @@ include {
 
 Error? main() {
     int value;
-    int ok = hylian_to_int("123", value);
+    bool ok = to_int("123", value);
 
     if (ok) {
         println("Parsed: {{value}}");
@@ -556,8 +554,8 @@ Error? main() {
         println("Parse failed.");
     }
 
-    ok = hylian_to_int("not_a_number", value);
-    if (ok == 0) {
+    ok = to_int("not_a_number", value);
+    if (!ok) {
         println("Correctly rejected bad input.");
     }
 
@@ -574,16 +572,16 @@ Correctly rejected bad input.
 
 ---
 
-#### `hylian_to_float(s: str, out: float*) -> int`
+#### `to_float(s: str, out: float&) -> bool`
 
 Parse a floating-point number from `s` and write the result into `out`.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `s` | `str` | The string to parse |
-| `out` | `float*` | Pointer to a `float` that receives the parsed value |
+| `out` | `float&` | Reference to a `float` that receives the parsed value |
 
-**Return value:** `1` on success, `0` if the string is not a valid floating-point number or if any characters remain after the number.
+**Return value:** `true` on success, `false` if the string is not a valid floating-point number or if any characters remain after the number.
 
 ```hylian
 include {
@@ -593,7 +591,7 @@ include {
 
 Error? main() {
     float f;
-    int ok = hylian_to_float("3.14", f);
+    bool ok = to_float("3.14", f);
 
     if (ok) {
         println("Parsed float successfully.");
@@ -607,7 +605,7 @@ Error? main() {
 
 ---
 
-#### `hylian_from_int(n: int) -> str`
+#### `from_int(n: int) -> str`
 
 Convert an integer to its heap-allocated decimal string representation.
 
@@ -617,7 +615,7 @@ Convert an integer to its heap-allocated decimal string representation.
 
 **Return value:** *Heap-allocated* null-terminated decimal string. Returns `nil` on out-of-memory. **Caller must free.**
 
-> **Note:** For simple printing, passing an `int` directly to `print` or `println` is more convenient — the compiler handles the conversion automatically. Use `hylian_from_int` when you need to store or manipulate the string value itself.
+> **Note:** For simple printing, passing an `int` directly to `print` or `println` is more convenient — the compiler handles the conversion automatically. Use `from_int` when you need to store or manipulate the string value itself.
 
 ```hylian
 include {
@@ -627,8 +625,8 @@ include {
 
 Error? main() {
     int n = 42;
-    str s = hylian_from_int(n);
-    str msg = hylian_replace("the answer is X", "X", s);
+    str s = from_int(n);
+    str msg = replace("the answer is X", "X", s);
     println(msg);
     return nil;
 }
@@ -642,7 +640,7 @@ the answer is 42
 
 ---
 
-#### `hylian_equals(a: str, b: str) -> int`
+#### `equals(a: str, b: str) -> bool`
 
 Compare two strings for exact byte-for-byte equality.
 
@@ -651,9 +649,9 @@ Compare two strings for exact byte-for-byte equality.
 | `a` | `str` | First string |
 | `b` | `str` | Second string |
 
-**Return value:** `1` if `a` and `b` are identical, `0` otherwise.
+**Return value:** `true` if `a` and `b` are identical, `false` otherwise.
 
-> **Note:** Do not use `==` to compare strings in Hylian — that compares pointer addresses, not contents. Always use `hylian_equals` for string equality checks.
+> **Note:** Do not use `==` to compare strings in Hylian — that compares pointer addresses, not contents. Always use `equals` for string equality checks.
 
 ```hylian
 include {
@@ -666,8 +664,8 @@ Error? main() {
     str b = "hello";
     str c = "world";
 
-    println(hylian_equals(a, b));
-    println(hylian_equals(a, c));
+    println(equals(a, b));
+    println(equals(a, c));
 
     return nil;
 }
@@ -676,6 +674,6 @@ Error? main() {
 Output:
 
 ```sh
-1
-0
+true
+false
 ```

@@ -3,6 +3,7 @@
 [
   (block)
   (class_body)
+  (union_class_body)
   (switch_stmt)
   (unsafe_block)
   (enum_decl)

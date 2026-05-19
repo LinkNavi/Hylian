@@ -5,7 +5,7 @@
 # Language Reference
 
 - [Syntax](language/syntax.md)
-  - Types, variables, functions, classes, enums, switch, pointers, tuples, unsafe, const, static arrays, bitwise ops, struct literals, `as` casts, `null`, digit separators, and more
+  - Types, variables, functions, classes, enums, switch, pointers, tuples, unsafe, const, static arrays, bitwise ops, struct literals, `as` casts, `null`, digit separators, `union class`, and more
 - [Error Handling](language/error-handling.md)
 - [Modules & Standard Library](language/modules.md)
   - Module visibility: `public` functions, statics, consts, and enums
