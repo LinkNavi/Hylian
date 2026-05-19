@@ -1767,19 +1767,24 @@ def _fetch_and_install_pkg(
     existing_pkg = next((p for p in cfg.packages if p["name"] == pkg_name), None)
     if existing_pkg:
         installed_ver = existing_pkg["version"]
-        if not _semver_satisfies(installed_ver, pkg_version_constraint or pkg_version):
+        if _semver_satisfies(installed_ver, pkg_version_constraint or pkg_version):
+            # Already at a compatible version — skip download but still check deps
+            info(
+                f"{pkg_name} {installed_ver} already satisfies '{pkg_version_constraint or pkg_version}'"
+            )
+            pkg_version = installed_ver
+        elif pkg_version_constraint is not None:
+            # User explicitly requested a version — allow upgrade, warn and proceed
+            warn(f"Upgrading {pkg_name}: {installed_ver} -> {pkg_version}")
+        else:
+            # Transitive dep conflict — block it
             err(
                 f"Version conflict for '{pkg_name}':\n"
                 f"  already declared: {installed_ver}\n"
-                f"  required:         {pkg_version_constraint or pkg_version}\n"
+                f"  required:         {pkg_version}\n"
                 f"  Run: linkle add {pkg_name}@{pkg_version} to upgrade explicitly."
             )
             sys.exit(1)
-        # Already at a compatible version — skip download but still check deps
-        info(
-            f"{pkg_name} {installed_ver} already satisfies '{pkg_version_constraint or pkg_version}'"
-        )
-        pkg_version = installed_ver
 
     info(f"Downloading {pkg_name} v{pkg_version}")
 
@@ -1839,13 +1844,21 @@ def _fetch_and_install_pkg(
     # ── Alias collision check ─────────────────────────────────────────────────
     existing_aliases = {v["alias"]: v["path"] for v in cfg.vendors}
 
+    # Paths this package owns (old direct layout or new sub-vendor layout)
+    pkg_owned_prefixes = (
+        f"vendors/{pkg_name}/vendors/",
+        f"vendors/{pkg_name}",
+    )
+
     if sub_vendor_aliases:
         collisions = []
         for alias in sub_vendor_aliases:
             if alias in existing_aliases:
                 existing_path = existing_aliases[alias]
                 expected_path = f"vendors/{pkg_name}/vendors/{alias}"
-                if existing_path != expected_path:
+                if existing_path != expected_path and not any(
+                    existing_path.startswith(p) for p in pkg_owned_prefixes
+                ):
                     collisions.append((alias, existing_path))
 
         if collisions:
@@ -1861,7 +1874,9 @@ def _fetch_and_install_pkg(
         if pkg_name in existing_aliases:
             existing_path = existing_aliases[pkg_name]
             expected_path = f"vendors/{pkg_name}"
-            if existing_path != expected_path:
+            if existing_path != expected_path and not any(
+                existing_path.startswith(p) for p in pkg_owned_prefixes
+            ):
                 err(
                     f"Alias collision: '{pkg_name}' is already used by: {existing_path}\n"
                     f"  Rename that entry in your vendors {{}} block to a unique alias."
@@ -1887,16 +1902,34 @@ def _fetch_and_install_pkg(
             )
         else:
             src += f"\npackages {{\n{new_pkg_entry}}}\n"
+    else:
+        # Update version in-place if upgrading
+        src = re.sub(
+            rf'(\b{re.escape(pkg_name)}\s*:\s*")[^"]*(")',
+            lambda m: m.group(1) + pkg_version + m.group(2),
+            src,
+            count=1,
+        )
 
     # vendors block
     added_aliases = []
     if sub_vendor_aliases:
         new_vend_entries = ""
         for alias in sub_vendor_aliases:
+            expected_path = f"vendors/{pkg_name}/vendors/{alias}"
             if alias not in existing_aliases:
-                new_vend_entries += (
-                    f'    {alias}: "vendors/{pkg_name}/vendors/{alias}",\n'
+                new_vend_entries += f'    {alias}: "{expected_path}",\n'
+                added_aliases.append(alias)
+            elif existing_aliases[alias] != expected_path:
+                # Update path in-place (e.g. upgrading from direct to sub-vendor layout)
+                src = re.sub(
+                    rf'(\b{re.escape(alias)}\s*:\s*")[^"]*(")',
+                    lambda m, p=expected_path: m.group(1) + p + m.group(2),
+                    src,
+                    count=1,
                 )
+                added_aliases.append(alias)
+            else:
                 added_aliases.append(alias)
         if new_vend_entries:
             if re.search(r"vendors\s*\{", src):
