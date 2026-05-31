@@ -736,19 +736,21 @@ def _runtime_obj(stem_rel, target, verbose):
                 rel = os.path.relpath(c_path)
             except:
                 rel = c_path
+            gcc_flags = [
+                "gcc",
+                "-O2",
+                "-c",
+                "-ffreestanding",
+                "-nostdlib",
+                "-nostdinc",
+                "-fno-builtin",
+            ]
+            # Add kernel-specific flags for freestanding targets
+            if target in ("kernel", "limine"):
+                gcc_flags.extend(["-mno-sse", "-mno-mmx", "-mno-red-zone"])
+            gcc_flags.extend([c_path, "-o", obj_path])
             _run(
-                [
-                    "gcc",
-                    "-O2",
-                    "-c",
-                    "-ffreestanding",
-                    "-nostdlib",
-                    "-nostdinc",
-                    "-fno-builtin",
-                    c_path,
-                    "-o",
-                    obj_path,
-                ],
+                gcc_flags,
                 verbose,
                 label=f"CC   {rel}",
             )
@@ -761,7 +763,7 @@ def _runtime_obj(stem_rel, target, verbose):
                 rel = asm_path
             fmt = NASM_FORMATS.get(target, "elf64")
             _run(
-                ["nasm", "-f", fmt, asm_path, "-o", obj_path],
+                ["nasm", "-f", fmt, "-w-label-redef-late", asm_path, "-o", obj_path],
                 verbose,
                 label=f"ASM  {rel}",
             )
@@ -828,20 +830,22 @@ def _build_platform_obj(target, verbose):
             rel = os.path.relpath(platform_src)
         except:
             rel = platform_src
+        gcc_flags = [
+            "gcc",
+            "-O2",
+            "-c",
+            "-ffreestanding",
+            "-nostdlib",
+            "-nostdinc",
+            "-fno-builtin",
+            "-fno-stack-protector",
+        ]
+        # Add kernel-specific flags for freestanding targets
+        if target in ("kernel", "limine"):
+            gcc_flags.extend(["-mno-sse", "-mno-mmx", "-mno-red-zone"])
+        gcc_flags.extend([platform_src, "-o", platform_obj])
         _run(
-            [
-                "gcc",
-                "-O2",
-                "-c",
-                "-ffreestanding",
-                "-nostdlib",
-                "-nostdinc",
-                "-fno-builtin",
-                "-fno-stack-protector",
-                platform_src,
-                "-o",
-                platform_obj,
-            ],
+            gcc_flags,
             verbose,
             label=f"CC   {rel}",
         )
@@ -1069,7 +1073,14 @@ def _resolve_vendors(cfg, project_root, obj_dir, target, verbose):
                     raise BuildError(f"vendor '{alias}' compilation failed")
                 fmt = NASM_FORMATS.get(target, "elf64")
                 _run(
-                    ["nasm", f"-f{fmt}", vendor_asm, "-o", vendor_obj],
+                    [
+                        "nasm",
+                        f"-f{fmt}",
+                        "-w-label-redef-late",
+                        vendor_asm,
+                        "-o",
+                        vendor_obj,
+                    ],
                     verbose,
                     label=f"Assembling vendor {alias}",
                     cwd=project_root,
@@ -1195,7 +1206,7 @@ def cmd_build(cfg, target, verbose, project_root):
     # ── Step 3: assemble ASM → .o ─────────────────────────────────────────────
     fmt = NASM_FORMATS.get(effective_target, "elf64")
     _run(
-        ["nasm", f"-f{fmt}", out_asm, "-o", out_obj],
+        ["nasm", f"-f{fmt}", "-w-label-redef-late", out_asm, "-o", out_obj],
         verbose,
         label=f"Assembling {os.path.relpath(out_asm, project_root)}",
         cwd=project_root,
@@ -1844,9 +1855,9 @@ def _fetch_and_install_pkg(
     # ── Alias collision check ─────────────────────────────────────────────────
     existing_aliases = {v["alias"]: v["path"] for v in cfg.vendors}
 
-    # Paths this package owns (old direct layout or new sub-vendor layout)
+    # Paths this package owns
     pkg_owned_prefixes = (
-        f"vendors/{pkg_name}/vendors/",
+        f"vendors/{pkg_name}/",
         f"vendors/{pkg_name}",
     )
 
@@ -1855,7 +1866,7 @@ def _fetch_and_install_pkg(
         for alias in sub_vendor_aliases:
             if alias in existing_aliases:
                 existing_path = existing_aliases[alias]
-                expected_path = f"vendors/{pkg_name}/vendors/{alias}"
+                expected_path = f"vendors/{pkg_name}/{alias}"
                 if existing_path != expected_path and not any(
                     existing_path.startswith(p) for p in pkg_owned_prefixes
                 ):
@@ -1916,7 +1927,7 @@ def _fetch_and_install_pkg(
     if sub_vendor_aliases:
         new_vend_entries = ""
         for alias in sub_vendor_aliases:
-            expected_path = f"vendors/{pkg_name}/vendors/{alias}"
+            expected_path = f"vendors/{pkg_name}/{alias}"
             if alias not in existing_aliases:
                 new_vend_entries += f'    {alias}: "{expected_path}",\n'
                 added_aliases.append(alias)
@@ -2078,9 +2089,9 @@ def cmd_publish(project_root, cfg):
                 for fn in fnames:
                     if fn.endswith((".hy", ".hyi", ".c", ".h")):
                         fspath = os.path.join(root, fn)
-                        # arcname: <pkg_name>/vendors/<alias>/...
-                        rel = os.path.relpath(fspath, project_root)
-                        files.append((fspath, os.path.join(name, rel)))
+                        # arcname: <pkg_name>/<alias>/...
+                        rel = os.path.relpath(fspath, vpath)
+                        files.append((fspath, os.path.join(name, alias, rel)))
 
         if not files:
             err("No vendor source files found to publish (check your vendors {} block)")

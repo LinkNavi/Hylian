@@ -123,6 +123,12 @@ const char *ir_opcode_name(IROpcode op) {
     case IR_MEMCPY:         return "MEMCPY";
     case IR_CLI:            return "CLI";
     case IR_STI:            return "STI";
+    case IR_LGDT:           return "LGDT";
+    case IR_LIDT:           return "LIDT";
+    case IR_LTR:            return "LTR";
+    case IR_INVLPG:         return "INVLPG";
+    case IR_WRMSR:          return "WRMSR";
+    case IR_RDMSR:          return "RDMSR";
     case IR_CAST:           return "CAST";
     case IR_ADDROF_FN:      return "ADDROF_FN";
     case IR_READ_CR:        return "READ_CR";

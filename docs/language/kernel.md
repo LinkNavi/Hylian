@@ -84,6 +84,55 @@ include { kernel }
 | `disable_interrupts` | `void disable_interrupts()` | Executes `cli` — disables hardware interrupts |
 | `cli` | `void cli()` | Alias for `disable_interrupts` — executes the `cli` instruction directly |
 | `sti` | `void sti()` | Alias for `enable_interrupts` — executes the `sti` instruction directly |
+| `lgdt` | `void lgdt(usize base, uint16 limit)` | Loads the Global Descriptor Table Register with the given base address and limit |
+| `lidt` | `void lidt(usize base, uint16 limit)` | Loads the Interrupt Descriptor Table Register with the given base address and limit |
+| `ltr` | `void ltr(uint16 selector)` | Loads the Task Register with the given segment selector |
+| `invlpg` | `void invlpg(usize vaddr)` | Invalidates the TLB entry for the page containing the given virtual address |
+| `wrmsr` | `void wrmsr(uint64 msr, uint64 value)` | Writes a 64-bit value to the specified Model-Specific Register |
+| `rdmsr` | `uint64 rdmsr(uint64 msr)` | Reads a 64-bit value from the specified Model-Specific Register |
+
+**Example: Loading GDT and IDT**
+
+```hylian
+// Load Global Descriptor Table
+uint64 gdt_base = cast<uint64>(&my_gdt);
+uint16 gdt_limit = 23;  // 3 entries * 8 bytes - 1
+lgdt(gdt_base, gdt_limit);
+
+// Load Interrupt Descriptor Table
+uint64 idt_base = cast<uint64>(&my_idt);
+uint16 idt_limit = 4095;  // 256 entries * 16 bytes - 1
+lidt(idt_base, idt_limit);
+```
+
+**Example: TLB Management**
+
+```hylian
+// After unmapping a page, invalidate its TLB entry
+void unmap_page(uint64 vaddr) {
+    // ... page table manipulation ...
+    invlpg(vaddr);  // Flush TLB for this specific page
+}
+```
+
+**Example: MSR Operations (SYSCALL Setup)**
+
+```hylian
+const uint64 MSR_EFER = 0xC0000080;
+const uint64 MSR_STAR = 0xC0000081;
+const uint64 MSR_LSTAR = 0xC0000082;
+
+// Enable SYSCALL/SYSRET by setting SCE bit in EFER
+uint64 efer = rdmsr(MSR_EFER);
+wrmsr(MSR_EFER, efer | 0x1);
+
+// Configure code segment selectors
+uint64 star = (cast<uint64>(0x08) << 32) | (cast<uint64>(0x13) << 48);
+wrmsr(MSR_STAR, star);
+
+// Set SYSCALL entry point
+wrmsr(MSR_LSTAR, cast<uint64>(&syscall_entry));
+```
 
 #### Memory Utilities
 

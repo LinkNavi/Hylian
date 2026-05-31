@@ -36,6 +36,12 @@ static int has_side_effects(const IRInstr *ins) {
     case IR_STATIC_VAR:
     case IR_CLI:
     case IR_STI:
+    case IR_LGDT:
+    case IR_LIDT:
+    case IR_LTR:
+    case IR_INVLPG:
+    case IR_WRMSR:
+    case IR_RDMSR:
     case IR_MEMSET:
     case IR_MEMCPY:
     case IR_CAST:

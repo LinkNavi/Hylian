@@ -309,6 +309,18 @@ static Type infer_expr(ASTNode *node) {
       result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "sti") == 0) {
       result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "lgdt") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "lidt") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "ltr") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "invlpg") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "wrmsr") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "rdmsr") == 0) {
+      result = make_simple_type("uint64", 0);
     } else if (fc->name && strcmp(fc->name, "read_cr") == 0) {
       result = make_simple_type("uint64", 0);
     } else if (fc->name && strcmp(fc->name, "write_cr") == 0) {

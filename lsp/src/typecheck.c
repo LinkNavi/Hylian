@@ -306,9 +306,15 @@ static Type infer_expr(ASTNode *node) {
                 strcmp(fc->name, "iret")         == 0 ||
                 strcmp(fc->name, "halt")         == 0 ||
                 strcmp(fc->name, "memset")       == 0 ||
-                strcmp(fc->name, "memcpy")       == 0) {
+                strcmp(fc->name, "memcpy")       == 0 ||
+                strcmp(fc->name, "lgdt")         == 0 ||
+                strcmp(fc->name, "lidt")         == 0 ||
+                strcmp(fc->name, "ltr")          == 0 ||
+                strcmp(fc->name, "invlpg")       == 0 ||
+                strcmp(fc->name, "wrmsr")        == 0) {
                 result = make_simple_type("void", 0);
-            } else if (strcmp(fc->name, "read_cr")   == 0) {
+            } else if (strcmp(fc->name, "read_cr")   == 0 ||
+                       strcmp(fc->name, "rdmsr")     == 0) {
                 result = make_simple_type("uint64", 0);
             } else if (strcmp(fc->name, "outb") == 0) {
                 result = make_simple_type("void", 0);

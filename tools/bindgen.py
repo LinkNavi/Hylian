@@ -321,9 +321,17 @@ def _map_type(
         if sname in opaque_set:
             return sname
         # Small plain-data structs (e.g. Color, Vector2) are passed by value
-        # packed into a single integer register on x86-64 — map to int so the
-        # caller packs the fields and passes an integer directly.
+        # packed into a single integer register on x86-64.  Rather than
+        # collapsing them to "int" (which forces callers to write pack_Color()
+        # helpers), we keep the struct name so callers can use the struct
+        # literal syntax:  ClearBackground(Color { r: 245, g: 245, b: 245, a: 255 })
         if _is_small_value_struct(cursor_type):
+            # Prefer the struct name, but fall back to the original typedef name
+            # if the struct name is empty (e.g., anonymous struct with typedef)
+            if sname:
+                return sname
+            if original_spelling:
+                return original_spelling
             return "int"
         return "*void"
 
@@ -501,6 +509,8 @@ class BindgenResult:
         self.defines: list[str] = []  # const lines from #define macros
         self.opaque_classes: set[str] = set()  # names used as opaque handles
         self.skipped: list[str] = []  # names we couldn't handle
+        # name → list of (field_name, hylian_type) for small-value structs
+        self.small_value_structs: dict[str, list[tuple[str, str]]] = {}
 
 
 def _is_from_main_header(cursor, main_file: str) -> bool:
@@ -775,6 +785,14 @@ def parse_header(
                         lines_s.append(f"    {ftype}  {fname2}")
                 lines_s.append("}")
                 result.structs.append("\n".join(lines_s))
+                # Track small value structs so emit_hyi can generate pack_ helpers
+                if not is_union_record and _is_small_value_struct(canon):
+                    field_info = [
+                        (f.spelling, _map_field_type(f.type, opaque_set, verbose))
+                        for f in fields
+                        if f.spelling
+                    ]
+                    result.small_value_structs[tname] = field_info
             continue
 
         # ── Struct / Union ────────────────────────────────────────────────────
@@ -809,6 +827,11 @@ def parse_header(
                     lines.append(f"    {ftype}  {fname}")
                 lines.append("}")
                 result.structs.append("\n".join(lines))
+                # Track small value structs
+                if not is_union_cursor and _is_small_value_struct(cursor.type):
+                    result.small_value_structs[sname] = [
+                        (fname, ftype) for ftype, fname in fields
+                    ]
             continue
 
         # ── Function ──────────────────────────────────────────────────────────
@@ -992,7 +1015,104 @@ def scrape_defines(
     return results
 
 
-# ── .hyi emitter ─────────────────────────────────────────────────────────────
+def scrape_struct_constants(
+    header: str,
+    extra_includes: list[str],
+    filters: list[str],
+    small_value_struct_names: set[str],
+    verbose: bool,
+) -> list[str]:
+    """
+    Scrape #define macros that expand to struct/compound literals of small value
+    structs (e.g. RAYWHITE, RED from raylib) and emit them as Hylian
+    struct-literal consts.
+
+    Looks for patterns like:
+        #define RAYWHITE  CLITERAL(Color){ 245, 245, 245, 255 }
+        #define RAYWHITE  (Color){ 245, 245, 245, 255 }
+
+    Returns a list of  "const NAME = StructName { f0: V, f1: V, ... }"  lines.
+    We need the field names, so we look them up from the clang-parsed struct.
+    """
+    cmd = ["gcc", "-dM", "-E"]
+    for inc in extra_includes:
+        cmd += ["-I", inc]
+    cmd.append(header)
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        if verbose:
+            warn(f"gcc -dM -E failed (struct consts): {e}")
+        return []
+
+    if r.returncode != 0:
+        return []
+
+    # Match:  CLITERAL(TypeName){ v0, v1, v2, v3 }
+    #    or:  (TypeName){ v0, v1, v2, v3 }
+    _STRUCT_LIT_RE = re.compile(
+        r"(?:CLITERAL\s*\(\s*(\w+)\s*\)|"  # CLITERAL(TypeName)
+        r"\(\s*(\w+)\s*\))"  # (TypeName)
+        r"\s*\{([^}]*)\}"  # { values }
+    )
+
+    results: list[str] = []
+    seen: set[str] = set()
+
+    for line in r.stdout.splitlines():
+        m_def = re.match(r"^#define\s+(\w+)\s+(.*)", line)
+        if not m_def:
+            continue
+        macro_name, value = m_def.group(1), m_def.group(2).strip()
+
+        if macro_name.startswith("__") or macro_name.startswith("_"):
+            continue
+        if filters and not any(macro_name.startswith(f) for f in filters):
+            continue
+        if macro_name in seen:
+            continue
+
+        m_lit = _STRUCT_LIT_RE.search(value)
+        if not m_lit:
+            continue
+
+        type_name = (m_lit.group(1) or m_lit.group(2) or "").strip()
+        if type_name not in small_value_struct_names:
+            continue
+
+        # Parse the comma-separated integer values
+        raw_vals = [v.strip() for v in m_lit.group(3).split(",") if v.strip()]
+        int_vals = []
+        ok = True
+        for rv in raw_vals:
+            # strip suffixes and casts
+            rv2 = re.sub(r"[uUlLfF]$", "", rv.strip())
+            rv2 = re.sub(r"^\(\s*\w+\s*\)", "", rv2).strip()
+            try:
+                if rv2.startswith("0x") or rv2.startswith("0X"):
+                    int_vals.append(int(rv2, 16))
+                else:
+                    int_vals.append(int(rv2, 10))
+            except ValueError:
+                ok = False
+                break
+        if not ok:
+            continue
+
+        seen.add(macro_name)
+        # Pack the struct fields into a single integer constant that matches
+        # the C ABI (little-endian: field[0] is the lowest byte).
+        # For Color {r, g, b, a}, this produces: r | (g<<8) | (b<<16) | (a<<24)
+        packed_value = 0
+        for i, val in enumerate(int_vals):
+            packed_value |= (val & 0xFF) << (i * 8)
+        results.append(f"const {macro_name} = {packed_value}")
+
+    if verbose and results:
+        info(f"scraped {len(results)} struct-literal #define constants")
+
+    return results
 
 
 def emit_hyi(
@@ -1003,6 +1123,7 @@ def emit_hyi(
     out_path: str | None,
     extra_defines: list[str] | None = None,
     pkg_libs: list[str] | None = None,
+    struct_consts: list[str] | None = None,
 ) -> str:
     lines = []
 
@@ -1078,6 +1199,62 @@ def emit_hyi(
             lines.append("// #define constants")
             for d in deduped_defines:
                 lines.append(d)
+            lines.append("")
+
+    # pack_<StructName> helpers for small value structs
+    # These let callers write:  ClearBackground(RAYWHITE)  or
+    #   ClearBackground(pack_Color(245, 245, 245, 255))
+    # instead of manually bit-shifting fields into an int.
+    if result.small_value_structs:
+        lines.append(
+            "// ── Small value struct helpers ───────────────────────────────────────────"
+        )
+        lines.append(
+            "// These structs are passed by value (packed into a register by the C ABI)."
+        )
+        lines.append(
+            "// Use struct literal syntax:  Color { r: 245, g: 245, b: 245, a: 255 }"
+        )
+        lines.append("// or the pack_ helpers below for convenience.")
+        lines.append("")
+        for sname, fields in sorted(result.small_value_structs.items()):
+            param_list = ", ".join(f"{ft} {fn}" for fn, ft in fields)
+            init_list = ", ".join(f"{fn}: {fn}" for fn, _ in fields)
+            lines.append(f"// pack_{sname}({param_list}) -> {sname}")
+            lines.append(
+                f"// Returns a {sname} struct literal — use wherever a {sname} is expected."
+            )
+            lines.append(f"fn pack_{sname}({param_list}) -> {sname} {{")
+            lines.append(f"    {sname} sv = {sname} {{ {init_list} }};")
+            lines.append(f"    return sv;")
+            lines.append(f"}}")
+            lines.append("")
+
+    # Named struct-literal constants (e.g. RAYWHITE, RED scraped from #define macros)
+    if struct_consts:
+        # Deduplicate against already-emitted enum/define names
+        existing_names: set[str] = set()
+        for block in result.enums:
+            for bl in block.splitlines():
+                m = re.match(r"^const (\w+)", bl)
+                if m:
+                    existing_names.add(m.group(1))
+        for d in extra_defines or []:
+            m = re.match(r"^const (\w+)", d)
+            if m:
+                existing_names.add(m.group(1))
+        fresh = [
+            c
+            for c in struct_consts
+            if re.match(r"^const (\w+)", c)
+            and re.match(r"^const (\w+)", c).group(1) not in existing_names
+        ]
+        if fresh:
+            lines.append(
+                "// ── Named struct constants (from #define macros) ─────────────────────────"
+            )
+            for c in fresh:
+                lines.append(c)
             lines.append("")
 
     # Struct declarations
@@ -1272,6 +1449,19 @@ def main():
             verbose=args.verbose,
         )
 
+    # Always scrape struct-literal constants (e.g. RAYWHITE, RED) when there
+    # are small value structs — no extra flag needed.
+    struct_consts = None
+    if result.small_value_structs:
+        info("scraping struct-literal #define constants...")
+        struct_consts = scrape_struct_constants(
+            header=header,
+            extra_includes=args.includes,
+            filters=args.filters,
+            small_value_struct_names=set(result.small_value_structs.keys()),
+            verbose=args.verbose,
+        )
+
     emit_hyi(
         result=result,
         module_name=module_name,
@@ -1280,6 +1470,7 @@ def main():
         out_path=args.out,
         extra_defines=extra_defines,
         pkg_libs=args.pkg_libs,
+        struct_consts=struct_consts,
     )
 
 

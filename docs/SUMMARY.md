@@ -12,6 +12,9 @@
 - [Vendor Packages & FFI](language/vendors.md)
   - Wrapping C libraries, `.hyi` interface files, auto-generating bindings with `bindgen.py`, filtered bindgen for large SDKs, and native-feeling FFI patterns
 - [Kernel Development Guide](language/kernel.md)
+  - [x86-64 Intrinsics Quick Reference](intrinsics-quick-reference.md)
+  - [Intrinsics Implementation Details](intrinsics-implementation.md)
+  - [Before/After Comparison Examples](examples/intrinsics_comparison.md)
 
 # Standard Library
 

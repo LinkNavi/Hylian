@@ -108,3 +108,33 @@ fn memmap_len(i: uint64) -> uint64
 // 0 = usable, 1 = reserved, 2 = ACPI reclaimable, 3 = ACPI NVS,
 // 4 = bad memory, 5 = bootloader reclaimable, 6 = kernel/modules, 7 = framebuffer
 fn memmap_type(i: uint64) -> uint64
+
+// ── x86_64 Intrinsics ─────────────────────────────────────────────────────────
+
+// Load the Global Descriptor Table Register (GDTR).
+// base: linear address of the GDT
+// limit: size of the GDT in bytes minus 1
+fn lgdt(base: uint64, limit: uint16)
+
+// Load the Interrupt Descriptor Table Register (IDTR).
+// base: linear address of the IDT
+// limit: size of the IDT in bytes minus 1
+fn lidt(base: uint64, limit: uint16)
+
+// Load Task Register with the given segment selector.
+// selector: GDT selector for the TSS descriptor (e.g., 0x28)
+fn ltr(selector: uint16)
+
+// Invalidate TLB entry for a specific virtual address.
+// vaddr: virtual address whose TLB entry should be invalidated
+fn invlpg(vaddr: uint64)
+
+// Read a Model-Specific Register (MSR).
+// msr: MSR number (e.g., 0xC0000080 for EFER)
+// Returns the 64-bit MSR value
+fn rdmsr(msr: uint64) -> uint64
+
+// Write a Model-Specific Register (MSR).
+// msr: MSR number (e.g., 0xC0000080 for EFER)
+// value: 64-bit value to write
+fn wrmsr(msr: uint64, value: uint64)

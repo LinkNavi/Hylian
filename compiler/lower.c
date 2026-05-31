@@ -607,6 +607,68 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             return t;
         }
 
+        /* ── lgdt(base, limit) / lidt(base, limit) ─────────────────────────── */
+        if (strcmp(call->name, "lgdt") == 0 && call->arg_count >= 2) {
+            int tbase  = lower_expr(call->args[0], s);
+            int tlimit = lower_expr(call->args[1], s);
+            int t      = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_LGDT);
+            ins->dest = irop_temp(t);
+            ins->src1 = irop_temp(tbase);
+            ins->src2 = irop_temp(tlimit);
+            return t;
+        }
+        if (strcmp(call->name, "lidt") == 0 && call->arg_count >= 2) {
+            int tbase  = lower_expr(call->args[0], s);
+            int tlimit = lower_expr(call->args[1], s);
+            int t      = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_LIDT);
+            ins->dest = irop_temp(t);
+            ins->src1 = irop_temp(tbase);
+            ins->src2 = irop_temp(tlimit);
+            return t;
+        }
+
+        /* ── ltr(selector) ──────────────────────────────────────────────────── */
+        if (strcmp(call->name, "ltr") == 0 && call->arg_count >= 1) {
+            int tsel = lower_expr(call->args[0], s);
+            int t    = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_LTR);
+            ins->dest = irop_temp(t);
+            ins->src1 = irop_temp(tsel);
+            return t;
+        }
+
+        /* ── invlpg(vaddr) ──────────────────────────────────────────────────── */
+        if (strcmp(call->name, "invlpg") == 0 && call->arg_count >= 1) {
+            int tvaddr = lower_expr(call->args[0], s);
+            int t      = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_INVLPG);
+            ins->dest = irop_temp(t);
+            ins->src1 = irop_temp(tvaddr);
+            return t;
+        }
+
+        /* ── wrmsr(msr, val) / rdmsr(msr) ───────────────────────────────────── */
+        if (strcmp(call->name, "wrmsr") == 0 && call->arg_count >= 2) {
+            int tmsr = lower_expr(call->args[0], s);
+            int tval = lower_expr(call->args[1], s);
+            int t    = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_WRMSR);
+            ins->dest = irop_temp(t);
+            ins->src1 = irop_temp(tmsr);
+            ins->src2 = irop_temp(tval);
+            return t;
+        }
+        if (strcmp(call->name, "rdmsr") == 0 && call->arg_count >= 1) {
+            int tmsr = lower_expr(call->args[0], s);
+            int t    = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_RDMSR);
+            ins->dest = irop_temp(t);
+            ins->src1 = irop_temp(tmsr);
+            return t;
+        }
+
         /* ── read_cr(n) / write_cr(n, val) ────────────────────────────────── */
         if (strcmp(call->name, "read_cr") == 0 && call->arg_count >= 1) {
             long n = 0;

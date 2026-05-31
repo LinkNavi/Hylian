@@ -1995,15 +1995,10 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
         /* int → float: numeric conversion via SSE2 */
         fprintf(out, "    cvtsi2sd xmm0, rax\n");
         fprintf(out, "    movq rax, xmm0\n");
-      } else if (strcmp(ins->str_extra, "int") == 0 ||
-                 strcmp(ins->str_extra, "int64") == 0 ||
-                 strcmp(ins->str_extra, "uint64") == 0 ||
-                 strcmp(ins->str_extra, "usize") == 0 ||
-                 strcmp(ins->str_extra, "isize") == 0) {
-        /* float → int: truncate via SSE2 (cvttsd2si = truncate-toward-zero) */
-        fprintf(out, "    movq xmm0, rax\n");
-        fprintf(out, "    cvttsd2si rax, xmm0\n");
       }
+      /* Removed automatic float→int conversion to avoid SSE instructions in kernel code.
+         Casting from pointer/int to int/uint64 is a no-op (value already in rax).
+         Explicit float→int conversion should be handled separately if needed. */
       /* other pointer/handle types: no conversion needed */
     }
     store_dest_rax(&ins->dest, out);
@@ -2037,6 +2032,59 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
 
   case IR_STI:
     fprintf(out, "    sti\n");
+    break;
+
+  case IR_LGDT:
+    /* lgdt [base, limit] — build descriptor on stack */
+    load_operand_reg(&ins->src1, "rax", out);  /* base */
+    load_operand_reg(&ins->src2, "cx", out);   /* limit */
+    fprintf(out, "    sub  rsp, 16\n");
+    fprintf(out, "    mov  [rsp + 2], rax\n");
+    fprintf(out, "    mov  [rsp], cx\n");
+    fprintf(out, "    lgdt [rsp]\n");
+    fprintf(out, "    add  rsp, 16\n");
+    break;
+
+  case IR_LIDT:
+    /* lidt [base, limit] — build descriptor on stack */
+    load_operand_reg(&ins->src1, "rax", out);  /* base */
+    load_operand_reg(&ins->src2, "cx", out);   /* limit */
+    fprintf(out, "    sub  rsp, 16\n");
+    fprintf(out, "    mov  [rsp + 2], rax\n");
+    fprintf(out, "    mov  [rsp], cx\n");
+    fprintf(out, "    lidt [rsp]\n");
+    fprintf(out, "    add  rsp, 16\n");
+    break;
+
+  case IR_LTR:
+    /* ltr selector */
+    load_operand_reg(&ins->src1, "ax", out);
+    fprintf(out, "    ltr  ax\n");
+    break;
+
+  case IR_INVLPG:
+    /* invlpg [vaddr] */
+    load_operand_reg(&ins->src1, "rax", out);
+    fprintf(out, "    invlpg [rax]\n");
+    break;
+
+  case IR_WRMSR:
+    /* wrmsr msr, val — rcx=msr, edx:eax=val */
+    load_operand_reg(&ins->src1, "rcx", out);  /* msr */
+    load_operand_reg(&ins->src2, "rax", out);  /* val */
+    fprintf(out, "    mov  rdx, rax\n");
+    fprintf(out, "    shr  rdx, 32\n");
+    fprintf(out, "    and  eax, 0xFFFFFFFF\n");
+    fprintf(out, "    wrmsr\n");
+    break;
+
+  case IR_RDMSR:
+    /* dest = rdmsr(msr) — rcx=msr, result in edx:eax */
+    load_operand_reg(&ins->src1, "rcx", out);  /* msr */
+    fprintf(out, "    rdmsr\n");
+    fprintf(out, "    shl  rdx, 32\n");
+    fprintf(out, "    or   rax, rdx\n");
+    store_dest_rax(&ins->dest, out);
     break;
 
   default:
@@ -2516,8 +2564,8 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
      bump allocator and inline strlen — still need to declare them as externs
      so the assembler resolves the references at link time. */
   fprintf(out, "extern malloc\nextern realloc\nextern strlen\n");
-  if (!freestanding && !is_limine)
-    fprintf(out, "extern arena_init\nextern arena_alloc\nextern arena_free\n");
+  /* Arena functions are always needed since codegen unconditionally emits them */
+  fprintf(out, "extern arena_init\nextern arena_alloc\nextern arena_free\n");
   /* Suppress duplicate arena externs that vendor-scan may have added via IR_CALL */
   for (int vi = 0; vi < vendor_extern_count; vi++) {
     if (strcmp(vendor_extern_names[vi], "arena_init") == 0 ||

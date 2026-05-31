@@ -103,6 +103,15 @@ typedef enum {
         /* Interrupt control */
         IR_CLI,      /* cli — disable interrupts */
         IR_STI,      /* sti — enable interrupts  */
+
+        /* Descriptor table & system intrinsics */
+        IR_LGDT,     /* lgdt base, limit — src1=base src2=limit */
+        IR_LIDT,     /* lidt base, limit — src1=base src2=limit */
+        IR_LTR,      /* ltr selector — src1=selector */
+        IR_INVLPG,   /* invlpg vaddr — src1=vaddr */
+        IR_WRMSR,    /* wrmsr msr, val — src1=msr src2=val */
+        IR_RDMSR,    /* dest = rdmsr(msr) — src1=msr */
+
 IR_ADDROF_FN,   /* dest = address of function (lea rax, [rel name]) */
         /* Cast (type reinterpretation): str_extra = target type name */
         IR_CAST,     /* dest = (type)src1 */

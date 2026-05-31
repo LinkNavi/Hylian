@@ -919,6 +919,7 @@ static void resolve_vendor_import(LspProject *proj, const char *inc)
     else
     {
         lsp_log("[lsp_analysis] no .hyi found for vendor: %s", alias);
+        lsp_log("looked in: %s/vendors/%s/%s.hyi", proj->root_dir, alias, alias);
     }
 
     /* If there's also a .hy source file, resolve it as a normal user file */
@@ -1252,7 +1253,7 @@ void lsp_project_update_file(LspProject *proj,
     {
         TCExternalFunc *exts = NULL;
         int ext_count = 0;
-        
+
 
         /* 1. Builtins */
         for (int i = 0; hylian_builtins[i].name; i++)
