@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-
+#include "codegen_termina.h"
 #include "ast.h"
 #include "codegen_asm.h"
 #include "ir.h"
@@ -644,7 +644,7 @@ int main(int argc, char **argv) {
          hylian <input.hy>
          hylian <input.hy> -o <output.asm>
          hylian <input.hy> -o <output.asm> --src-dir <dir>
-         hylian <input.hy> --target <linux|macos|windows>
+         hylian <input.hy> --target <linux|macos|windows|limine|termina>
          hylian <input.hy> --dump-ir
          hylian <input.hy> --freestanding */
     for (int i = 1; i < argc; i++) {
@@ -657,8 +657,9 @@ int main(int argc, char **argv) {
             if (strcmp(target, "linux") != 0 &&
                 strcmp(target, "macos") != 0 &&
                 strcmp(target, "windows") != 0 &&
-                strcmp(target, "limine") != 0) {
-                fprintf(stderr, "hylian: unknown target '%s' (must be linux, macos, windows, or limine)\n", target);
+                strcmp(target, "limine") != 0 &&
+                strcmp(target, "termina") != 0) {
+                fprintf(stderr, "hylian: unknown target '%s' (must be linux, macos, windows, limine, or termina)\n", target);
                 return 1;
             }
         } else if (strcmp(argv[i], "--dump-ir") == 0) {
@@ -669,7 +670,7 @@ int main(int argc, char **argv) {
             input_file = argv[i];
         } else {
             fprintf(stderr, "hylian: unknown option '%s'\n", argv[i]);
-            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir] [--freestanding]\n");
+            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine|termina] [--dump-ir] [--freestanding]\n");
             return 1;
         }
     }
@@ -679,7 +680,7 @@ int main(int argc, char **argv) {
 
     if (!input_file) {
         fprintf(stderr, "hylian: no input file specified\n");
-        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir]\n");
+        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine|termina] [--dump-ir]\n");
         return 1;
     }
 
@@ -707,15 +708,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n");
     }
 
-    FILE *out = fopen(output_file, "w");
-    if (!out) {
-        fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);
-        ir_module_free(mod);
-        return 1;
+    if (strcmp(target, "termina") == 0) {
+        FILE *out = fopen(output_file, "wb");
+        if (!out) {
+            fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);
+            ir_module_free(mod);
+            return 1;
+        }
+        codegen_termina(mod, out, input_file);
+        fclose(out);
+    } else {
+        FILE *out = fopen(output_file, "w");
+        if (!out) {
+            fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);
+            ir_module_free(mod);
+            return 1;
+        }
+        codegen_ir(mod, out, input_file, target, freestanding);
+        fclose(out);
     }
-
-    codegen_ir(mod, out, input_file, target, freestanding);
-    fclose(out);
     ir_module_free(mod);
     printf("Generated %s\n", output_file);
     return 0;

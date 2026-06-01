@@ -3,6 +3,7 @@ Website/
 
 # Vendored and editor dependencies (have their own git repos)
 Din/
+Termina/
 lsp/editors/nvim/
 lsp/vendor/tree-sitter/
 lsp/vendor/tree-sitter-c/

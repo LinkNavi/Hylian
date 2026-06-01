@@ -41,9 +41,10 @@ NASM_FORMATS = {
     "windows": "win64",
     "kernel": "elf64",
     "limine": "elf64",
+    "termina": "bin",
 }
 
-VALID_TARGETS = ("linux", "macos", "windows", "kernel", "limine")
+VALID_TARGETS = ("linux", "macos", "windows", "kernel", "limine", "termina")
 
 REGISTRY_URL = os.environ.get("HYLIAN_REGISTRY", "https://hylian.lol")
 
@@ -1161,6 +1162,8 @@ def cmd_build(cfg, target, verbose, project_root):
     out_obj = os.path.join(obj_dir, cfg.build_main + ".o")
 
     bin_ext = ".exe" if effective_target == "windows" else ""
+    if effective_target == "termina":
+        bin_ext = ".bin"
     bin_out = os.path.join(bin_dir, bin_name + bin_ext)
 
     if not os.path.exists(main_hy):
@@ -1170,6 +1173,34 @@ def cmd_build(cfg, target, verbose, project_root):
     os.makedirs(bin_dir, exist_ok=True)
 
     t0 = time.time()
+
+    # ── Termina target: direct bytecode compilation (no linking) ──────────────
+    if effective_target == "termina":
+        info(
+            f"Compiling  {os.path.relpath(main_hy, project_root)} → {os.path.relpath(bin_out, project_root)}"
+        )
+        compile_cmd = [
+            hylian_bin,
+            main_hy,
+            "-o",
+            bin_out,
+            "--src-dir",
+            src_dir,
+            "--target",
+            effective_target,
+        ]
+
+        r = _run(compile_cmd, verbose, capture=True, cwd=project_root)
+        if r.returncode != 0:
+            print(r.stdout)
+            print(r.stderr, file=sys.stderr)
+            raise BuildError("compilation failed")
+        if verbose and r.stdout.strip():
+            dim(r.stdout.strip())
+
+        elapsed = time.time() - t0
+        ok(f"Built {os.path.relpath(bin_out, project_root)}  ({elapsed:.2f}s)")
+        return bin_out
 
     # ── Step 1: resolve vendors ───────────────────────────────────────────────
     vendor_objs, vendor_libs, _ = _resolve_vendors(

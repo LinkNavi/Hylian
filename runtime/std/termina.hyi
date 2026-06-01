@@ -1,0 +1,28 @@
+// Termina System Interface
+// Provides graphics, input, and system control functions for Termina VM
+
+module std.termina
+
+// System control
+fn hlt()
+fn draw()
+
+// Graphics primitives
+fn cls(color: int)
+fn pset(x: int, y: int, color: int)
+fn line(x0: int, y0: int, x1: int, y1: int, color: int)
+fn rect(x: int, y: int, w: int, h: int, color: int)
+fn rectfill(x: int, y: int, w: int, h: int, color: int)
+fn circle(cx: int, cy: int, r: int, color: int)
+fn circlefill(cx: int, cy: int, r: int, color: int)
+
+// Text rendering
+fn print_str(x: int, y: int, s: str, color: int)
+
+// Input (future)
+// fn btn(b: int) -> int
+// fn btnp(b: int) -> int
+
+// Audio (future)
+// fn sfx(n: int)
+// fn music(n: int)

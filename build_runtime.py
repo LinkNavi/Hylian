@@ -89,6 +89,10 @@ def build_platform(target, verbose):
     if not os.path.exists(src):
         print(f"  ERROR: no platform file for target '{target}': {src}")
         return None
+    # skip termina — it's a bytecode target, not compiled to native
+    if target == "termina":
+        print(f"  SKIP  runtime/platform/termina.c (bytecode target, no native object)")
+        return None
     # skip windows.c on non-windows hosts — it needs MSVC/mingw
     current = detect_platform()
     if target == "windows" and current != "windows":
@@ -227,7 +231,7 @@ def main():
     parser.add_argument(
         "--target",
         default=detect_platform(),
-        choices=["linux", "macos", "windows"],
+        choices=["linux", "macos", "windows", "termina"],
         help="Platform to build the platform layer for (default: auto-detect)",
     )
     args = parser.parse_args()

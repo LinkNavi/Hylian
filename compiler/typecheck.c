@@ -307,6 +307,30 @@ static Type infer_expr(ASTNode *node) {
       result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "cli") == 0) {
       result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "print") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "println") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "hlt") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "cls") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "draw") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "pset") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "line") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "rect") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "rectfill") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "circle") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "circlefill") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "print_str") == 0) {
+      result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "sti") == 0) {
       result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "lgdt") == 0) {
