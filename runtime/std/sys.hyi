@@ -1,0 +1,14 @@
+module std.sys
+
+fn sys_write(int fd, str buf, int len) -> int
+fn sys_read(int fd, str buf, int len) -> int
+fn sys_open(str path, int flags, int mode) -> int
+fn sys_close(int fd)
+fn sys_exit(int code)
+fn sys_mmap(int len) -> usize
+fn sys_munmap(int ptr, int len)
+fn sys_fstat(int fd, str buf) -> int
+fn sys_getcwd(str buf, int size) -> int
+fn sys_mkdir(str path, int mode) -> int
+fn sys_pread(int fd, str buf, int len, int offset) -> int
+fn sys_pwrite(int fd, str buf, int len, int offset) -> int

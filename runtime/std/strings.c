@@ -75,5 +75,42 @@ char  *hylian_join(char **parts,long count,char *delim) {
     } *dst='\0'; return out;
 }
 long   hylian_to_int(char *s,long *out)   { char *e=s; long r=0,sign=1; if(*e=='-'){sign=-1;e++;} while(*e>='0'&&*e<='9')r=r*10+(*e++-'0'); *out=sign*r; return e!=s; }
-long   hylian_to_float(char *s,double *o) { (void)s;(void)o; return 0; } // stub, needs soft float
 char  *hylian_from_int(long n)            { char buf[24]; long l=hylian_length(""); (void)l; char tmp[24]; int tl=0,neg=0; unsigned long u; if(n<0){neg=1;u=(unsigned long)(-(n+1))+1u;}else u=(unsigned long)n; if(u==0)tmp[tl++]='0'; else while(u>0){tmp[tl++]=(char)('0'+(int)(u%10));u/=10;} if(neg)tmp[tl++]='-'; char *o=(char*)hy_alloc(tl+1); for(int i=0;i<tl;i++)o[i]=tmp[tl-1-i]; o[tl]='\0'; return o; }
+
+char  *hylian_concat(char *a, char *b) {
+    long al = hy_strlen(a), bl = hy_strlen(b);
+    char *o = (char *)hy_alloc(al + bl + 1);
+    hy_memcpy(o, a, al);
+    hy_memcpy(o + al, b, bl + 1);
+    return o;
+}
+
+/* Returns the character at index i as a heap-allocated 1-char string.
+   Returns nil if out of bounds. */
+char  *hylian_char_at(char *s, long i) {
+    long l = hy_strlen(s);
+    if (i < 0 || i >= l) return (void *)0;
+    char *o = (char *)hy_alloc(2);
+    o[0] = s[i]; o[1] = '\0';
+    return o;
+}
+
+/* to_float: parses [-]digits[.digits] — no scientific notation, no libc */
+long   hylian_to_float(char *s, double *out) {
+    if (!s || !out) return 0;
+    char *p = s;
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; }
+    else if (*p == '+') p++;
+    if (!(*p >= '0' && *p <= '9') && *p != '.') return 0;
+    double r = 0.0;
+    while (*p >= '0' && *p <= '9') r = r * 10.0 + (*p++ - '0');
+    if (*p == '.') {
+        p++;
+        double frac = 0.1;
+        while (*p >= '0' && *p <= '9') { r += (*p++ - '0') * frac; frac *= 0.1; }
+    }
+    if (*p != '\0') return 0;
+    *out = neg ? -r : r;
+    return 1;
+}

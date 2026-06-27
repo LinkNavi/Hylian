@@ -48,3 +48,6 @@ int hy_mkdir(const char *path,int mode) {
     (void)mode; return CreateDirectoryA(path,0) ? 0 : -1;
 }
 #endif
+
+long hy_getcwd(char *buf, hy_size size) { (void)buf;(void)size; return -1; }
+long hy_getenv(const char *name, char *buf, hy_size buf_len) { (void)name;(void)buf;(void)buf_len; return -1; }

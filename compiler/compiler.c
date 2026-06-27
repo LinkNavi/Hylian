@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include "codegen_termina.h"
 #include "ast.h"
 #include "codegen_asm.h"
 #include "ir.h"
@@ -18,10 +17,12 @@ extern ProgramNode *root;
 
 /* Defined and owned by parser.y — set before each yyparse() call */
 extern const char *current_parse_file;
+extern const char *current_compile_target;
 
 
 #define MAX_VISITED 256
 
+static const char *current_target = "linux";
 static char *visited[MAX_VISITED];
 static int   visited_count = 0;
 
@@ -402,6 +403,7 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
     yyrestart(f);
     yylineno = 1;
     current_parse_file = filepath;
+    current_compile_target = current_target;
     int parse_result = yyparse();
     fclose(f);
 
@@ -438,34 +440,33 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
            so the typecheck pass knows about their function signatures.
            The codegen also handles them separately for linking. */
         if (strncmp(inc, "std.", 4) == 0) {
-            /* Convert std.foo.bar -> runtime/std/foo/bar.hyi
-               Strip the "std." prefix first */
-            const char *std_module = inc + 4; /* e.g. "io", "kernel", "networking.tcp" */
+            const char *std_module = inc + 4;
             int slen = strlen(std_module);
             char *std_rel = malloc(slen + 1);
             for (int j = 0; j < slen; j++)
                 std_rel[j] = (std_module[j] == '.') ? '/' : std_module[j];
             std_rel[slen] = '\0';
 
-            /* Build candidate paths:
-               1. <project_root>/runtime/std/<std_rel>.hyi  (from compiler binary dir)
-               2. runtime/std/<std_rel>.hyi                 (relative to cwd) */
             char *project_root = dir_of(src_dir);
 
             char *hyi1 = malloc(strlen(project_root) + 14 + slen + 5);
             sprintf(hyi1, "%s/runtime/std/%s.hyi", project_root, std_rel);
-
             char *hyi2 = malloc(14 + slen + 5);
             sprintf(hyi2, "runtime/std/%s.hyi", std_rel);
+
+            char *hy1 = malloc(strlen(project_root) + 14 + slen + 4);
+            sprintf(hy1, "%s/runtime/std/%s.hy", project_root, std_rel);
+            char *hy2 = malloc(14 + slen + 4);
+            sprintf(hy2, "runtime/std/%s.hy", std_rel);
 
             free(project_root);
             free(std_rel);
 
             char *hyi_path = NULL;
-            const char *cands[] = { hyi1, hyi2, NULL };
-            for (int ci = 0; cands[ci]; ci++) {
-                FILE *probe = fopen(cands[ci], "r");
-                if (probe) { fclose(probe); hyi_path = strdup(cands[ci]); break; }
+            const char *hyi_cands[] = { hyi1, hyi2, NULL };
+            for (int ci = 0; hyi_cands[ci]; ci++) {
+                FILE *probe = fopen(hyi_cands[ci], "r");
+                if (probe) { fclose(probe); hyi_path = strdup(hyi_cands[ci]); break; }
             }
             free(hyi1); free(hyi2);
 
@@ -477,7 +478,6 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
                 ProgramNode *dep = parse_hyi_into_program(hyi_path, &link_lib,
                                                            &pkg_names, &pkg_count);
                 if (dep) {
-                    /* Keep the original std.* include in place for codegen */
                     dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
                     dep->includes[dep->include_count++] = strdup(inc);
                     merge_programs(program, dep);
@@ -487,6 +487,24 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
                 free(pkg_names);
             }
             if (hyi_path) free(hyi_path);
+
+            /* If a .hy exists alongside the .hyi, compile it as pure-Hylian stdlib */
+            char *hy_path = NULL;
+            const char *hy_cands[] = { hy1, hy2, NULL };
+            for (int ci = 0; hy_cands[ci]; ci++) {
+                FILE *probe = fopen(hy_cands[ci], "r");
+                if (probe) { fclose(probe); hy_path = strdup(hy_cands[ci]); break; }
+            }
+            free(hy1); free(hy2);
+
+            if (hy_path && !already_visited(hy_path)) {
+                char *hy_dir = dir_of(hy_path);
+                ProgramNode *dep = compile_file(hy_path, hy_dir);
+                free(hy_dir);
+                if (dep) merge_programs(program, dep);
+            }
+            if (hy_path) free(hy_path);
+
             continue;
         }
 
@@ -644,7 +662,7 @@ int main(int argc, char **argv) {
          hylian <input.hy>
          hylian <input.hy> -o <output.asm>
          hylian <input.hy> -o <output.asm> --src-dir <dir>
-         hylian <input.hy> --target <linux|macos|windows|limine|termina>
+         hylian <input.hy> --target <linux|macos|windows|limine>
          hylian <input.hy> --dump-ir
          hylian <input.hy> --freestanding */
     for (int i = 1; i < argc; i++) {
@@ -654,12 +672,13 @@ int main(int argc, char **argv) {
             src_dir = argv[++i];
         } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
             target = argv[++i];
+            current_target = target;
             if (strcmp(target, "linux") != 0 &&
                 strcmp(target, "macos") != 0 &&
                 strcmp(target, "windows") != 0 &&
                 strcmp(target, "limine") != 0 &&
                 strcmp(target, "termina") != 0) {
-                fprintf(stderr, "hylian: unknown target '%s' (must be linux, macos, windows, limine, or termina)\n", target);
+                fprintf(stderr, "hylian: unknown target '%s' (must be linux, macos, windows, or limine)\n", target);
                 return 1;
             }
         } else if (strcmp(argv[i], "--dump-ir") == 0) {
@@ -670,7 +689,7 @@ int main(int argc, char **argv) {
             input_file = argv[i];
         } else {
             fprintf(stderr, "hylian: unknown option '%s'\n", argv[i]);
-            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine|termina] [--dump-ir] [--freestanding]\n");
+            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir] [--freestanding]\n");
             return 1;
         }
     }
@@ -680,7 +699,7 @@ int main(int argc, char **argv) {
 
     if (!input_file) {
         fprintf(stderr, "hylian: no input file specified\n");
-        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine|termina] [--dump-ir]\n");
+        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir]\n");
         return 1;
     }
 
@@ -708,16 +727,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n");
     }
 
-    if (strcmp(target, "termina") == 0) {
-        FILE *out = fopen(output_file, "wb");
-        if (!out) {
-            fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);
-            ir_module_free(mod);
-            return 1;
-        }
-        codegen_termina(mod, out, input_file);
-        fclose(out);
-    } else {
+    {
         FILE *out = fopen(output_file, "w");
         if (!out) {
             fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);

@@ -15,5 +15,7 @@ hy_ssize hy_pread(int fd, void *buf, hy_size len, long offset);
 hy_ssize hy_pwrite(int fd, const void *buf, hy_size len, long offset);
 long     hy_fsize(int fd);
 int      hy_mkdir(const char *path, int mode);
+long     hy_getcwd(char *buf, hy_size size);
+long     hy_getenv(const char *name, char *buf, hy_size buf_len);
 
 #endif

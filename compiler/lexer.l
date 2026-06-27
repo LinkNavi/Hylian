@@ -4,6 +4,28 @@
 #include <stdlib.h>
 
 extern const char *current_parse_file;
+static int input(void);
+extern const char *current_compile_target;
+
+/* Skip tokens for a top-level declaration (function or class body).
+   Called after @target(X) when X doesn't match the current target.
+   Skips: a single-line decl (ends at ';' with brace_depth==0),
+   or a braced decl (ends when brace_depth returns to 0 after first '{').*/
+static void skip_target_decl(void) {
+    int c;
+    int brace_depth = 0;
+    int seen_brace = 0;
+    while ((c = input()) != EOF) {
+        if (c == '\n') yylineno++;
+        if (c == '{') { brace_depth++; seen_brace = 1; }
+        else if (c == '}') {
+            brace_depth--;
+            if (seen_brace && brace_depth == 0) return;
+        } else if (c == ';' && !seen_brace) {
+            return;
+        }
+    }
+}
 
 /* Check if a raw string body (between outer quotes) contains {{ }} interpolation */
 static int has_interpolation(const char *s) {
@@ -185,6 +207,20 @@ static char *strip_underscores(const char *s) {
 ">>"                { return RSHIFT; }
 "^"                 { return XOR; }
 "$"                 { /* swallow stray $ (legacy prefix, no longer needed) */ }
+@target[ \t]*\([ \t]*[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\) {
+    /* Extract the target name from @target(...) */
+    char *p = yytext;
+    while (*p && *p != '(') p++;
+    p++; /* skip '(' */
+    while (*p == ' ' || *p == '\t') p++;
+    char tname[64]; int tlen = 0;
+    while (*p && *p != ')' && *p != ' ' && *p != '\t' && tlen < 63)
+        tname[tlen++] = *p++;
+    tname[tlen] = '\0';
+    if (strcmp(tname, current_compile_target) != 0)
+        skip_target_decl();
+    /* else: target matches, parse the following declaration normally */
+}
 .                   { fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;31merror:\033[0m unexpected character '%s'\n", current_parse_file, yylineno, yytext); }
 
 %%

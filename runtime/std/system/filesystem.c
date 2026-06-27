@@ -66,7 +66,10 @@ long hylian_file_size(char *path,long path_len) {
     long s=hy_fsize(fd); hy_close(fd); return s;
 }
 
-long hylian_getcwd(char *buf,long buf_len) { (void)buf;(void)buf_len; return -1; } // platform specific, stub
+long hylian_getcwd(char *buf, long buf_len) {
+    if (!buf || buf_len <= 0) return -1;
+    return hy_getcwd(buf, (hy_size)buf_len);
+}
 long hylian_parent_dir(char *path,long path_len,char *buf,long buf_len) {
     if(!path||path_len<=0||!buf||buf_len<=0)return -1;
     char *last=0; for(long i=0;i<path_len;i++) if(path[i]=='/'||path[i]=='\\')last=path+i;

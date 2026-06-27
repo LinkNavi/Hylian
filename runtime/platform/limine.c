@@ -539,3 +539,6 @@ void free(void *p) { (void)p; }
 
 // Limine calls _start directly. The Hylian compiler generates the user's
 // main() as _start for freestanding targets; this file provides runtime support.
+
+long hy_getcwd(char *buf, unsigned long size) { (void)buf;(void)size; return -1; }
+long hy_getenv(const char *name, char *buf, unsigned long buf_len) { (void)name;(void)buf;(void)buf_len; return -1; }

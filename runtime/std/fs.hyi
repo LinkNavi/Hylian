@@ -1,0 +1,9 @@
+module std.fs
+
+fn file_read(str path, str buf, int buf_len) -> int
+fn file_write(str path, str buf, int buf_len) -> int
+fn file_append(str path, str buf, int buf_len) -> int
+fn file_exists(str path) -> bool
+fn file_size(str path) -> int
+fn getcwd(str buf, int size) -> int
+fn mkdir(str path, int mode) -> int

@@ -37,3 +37,6 @@ long hy_fsize(int fd) {
     if(r<0) return -1; long s; __builtin_memcpy(&s,buf+48,8); return s;
 }
 int hy_mkdir(const char *path,int mode) { return (int)sc3(136,(long)path,mode,0); }
+
+long hy_getcwd(char *buf, hy_size size) { (void)buf;(void)size; return -1; }
+long hy_getenv(const char *name, char *buf, hy_size buf_len) { (void)name;(void)buf;(void)buf_len; return -1; }

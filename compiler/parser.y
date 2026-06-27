@@ -9,6 +9,7 @@ extern int yylineno;
 
 /* Set this to the current source file path before calling yyparse() */
 const char *current_parse_file = "<unknown>";
+const char *current_compile_target = "linux";
 
 void yyerror(const char *s) {
     /* Bold red "error:" label */

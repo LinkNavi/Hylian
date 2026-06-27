@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 static char *module_names[64];
 static int   module_count = 0;
@@ -468,6 +469,18 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->src1 = irop_temp(tptr);
             ins->src2 = irop_temp(tval);
             ins->dest = irop_temp(t);
+            /* Propagate the stored-value type for sized-store codegen.
+             * LHS resolved_type may be unpopulated for UnaryOpNode store paths,
+             * so prefer the RHS value type which typecheck always annotates. */
+            const char *vtype = (bin->right && bin->right->resolved_type.name
+                                 && bin->right->resolved_type.name[0])
+                                ? bin->right->resolved_type.name
+                                : (bin->left && bin->left->resolved_type.name
+                                   && bin->left->resolved_type.name[0]
+                                   ? bin->left->resolved_type.name : NULL);
+            if (vtype)
+                ins->str_extra = strdup(vtype);
+            assert(ins->str_extra != NULL && "IR_STORE_PTR: pointee type not propagated");
             return t;
         }
 

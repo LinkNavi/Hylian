@@ -242,3 +242,5 @@ int munmap(void* addr, size_t length) {
  * 
  * No special _start code is needed here.
  */
+long hy_getcwd(char *buf, unsigned long size) { (void)buf;(void)size; return -1; }
+long hy_getenv(const char *name, char *buf, unsigned long buf_len) { (void)name;(void)buf;(void)buf_len; return -1; }

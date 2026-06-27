@@ -1,8 +1,14 @@
 #include "../../platform/platform.h"
 
 long hylian_getenv(char *name, long name_len, char *buf, long buf_len) {
-    (void)name;(void)name_len;(void)buf;(void)buf_len;
-    return -1; // needs libc on all platforms, stub for now
+    if (!name || name_len <= 0 || !buf || buf_len <= 0) return -1;
+    /* ensure null-terminated name for hy_getenv */
+    char tmp[256];
+    if (name_len >= (long)sizeof(tmp)) return -1;
+    long i = 0;
+    while (i < name_len) { tmp[i] = name[i]; i++; }
+    tmp[i] = '\0';
+    return hy_getenv(tmp, buf, (hy_size)buf_len);
 }
 void hylian_exit(long code) { hy_exit((int)code); }
 long hylian_exec(char *cmd, long cmd_len) { (void)cmd;(void)cmd_len; return -1; }

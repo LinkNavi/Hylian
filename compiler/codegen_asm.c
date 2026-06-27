@@ -949,7 +949,17 @@ static void emit_ir_instr(const IRInstr *ins, FILE *out) {
   case IR_STORE_PTR:
     load_operand_reg(&ins->src1, "rcx", out);
     load_operand_reg(&ins->src2, "rax", out);
-    fprintf(out, "    mov [rcx], rax\n");
+    if (ins->str_extra &&
+        (strcmp(ins->str_extra, "uint8") == 0 || strcmp(ins->str_extra, "int8") == 0))
+        fprintf(out, "    mov byte [rcx], al\n");
+    else if (ins->str_extra &&
+             (strcmp(ins->str_extra, "uint16") == 0 || strcmp(ins->str_extra, "int16") == 0))
+        fprintf(out, "    mov word [rcx], ax\n");
+    else if (ins->str_extra &&
+             (strcmp(ins->str_extra, "uint32") == 0 || strcmp(ins->str_extra, "int32") == 0))
+        fprintf(out, "    mov dword [rcx], eax\n");
+    else
+        fprintf(out, "    mov [rcx], rax\n");
     break;
 
   case IR_READ_CR:
@@ -2347,7 +2357,7 @@ void codegen_ir(IRModule *mod, FILE *out, const char *src_filename,
        "hylian_ends_with hylian_index_of hylian_slice hylian_trim "
        "hylian_trim_start hylian_trim_end hylian_to_upper hylian_to_lower "
        "hylian_replace hylian_split hylian_join hylian_to_int hylian_to_float "
-       "hylian_from_int hylian_equals",
+       "hylian_from_int hylian_equals hylian_concat hylian_char_at",
        NULL, "str_", 0},
       {"std.mem", "mem", "mem",
        "arena_init arena_alloc arena_free arena_new arena_delete malloc free realloc",

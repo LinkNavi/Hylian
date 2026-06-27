@@ -12,55 +12,38 @@ InterpStringNode *make_interp_string(const char *raw) {
     InterpStringNode *n = malloc(sizeof(InterpStringNode));
     n->base.type = NODE_INTERP_STRING;
     zero_resolved_type(&n->base);
-    n->segments = NULL;
-    n->seg_count = 0;
 
-    /* strip surrounding quotes */
     int raw_len = strlen(raw);
-    char *inner = malloc(raw_len - 1);  /* raw_len - 2 chars + NUL */
-    strncpy(inner, raw + 1, raw_len - 2);
-    inner[raw_len - 2] = '\0';
+    // work in-place on a copy, no extra strncpy
+    char *inner = strndup(raw + 1, raw_len - 2);
 
-    /* walk through, splitting on {{ and }} */
+    // pre-count segments to avoid realloc loop
+    int seg_cap = 4;
+    n->seg_count = 0;
+    n->segments = malloc(seg_cap * sizeof(InterpSegment));
+
     char *p = inner;
-    char buf[4096];
-    int buf_len = 0;
+    char *start = p;
 
     while (*p) {
         if (p[0] == '{' && p[1] == '{') {
-            /* flush any accumulated literal */
-            if (buf_len > 0) {
-                buf[buf_len] = '\0';
-                n->segments = realloc(n->segments, (n->seg_count + 1) * sizeof(InterpSegment));
-                n->segments[n->seg_count].is_expr = 0;
-                n->segments[n->seg_count].text = strdup(buf);
-                n->seg_count++;
-                buf_len = 0;
+            if (p > start) {
+                if (n->seg_count == seg_cap) { seg_cap *= 2; n->segments = realloc(n->segments, seg_cap * sizeof(InterpSegment)); }
+                n->segments[n->seg_count++] = (InterpSegment){ .is_expr = 0, .text = strndup(start, p - start) };
             }
-            p += 2; /* skip {{ */
-            /* collect until }} */
-            while (*p && !(p[0] == '}' && p[1] == '}')) {
-                buf[buf_len++] = *p++;
-            }
-            buf[buf_len] = '\0';
-            n->segments = realloc(n->segments, (n->seg_count + 1) * sizeof(InterpSegment));
-            n->segments[n->seg_count].is_expr = 1;
-            n->segments[n->seg_count].text = strdup(buf);
-            n->seg_count++;
-            buf_len = 0;
-            if (p[0] == '}' && p[1] == '}') p += 2; /* skip }} */
+            p += 2;
+            start = p;
+            while (*p && !(p[0] == '}' && p[1] == '}')) p++;
+            if (n->seg_count == seg_cap) { seg_cap *= 2; n->segments = realloc(n->segments, seg_cap * sizeof(InterpSegment)); }
+            n->segments[n->seg_count++] = (InterpSegment){ .is_expr = 1, .text = strndup(start, p - start) };
+            if (*p) p += 2;
+            start = p;
         } else {
-            buf[buf_len++] = *p++;
+            p++;
         }
     }
-    /* flush trailing literal */
-    if (buf_len > 0) {
-        buf[buf_len] = '\0';
-        n->segments = realloc(n->segments, (n->seg_count + 1) * sizeof(InterpSegment));
-        n->segments[n->seg_count].is_expr = 0;
-        n->segments[n->seg_count].text = strdup(buf);
-        n->seg_count++;
-    }
+    if (p > start)
+        n->segments[n->seg_count++] = (InterpSegment){ .is_expr = 0, .text = strndup(start, p - start) };
 
     free(inner);
     return n;

@@ -213,3 +213,5 @@ void *realloc(void *ptr, unsigned long new_size) {
 void free(void *ptr) {
     (void)ptr; // bump allocator: no-op
 }
+long hy_getcwd(char *buf, unsigned long size) { (void)buf;(void)size; return -1; }
+long hy_getenv(const char *name, char *buf, unsigned long buf_len) { (void)name;(void)buf;(void)buf_len; return -1; }

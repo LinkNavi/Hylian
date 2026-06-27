@@ -162,7 +162,7 @@ if [ "$NO_BUILD" -eq 0 ]; then
             cd compiler
             bison -d parser.y 2>/dev/null
             flex lexer.l 2>/dev/null
-            gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c codegen_termina.c typecheck.c compiler.c -o ../hylian
+            gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c typecheck.c compiler.c -o ../hylian
         )
         if [ $? -ne 0 ]; then
             fail "Compiler build failed — aborting install."
