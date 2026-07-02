@@ -159,17 +159,6 @@ static const char *type_name(Type t) {
         snprintf(buf, sizeof(buf), "multi<...>");
         return buf;
     }
-    if (t.kind == TYPE_TUPLE) {
-        char tmp[256] = "(";
-        for (int i = 0; i < t.elem_type_count; i++) {
-            if (i > 0) strncat(tmp, ", ", sizeof(tmp) - strlen(tmp) - 1);
-            strncat(tmp, t.elem_types[i].name ? t.elem_types[i].name : "?",
-                    sizeof(tmp) - strlen(tmp) - 1);
-        }
-        strncat(tmp, ")", sizeof(tmp) - strlen(tmp) - 1);
-        snprintf(buf, sizeof(buf), "%s", tmp);
-        return buf;
-    }
     if (t.name) return t.name;
     return "unknown";
 }
@@ -468,16 +457,6 @@ static Type infer_expr(ASTNode *node) {
         break;
     }
 
-    case NODE_TUPLE: {
-        TupleNode *tn = (TupleNode *)node;
-        Type *elem_types = malloc(tn->elem_count * sizeof(Type));
-        for (int i = 0; i < tn->elem_count; i++)
-            elem_types[i] = infer_expr(tn->elements[i]);
-        result = make_tuple_type(elem_types, tn->elem_count);
-        free(elem_types);
-        break;
-    }
-
     case NODE_INDEX: {
         IndexNode *in_node = (IndexNode *)node;
         Type obj_type = infer_expr(in_node->object);
@@ -639,12 +618,6 @@ static void infer_stmt(ASTNode *node) {
         MemberAssignNode *ma = (MemberAssignNode *)node;
         if (ma->object) infer_expr(ma->object);
         infer_expr(ma->value);
-        break;
-    }
-
-    case NODE_DEFER: {
-        DeferNode *dn = (DeferNode *)node;
-        if (dn->expr) infer_expr(dn->expr);
         break;
     }
 

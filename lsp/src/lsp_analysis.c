@@ -155,20 +155,6 @@ static void type_to_str(Type t, char *buf, int bufsz)
         else
             snprintf(buf, bufsz, "multi<...>");
     }
-    else if (t.kind == TYPE_TUPLE)
-    {
-        char tmp[256] = "(";
-        for (int i = 0; i < t.elem_type_count; i++)
-        {
-            char et[64];
-            type_to_str(t.elem_types[i], et, sizeof(et));
-            if (i > 0)
-                strncat(tmp, ", ", sizeof(tmp) - strlen(tmp) - 1);
-            strncat(tmp, et, sizeof(tmp) - strlen(tmp) - 1);
-        }
-        strncat(tmp, ")", sizeof(tmp) - strlen(tmp) - 1);
-        snprintf(buf, bufsz, "%s%s", tmp, t.nullable ? "?" : "");
-    }
     else
     {
         snprintf(buf, bufsz, "%s%s",

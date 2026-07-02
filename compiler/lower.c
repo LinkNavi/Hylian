@@ -1220,16 +1220,6 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         return t;
     }
 
-    case NODE_TUPLE: {
-        TupleNode *tup = (TupleNode *)node;
-        /* Lower each element; return the last one (tuples are simple here) */
-        int t = -1;
-        for (int i = 0; i < tup->elem_count; i++)
-            t = lower_expr(tup->elements[i], s);
-        if (t < 0) { t = alloc_temp(s); ir_emit(s->mod, IR_CONST_NIL)->dest = irop_temp(t); }
-        return t;
-    }
-
     case NODE_STRUCT_LITERAL: {
         StructLiteralNode *sl = (StructLiteralNode *)node;
         /* Allocate a hidden named stack slot for the struct */
@@ -1654,10 +1644,6 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         ins->str_extra = strdup(ab->body);
         break;
     }
-
-    case NODE_DEFER:
-        ir_emit(s->mod, IR_NOP);
-        break;
 
     case NODE_STATIC_VAR: {
 

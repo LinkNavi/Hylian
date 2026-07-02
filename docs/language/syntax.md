@@ -1019,45 +1019,6 @@ for (int i = 0; i < 4; i++) {
 
 ---
 
-## Tuples and Multi-Value Returns
-
-A function can return more than one value by declaring a tuple return type. Tuple types are written as a parenthesised, comma-separated list of types:
-
-```hylian
-(int, int) divmod(int a, int b) {
-    return a / b, a % b;
-}
-```
-
-The caller receives a tuple value and can access its fields by index:
-
-```hylian
-(int, int) result = divmod(17, 5);
-int quotient  = result.0;    // 3
-int remainder = result.1;    // 2
-```
-
-Tuples can hold more than two elements:
-
-```hylian
-(str, int, bool) describe(int n) {
-    if (n > 0) { return "positive", n, true; }
-    return "non-positive", n, false;
-}
-```
-
-Tuple literals can also appear as local values:
-
-```hylian
-(int, str) pair = (42, "hello");
-int  num  = pair.0;
-str  text = pair.1;
-```
-
-> **Coming from Go?** Multi-value returns in Go (`return a, b`) work the same way in Hylian. The main difference is that Hylian makes the tuple type explicit in the signature.
-
----
-
 ## Bitwise Operators
 
 Hylian supports all six standard bitwise operators. They operate on integer types (`int`, `uint8`–`uint64`, `usize`, `isize`).

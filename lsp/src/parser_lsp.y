@@ -90,7 +90,7 @@ void typelist_add(TypeList* l, Type t) {
 
 %token INCLUDE CLASS PUBLIC PRIVATE IF ELSE RETURN NEW NIL TRUE_LIT FALSE_LIT
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
-%token DEFER UNSAFE CONST STATIC EXTERN AMP ENUM
+%token UNSAFE CONST STATIC AMP ENUM
 %token VOLATILE PACKED NAKED USIZE ISIZE UNION_KW
 %token TILDE LSHIFT RSHIFT XOR CAST SIZE_OF AS
 %token MODULE
@@ -117,10 +117,10 @@ void typelist_add(TypeList* l, Type t) {
 %type <method_node> method_decl
 %type <func_node> func_decl
 %type <field_node> field_decl
-%type <type_node> type nullable_type
+%type <type_node> type
 %type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
 %type <node> static_var_decl enum_decl enum_body
-%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list tuple_type_items switch_arms
+%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list switch_arms
 %type <node_list> module_body
 %type <node> module_member
 %type <node> include_path
@@ -653,27 +653,6 @@ args:
     | args COMMA expr { NodeList* l=(NodeList*)$1; list_add(l,$3); $$=l; }
     ;
 
-/* nullable_type: a type with an optional trailing '?' */
-nullable_type:
-    type              { $$ = $1; }
-    | type QUESTION   { Type t = $1; t.nullable = 1; $$ = t; }
-    ;
-
-/* tuple_type_items: at least two nullable_type separated by commas, stored as TypeList* */
-tuple_type_items:
-    nullable_type COMMA nullable_type {
-        TypeList* tl = typelist_new();
-        typelist_add(tl, $1);
-        typelist_add(tl, $3);
-        $$ = (void*)tl;
-    }
-    | tuple_type_items COMMA nullable_type {
-        TypeList* tl = (TypeList*)$1;
-        typelist_add(tl, $3);
-        $$ = (void*)tl;
-    }
-    ;
-
 /* union_types: pipe-separated list of types for multi<A | B | ...>
    We reuse void* node_list slot but store a TypeList* instead */
 union_types:
@@ -718,12 +697,6 @@ type:
     | MULTI LT union_types COMMA NUMBER GT {
         TypeList* tl = (TypeList*)$3;
         $$ = make_multi_type(tl->items, tl->count, 0, $5);
-        free(tl->items); free(tl);
-    }
-    /* tuple type: (A, B) or (A?, B, C) etc. */
-    | LPAREN tuple_type_items RPAREN {
-        TypeList* tl = (TypeList*)$2;
-        $$ = make_tuple_type(tl->items, tl->count);
         free(tl->items); free(tl);
     }
     ;
@@ -779,7 +752,6 @@ stmt:
     | VOLATILE STAR expr SEMICOLON {
         $$ = (ASTNode*)make_unary_op("deref", $3, 0); SET_LINE($$);
     }
-    | DEFER expr SEMICOLON { $$ = (ASTNode*)make_defer($2); SET_LINE($$); }
     | expr SEMICOLON { $$ = $1; }
     /* := declare-assign (type inferred as auto) */
     | IDENTIFIER DECLARE_ASSIGN expr SEMICOLON {
@@ -897,17 +869,6 @@ var_decl:
 
 return_stmt:
     RETURN expr SEMICOLON { $$ = (ASTNode*)make_return($2); SET_LINE($$); }
-    | RETURN expr COMMA args SEMICOLON {
-        NodeList* al = (NodeList*)$4;
-        int total = 1 + al->count;
-        ASTNode **elems = malloc(total * sizeof(ASTNode*));
-        elems[0] = $2;
-        for (int i = 0; i < al->count; i++) elems[i+1] = al->items[i];
-        free(al->items); free(al);
-        ASTNode* tup = (ASTNode*)make_tuple(elems, total);
-        free(elems);
-        $$ = (ASTNode*)make_return(tup); SET_LINE($$);
-    }
     | RETURN SEMICOLON    { $$ = (ASTNode*)make_return(NULL); SET_LINE($$); }
     ;
 
@@ -1015,18 +976,6 @@ expr:
     | expr INC          { $$ = (ASTNode*)make_unary_op("++", $1, 1); SET_LINE($$); }
     | expr DEC          { $$ = (ASTNode*)make_unary_op("--", $1, 1); SET_LINE($$); }
     | LPAREN expr RPAREN { $$ = $2; }
-    /* tuple literal: (a, b) or (a, b, c, ...) */
-    | LPAREN expr COMMA args RPAREN {
-        NodeList* al = (NodeList*)$4;
-        int total = 1 + al->count;
-        ASTNode **elems = malloc(total * sizeof(ASTNode*));
-        elems[0] = $2;
-        for (int i = 0; i < al->count; i++) elems[i+1] = al->items[i];
-        free(al->items); free(al);
-        $$ = (ASTNode*)make_tuple(elems, total);
-        free(elems);
-        SET_LINE($$);
-    }
     ;
 
 %%

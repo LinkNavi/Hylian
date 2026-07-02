@@ -56,7 +56,7 @@ header "Building Hylian Compiler"
 cd compiler
 bison -d parser.y   2>/dev/null
 flex lexer.l        2>/dev/null
-gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c typecheck.c compiler.c \
+gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c codegen_elf.c typecheck.c compiler.c \
     -o ../hylian 2>&1
 if [ $? -ne 0 ]; then
     echo -e "${RED}✗ Compiler build failed — aborting.${NC}"
@@ -95,6 +95,7 @@ resolve_runtime_obj "runtime/std/io"      "io_runtime.o"
 resolve_runtime_obj "runtime/std/errors"  "errors_runtime.o"
 resolve_runtime_obj "runtime/std/strings" "strings_runtime.o"
 resolve_runtime_obj "runtime/platform/linux" "platform_runtime.o"
+resolve_runtime_obj "runtime/std/mem" "mem_runtime.o"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IR dump test runner (checks stderr output from --dump-ir, no linking needed)
@@ -186,7 +187,7 @@ run_test() {
     fi
 
     # Link
-    gcc "$obj_file" io_runtime.o errors_runtime.o strings_runtime.o platform_runtime.o \
+    gcc "$obj_file" io_runtime.o errors_runtime.o strings_runtime.o platform_runtime.o mem_runtime.o \
         "${extra_objs[@]}" -o "$bin_file" -no-pie 2>/tmp/link_err
     if [ $? -ne 0 ]; then
         fail_msg "$desc"
@@ -237,7 +238,7 @@ run_test_exit() {
     fi
 
     nasm -felf64 "$asm_file" -o "$obj_file" 2>/dev/null
-    gcc "$obj_file" io_runtime.o errors_runtime.o strings_runtime.o platform_runtime.o \
+    gcc "$obj_file" io_runtime.o errors_runtime.o strings_runtime.o platform_runtime.o mem_runtime.o \
         -o "$bin_file" -no-pie 2>/dev/null
 
     "./$bin_file" >/dev/null 2>&1

@@ -152,7 +152,7 @@ void typelist_add(TypeList* l, Type t) {
 %type <method_node> method_decl
 %type <func_node> func_decl
 %type <field_node> field_decl
-%type <type_node> type nullable_type
+%type <type_node> type
 %type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
 %type <node_list> class_body stmt_list param_list params arg_list args union_types include_list switch_arms field_init_list
 %type <node> include_path
@@ -723,27 +723,6 @@ args:
     | args COMMA expr { NodeList* l=(NodeList*)$1; list_add(l,$3); $$=l; }
     ;
 
-/* nullable_type: a type with an optional trailing '?' */
-nullable_type:
-    type              { $$ = $1; }
-    | type QUESTION   { Type t = $1; t.nullable = 1; $$ = t; }
-    ;
-
-/* tuple_type_items: at least two nullable_type separated by commas, stored as TypeList* */
-tuple_type_items:
-    nullable_type COMMA nullable_type {
-        TypeList* tl = typelist_new();
-        typelist_add(tl, $1);
-        typelist_add(tl, $3);
-        $$ = (void*)tl;
-    }
-    | tuple_type_items COMMA nullable_type {
-        TypeList* tl = (TypeList*)$1;
-        typelist_add(tl, $3);
-        $$ = (void*)tl;
-    }
-    ;
-
 /* union_types: pipe-separated list of types for multi<A | B | ...>
    We reuse void* node_list slot but store a TypeList* instead */
 union_types:
@@ -790,12 +769,6 @@ type:
         $$ = make_multi_type(tl->items, tl->count, 0, $5);
         free(tl->items); free(tl);
     }
-    /* tuple type: (A, B) or (A?, B, C) etc. */
-    | LPAREN tuple_type_items RPAREN {
-        TypeList* tl = (TypeList*)$2;
-        $$ = make_tuple_type(tl->items, tl->count);
-        free(tl->items); free(tl);
-    }
     ;
 
 stmt_list:
@@ -834,7 +807,6 @@ stmt:
     $$ = (ASTNode*)make_unsafe_block(sl->items, sl->count);
     free(sl);
 }
-    | DEFER expr SEMICOLON { $$ = (ASTNode*)make_defer($2); }
     | expr SEMICOLON { $$ = $1; }
     /* volatile write: volatile *lhs = rhs; */
     | VOLATILE STAR expr ASSIGN expr SEMICOLON {
@@ -967,17 +939,6 @@ var_decl:
 
 return_stmt:
     RETURN expr SEMICOLON { $$ = (ASTNode*)make_return($2); }
-    | RETURN expr COMMA args SEMICOLON {
-        NodeList* al = (NodeList*)$4;
-        int total = 1 + al->count;
-        ASTNode **elems = malloc(total * sizeof(ASTNode*));
-        elems[0] = $2;
-        for (int i = 0; i < al->count; i++) elems[i+1] = al->items[i];
-        free(al->items); free(al);
-        ASTNode* tup = (ASTNode*)make_tuple(elems, total);
-        free(elems);
-        $$ = (ASTNode*)make_return(tup);
-    }
     | RETURN SEMICOLON    { $$ = (ASTNode*)make_return(NULL); }
     ;
 
@@ -1105,17 +1066,6 @@ expr:
         }
         free(fl->items); free(fl);
         $$ = (ASTNode*)sl;
-    }
-    /* tuple literal: (a, b) or (a, b, c, ...) */
-    | LPAREN expr COMMA args RPAREN {
-        NodeList* al = (NodeList*)$4;
-        int total = 1 + al->count;
-        ASTNode **elems = malloc(total * sizeof(ASTNode*));
-        elems[0] = $2;
-        for (int i = 0; i < al->count; i++) elems[i+1] = al->items[i];
-        free(al->items); free(al);
-        $$ = (ASTNode*)make_tuple(elems, total);
-        free(elems);
     }
     ;
 

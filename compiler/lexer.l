@@ -117,11 +117,9 @@ static char *strip_underscores(const char *s) {
 "switch"            { return SWITCH; }
 "case"              { return CASE; }
 "default"           { return DEFAULT; }
-"defer"             { return DEFER; }
 "unsafe"            { return UNSAFE; }
 "const"             { return CONST; }
 "static"            { return STATIC; }
-"extern"            { return EXTERN; }
 "void"              { return VOID; }
 "bool"              { return BOOL; }
 "volatile"          { return VOLATILE; }

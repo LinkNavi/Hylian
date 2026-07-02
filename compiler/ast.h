@@ -28,14 +28,12 @@ typedef enum {
     NODE_CONTINUE,
     NODE_ASSIGN,
     NODE_COMPOUND_ASSIGN,
-    NODE_DEFER,
     NODE_INTERP_STRING,
     NODE_ARRAY_LITERAL,
     NODE_INDEX,
     NODE_INDEX_ASSIGN,
     NODE_ASM_BLOCK,
     NODE_UNSAFE,    /* unsafe { ... } block */
-    NODE_TUPLE,     /* tuple literal: (a, b, c) */
     NODE_ENUM,      /* enum Color { Red, Green, Blue } */
     NODE_SWITCH,    /* switch (expr) { case v: { } ... default: { } } */
     NODE_CASE,      /* one arm of a switch: case value: { body } or default: { body } */
@@ -48,7 +46,7 @@ typedef enum {
     TYPE_SIMPLE,   /* int, str, bool, void, Error, ClassName */
     TYPE_ARRAY,    /* array<T> or array<T, N> */
     TYPE_MULTI,    /* multi<A | B | ...> or multi<any> with optional N */
-    TYPE_TUPLE,    /* (A, B, ...) — tuple return type */
+    /* (no tuple type — removed, was unimplemented) */
 TYPE_REF,
 TYPE_RAWPTR,
 } TypeKind;
@@ -271,12 +269,6 @@ typedef struct {
 typedef struct { ASTNode base; char *header; } CppIncludeNode;
 typedef struct { ASTNode base; ASTNode *value; } ReturnNode;
 
-typedef struct {
-    ASTNode base;
-    ASTNode **elements;
-    int elem_count;
-} TupleNode;
-typedef struct { ASTNode base; ASTNode *expr; } DeferNode;
 typedef struct { ASTNode base; } BreakNode;
 typedef struct { ASTNode base; } ContinueNode;
 typedef struct { ASTNode base; char *body; } AsmBlockNode;
@@ -350,7 +342,6 @@ MethodCallNode *make_method_call(ASTNode *obj, char *method);
 FuncCallNode *make_func_call(char *name);
 NewNode *make_new(char *class_name);
 InterpStringNode *make_interp_string(const char *raw); /* raw = full string with quotes */
-DeferNode *make_defer(ASTNode *expr);
 BreakNode *make_break();
 ContinueNode *make_continue();
 UnsafeBlockNode *make_unsafe_block(ASTNode **body, int body_count);
@@ -375,11 +366,9 @@ SwitchNode *make_switch(ASTNode *subject);
 ArrayLiteralNode *make_array_literal(ASTNode **elems, int count);
 IndexNode *make_index(ASTNode *object, ASTNode *index);
 IndexAssignNode *make_index_assign(ASTNode *object, ASTNode *index, ASTNode *value);
-TupleNode *make_tuple(ASTNode **elems, int count);
 Type make_simple_type(char *name, int nullable);
 Type make_array_type(Type elem, int fixed_size);
 Type make_multi_type(Type *elems, int count, int is_any, int fixed_size);
-Type make_tuple_type(Type *elems, int count);
 Type make_ref_type(Type inner);
 Type make_rawptr_type(Type inner);
 ModuleNode *make_module(char *name);

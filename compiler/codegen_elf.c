@@ -1483,24 +1483,55 @@ static void codegen_instr(ElfCtx *ctx, IRInstr *ins) {
     case IR_PRINTLN: {
         int is_nl = (ins->op == IR_PRINTLN);
         int arg_type = ins->extra_int;
-        if (arg_type == 1 /* STR_LIT */ || arg_type == 4 /* STR_PTR */) {
-            if (ins->src1.kind == IROP_CONST_STR) {
-                const char *lbl = rodata_str_label(ctx, ins->src1.str_val ? ins->src1.str_val : "");
-                emit_lea_sym(ctx, REG_RDI, lbl);
-            } else {
-                load_operand_rax(ctx, ins->src1);
-                emit_mov_rr(b, REG_RDI, REG_RAX);
-            }
-            emit_call_sym(ctx, is_nl ? "hylian_println_str" : "hylian_print_str");
-        } else if (arg_type == 2 /* INT */) {
-            load_operand_rax(ctx, ins->src1);
-            emit_mov_rr(b, REG_RDI, REG_RAX);
-            emit_call_sym(ctx, is_nl ? "hylian_println_int" : "hylian_print_int");
-        } else {
-            load_operand_rax(ctx, ins->src1);
-            emit_mov_rr(b, REG_RDI, REG_RAX);
-            emit_call_sym(ctx, is_nl ? "hylian_println" : "hylian_print");
+        int popped_scratch = 0;
+
+        switch (arg_type) {
+        case PRINT_ARG_STR_LIT: {
+            const char *sv = ins->src1.str_val ? ins->src1.str_val : "";
+            const char *lbl = rodata_str_label(ctx, sv);
+            emit_lea_sym(ctx, REG_RDI, lbl);
+            emit_mov_ri64(b, REG_RSI, (int64_t)strlen(sv));
+            break;
         }
+        case PRINT_ARG_INT: {
+            /* hylian_int_to_str(val, buf, bufsz) -> length in rax;
+               buf is a 32-byte scratch slot on the stack (mirrors codegen_asm.c) */
+            load_operand_rax(ctx, ins->src1);
+            emit_sub_ri(b, REG_RSP, 32);
+            emit_mov_rr(b, REG_RDI, REG_RAX);
+            emit_mov_rr(b, REG_RSI, REG_RSP);
+            emit_mov_ri32(b, REG_RDX, 32);
+            emit_call_sym(ctx, "hylian_int_to_str");
+            emit_mov_rr(b, REG_RSI, REG_RAX);  /* length */
+            emit_mov_rr(b, REG_RDI, REG_RSP);  /* buf ptr */
+            popped_scratch = 1;
+            break;
+        }
+        case PRINT_ARG_STR_PTR: {
+            load_operand_rax(ctx, ins->src1);
+            emit_push(b, REG_RAX);
+            emit_mov_rr(b, REG_RDI, REG_RAX);
+            emit_call_sym(ctx, "strlen");
+            emit_mov_rr(b, REG_RSI, REG_RAX);  /* length */
+            emit_pop(b, REG_RDI);              /* ptr */
+            break;
+        }
+        default:
+            /* PRINT_ARG_FLOAT / PRINT_ARG_INTERP: not yet supported by the
+               direct-ELF backend (no XMM/interp-segment codegen here yet).
+               Fall back to printing nothing rather than emitting a bad call. */
+            {
+                const char *lbl = rodata_str_label(ctx, "");
+                emit_lea_sym(ctx, REG_RDI, lbl);
+                emit_mov_ri64(b, REG_RSI, 0);
+            }
+            break;
+        }
+
+        emit_call_sym(ctx, is_nl ? "hylian_println" : "hylian_print");
+
+        if (popped_scratch)
+            emit_add_ri(b, REG_RSP, 32);
         break;
     }
 
@@ -1611,6 +1642,21 @@ static int write_elf(ElfCtx *ctx, const char *outfile) {
 
     int first_global_idx = 6; /* undef + file + 4 section syms */
 
+    /* Resolve BSS symbols (section + offset) BEFORE serializing the local/
+       global symbol loops below — those loops write Elf64_Sym entries by
+       value, so any symbol whose section/value isn't finalized yet gets
+       serialized as SHN_UNDEF and never fixed up. */
+    size_t bss_offset = 0;
+    for (int i = 0; i < ctx->bss_sym_count; i++) {
+        Sym *s = sym_get_or_add(&ctx->syms, ctx->bss_syms[i].name);
+        s->section   = 4; /* bss */
+        s->value     = bss_offset;
+        s->sym_type  = STT_OBJECT;
+        s->is_global = 1;
+        s->st_size_dummy = ctx->bss_syms[i].size;
+        bss_offset  += ctx->bss_syms[i].size;
+    }
+
     /* Local user symbols */
     int local_sym_count = first_global_idx;
     for (int i = 0; i < ctx->syms.count; i++) {
@@ -1625,7 +1671,7 @@ static int write_elf(ElfCtx *ctx, const char *outfile) {
             .st_other = STV_DEFAULT,
             .st_shndx = s->section == 0 ? SHN_UNDEF : shndx,
             .st_value = s->value,
-            .st_size  = 0,
+            .st_size  = s->st_size_dummy,
         };
         s->elf_index = local_sym_count++;
         buf_write(&symtab_buf, &es, sizeof(es));
@@ -1645,7 +1691,7 @@ static int write_elf(ElfCtx *ctx, const char *outfile) {
             .st_other = STV_DEFAULT,
             .st_shndx = shndx,
             .st_value = s->value,
-            .st_size  = 0,
+            .st_size  = s->st_size_dummy,
         };
         s->elf_index = local_sym_count++;
         buf_write(&symtab_buf, &es, sizeof(es));
@@ -1691,27 +1737,6 @@ static int write_elf(ElfCtx *ctx, const char *outfile) {
             .r_addend = r->addend,
         };
         buf_write(&rela_buf, &rela, sizeof(rela));
-    }
-
-    /* ── BSS symbols ── */
-    size_t bss_offset = 0;
-    for (int i = 0; i < ctx->bss_sym_count; i++) {
-        Sym *s = sym_get_or_add(&ctx->syms, ctx->bss_syms[i].name);
-        s->section   = 4; /* bss */
-        s->value     = bss_offset;
-        s->sym_type  = STT_OBJECT;
-        s->is_global = 1;
-        bss_offset  += ctx->bss_syms[i].size;
-        Elf64_Sym es = {
-            .st_name  = strtab_add(&strtab, ctx->bss_syms[i].name),
-            .st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT),
-            .st_other = STV_DEFAULT,
-            .st_shndx = bss_shndx,
-            .st_value = s->value,
-            .st_size  = ctx->bss_syms[i].size,
-        };
-        s->elf_index = local_sym_count++;
-        buf_write(&symtab_buf, &es, sizeof(es));
     }
 
     /* ── Compute section offsets ── */

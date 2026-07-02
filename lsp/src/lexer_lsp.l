@@ -91,11 +91,9 @@ static int has_interpolation(const char *s) {
 "switch"            { return SWITCH; }
 "case"              { return CASE; }
 "default"           { return DEFAULT; }
-"defer"             { return DEFER; }
 "unsafe"            { return UNSAFE; }
 "const"             { return CONST; }
 "static"            { return STATIC; }
-"extern"            { return EXTERN; }
 "enum"              { return ENUM; }
 "union"             { return UNION_KW; }
 "void"              { return VOID; }

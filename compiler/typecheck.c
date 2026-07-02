@@ -674,13 +674,6 @@ static void infer_stmt(ASTNode *node) {
     break;
   }
 
-  case NODE_DEFER: {
-    DeferNode *dn = (DeferNode *)node;
-    if (dn->expr)
-      infer_expr(dn->expr);
-    break;
-  }
-
   case NODE_SWITCH: {
     SwitchNode *sw = (SwitchNode *)node;
     infer_expr(sw->subject);
