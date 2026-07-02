@@ -91,8 +91,8 @@ void typelist_add(TypeList* l, Type t) {
 %token INCLUDE CLASS PUBLIC PRIVATE IF ELSE RETURN NEW NIL TRUE_LIT FALSE_LIT
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
 %token DEFER UNSAFE CONST STATIC EXTERN AMP ENUM
-%token VOLATILE PACKED NAKED USIZE ISIZE
-%token TILDE LSHIFT RSHIFT XOR CAST SIZE_OF
+%token VOLATILE PACKED NAKED USIZE ISIZE UNION_KW
+%token TILDE LSHIFT RSHIFT XOR CAST SIZE_OF AS
 %token MODULE
 %token INT STRING ERROR BOOL
 %token <str> ASM_BLOCK
@@ -135,6 +135,7 @@ void typelist_add(TypeList* l, Type t) {
 %left AMP
 %left EQ NE
 %left LT GT LE GE
+%left AS
 %left LSHIFT RSHIFT
 %left PLUS MINUS
 %left STAR SLASH MOD
@@ -471,6 +472,39 @@ class_decl:
         }
         free(body->items); free(body);
     }
+    /* union class variants */
+    | UNION_KW CLASS IDENTIFIER LBRACE class_body RBRACE {
+        $$ = make_class($3, 0); $$->is_union = 1;
+        NodeList* body = (NodeList*)$5;
+        for (int i = 0; i < body->count; i++) {
+            ASTNode* m = body->items[i];
+            if (m->type == NODE_FIELD) {
+                $$->fields = realloc($$->fields, ($$->field_count+1)*sizeof(FieldNode*));
+                $$->fields[$$->field_count++] = (FieldNode*)m;
+            } else if (m->type == NODE_METHOD) {
+                $$->methods = realloc($$->methods, ($$->method_count+1)*sizeof(MethodNode*));
+                $$->methods[$$->method_count++] = (MethodNode*)m;
+            }
+        }
+        free(body->items); free(body);
+    }
+    | PUBLIC UNION_KW CLASS IDENTIFIER LBRACE class_body RBRACE {
+        $$ = make_class($4, 1); $$->is_union = 1;
+        NodeList* body = (NodeList*)$6;
+        for (int i = 0; i < body->count; i++) {
+            ASTNode* m = body->items[i];
+            if (m->type == NODE_FIELD) {
+                $$->fields = realloc($$->fields, ($$->field_count+1)*sizeof(FieldNode*));
+                $$->fields[$$->field_count++] = (FieldNode*)m;
+            } else if (m->type == NODE_METHOD) {
+                $$->methods = realloc($$->methods, ($$->method_count+1)*sizeof(MethodNode*));
+                $$->methods[$$->method_count++] = (MethodNode*)m;
+            }
+        }
+        free(body->items); free(body);
+    }
+    | UNION_KW CLASS IDENTIFIER LBRACE RBRACE        { $$ = make_class($3, 0); $$->is_union = 1; }
+    | PUBLIC UNION_KW CLASS IDENTIFIER LBRACE RBRACE { $$ = make_class($4, 1); $$->is_union = 1; }
     ;
 
 module_decl:
@@ -951,6 +985,13 @@ expr:
     | expr RSHIFT expr { $$ = (ASTNode*)make_binary_op(">>", $1, $3); SET_LINE($$); }
     /* bitwise unary */
     | TILDE expr       { $$ = (ASTNode*)make_unary_op("~", $2, 0); SET_LINE($$); }
+    /* postfix cast: expr as Type */
+    | expr AS type %prec AS {
+        char *tname = $3.name ? strdup($3.name) : strdup("void");
+        ASTNode *type_node = (ASTNode*)make_literal(tname, LIT_STRING);
+        free(tname);
+        $$ = (ASTNode*)make_binary_op("cast", $1, type_node); SET_LINE($$);
+    }
     /* cast */
     | CAST LT type GT LPAREN expr RPAREN {
         char *tname = $3.name ? strdup($3.name) : strdup("void");

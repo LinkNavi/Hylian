@@ -5,7 +5,7 @@
 # Installs:
 #   /usr/local/bin/hylian               — compiler binary
 #   /usr/local/bin/linkle               — build system wrapper
-#   /usr/local/lib/hylian/std/          — stdlib .o and .hyi files
+#   /usr/local/lib/hylian/std/          — stdlib .o, .hyi, and .hy files
 #   /usr/local/lib/hylian/std/platform/ — platform .o files (linux, kernel, limine…)
 #   /usr/local/lib/hylian/linkle.py     — build system source
 #
@@ -162,7 +162,7 @@ if [ "$NO_BUILD" -eq 0 ]; then
             cd compiler
             bison -d parser.y 2>/dev/null
             flex lexer.l 2>/dev/null
-            gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c typecheck.c compiler.c -o ../hylian
+            gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c codegen_elf.c typecheck.c compiler.c -o ../hylian
         )
         if [ $? -ne 0 ]; then
             fail "Compiler build failed — aborting install."
@@ -285,6 +285,24 @@ while IFS= read -r -d '' hyi; do
 done < <(find ./runtime/std -name "*.hyi" -print0)
 
 ok "Copied ${hyi_copied} .hyi interface files → ${STD_DIR}"
+
+# Copy every .hy source file (so the compiler can rebuild from source)
+hy_copied=0
+while IFS= read -r -d '' hy; do
+    rel="${hy#./runtime/std/}"
+    dest="${STD_DIR}/${rel}"
+    dest_dir="$(dirname "$dest")"
+
+    if [ ! -d "$dest_dir" ]; then
+        maybe_sudo "$STD_DIR" -- mkdir -p "$dest_dir"
+    fi
+
+    maybe_sudo "$dest_dir" -- cp "$hy" "$dest"
+    [ "$VERBOSE" -eq 1 ] && dim "hy   $rel"
+    hy_copied=$((hy_copied + 1))
+done < <(find ./runtime/std -name "*.hy" -print0)
+
+ok "Copied ${hy_copied} .hy source files → ${STD_DIR}"
 
 # ── Step 6: Install platform objects ──────────────────────────────────────────
 #

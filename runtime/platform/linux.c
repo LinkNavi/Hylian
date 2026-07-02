@@ -130,3 +130,25 @@ long hy_getenv(const char *name, char *buf, hy_size buf_len) {
     }
     return -1;
 }
+
+/* ── process spawning ────────────────────────────────────────────────────── */
+
+long hy_fork(void) {
+    return sc3(57, 0, 0, 0);
+}
+
+long hy_execve(const char *path, char *const argv[], char *const envp[]) {
+    return sc3(59, (long)path, (long)argv, (long)envp);
+}
+
+long hy_waitpid(long pid, int *status, int options) {
+    return sc3(61, pid, (long)status, options);
+}
+
+long hy_pipe(int fds[2]) {
+    return sc3(293, (long)fds, 0, 0);
+}
+
+long hy_dup2(int oldfd, int newfd) {
+    return sc3(33, oldfd, newfd, 0);
+}

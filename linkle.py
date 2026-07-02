@@ -41,10 +41,9 @@ NASM_FORMATS = {
     "windows": "win64",
     "kernel": "elf64",
     "limine": "elf64",
-    "termina": "bin",
 }
 
-VALID_TARGETS = ("linux", "macos", "windows", "kernel", "limine", "termina")
+VALID_TARGETS = ("linux", "macos", "windows", "kernel", "limine", "elf")
 
 REGISTRY_URL = os.environ.get("HYLIAN_REGISTRY", "https://hylian.lol")
 
@@ -678,6 +677,11 @@ STD_MODULES = [
         "stem": os.path.join("system", "env"),
         "link_libs": [],
     },
+    {
+        "include": "std.process",
+        "stem": "process",
+        "link_libs": [],
+    },
     {"include": "std.crypto", "stem": "crypto", "link_libs": ["-lssl", "-lcrypto"]},
     {
         "include": "std.networking.tcp",
@@ -720,11 +724,16 @@ def _runtime_obj(stem_rel, target, verbose):
 
     for stem in candidates:
         obj_path = stem + ".o"
+        hy_path = stem + ".hy"
         c_path = stem + ".c"
         asm_path = stem + ".asm"
 
+        # Pre-built .o — use if fresh relative to all sources
         if os.path.exists(obj_path):
-            if _is_fresh(obj_path, c_path) and _is_fresh(obj_path, asm_path):
+            fresh = _is_fresh(obj_path, hy_path)
+            fresh = fresh and _is_fresh(obj_path, c_path)
+            fresh = fresh and _is_fresh(obj_path, asm_path)
+            if fresh:
                 try:
                     rel = os.path.relpath(obj_path)
                 except:
@@ -732,6 +741,40 @@ def _runtime_obj(stem_rel, target, verbose):
                 dim(f"pre-built  {rel}")
                 return obj_path
 
+        # Prefer .hy (Hylian source) — compile with the Hylian compiler
+        if os.path.exists(hy_path):
+            try:
+                rel = os.path.relpath(hy_path)
+            except:
+                rel = hy_path
+            hylian_bin = _find_hylian_bin()
+            std_dir = os.path.join(runtime_dir, "std")
+            if not os.path.isdir(std_dir):
+                std_dir = runtime_dir
+            asm_out = stem + ".asm"
+            compile_cmd = [
+                hylian_bin,
+                hy_path,
+                "-o",
+                asm_out,
+                "--src-dir",
+                std_dir,
+                "--target",
+                target,
+            ]
+            if target in ("kernel", "limine"):
+                compile_cmd.append("--freestanding")
+            _run(compile_cmd, verbose, label=f"HY   {rel}")
+            # Assemble the generated .asm → .o
+            fmt = NASM_FORMATS.get(target, "elf64")
+            _run(
+                ["nasm", "-f", fmt, "-w-label-redef-late", asm_out, "-o", obj_path],
+                verbose,
+                label=f"ASM  {os.path.relpath(asm_out)}",
+            )
+            return obj_path
+
+        # Fallback: .c (C source) — compile with gcc
         if os.path.exists(c_path):
             try:
                 rel = os.path.relpath(c_path)
@@ -757,6 +800,7 @@ def _runtime_obj(stem_rel, target, verbose):
             )
             return obj_path
 
+        # Last resort: .asm — assemble with nasm
         if os.path.exists(asm_path):
             try:
                 rel = os.path.relpath(asm_path)

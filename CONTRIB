@@ -1,0 +1,7 @@
+Be sure to follow existing code formats
+
+Hylian syntax is documented in the Docs/ dir
+
+Be sure to make or add on to an existing test script to verify completion
+
+If you are going to stub a feature list and document the stub in the STUBS file

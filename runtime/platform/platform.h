@@ -18,4 +18,11 @@ int      hy_mkdir(const char *path, int mode);
 long     hy_getcwd(char *buf, hy_size size);
 long     hy_getenv(const char *name, char *buf, hy_size buf_len);
 
+/* process spawning */
+long     hy_fork(void);
+long     hy_execve(const char *path, char *const argv[], char *const envp[]);
+long     hy_waitpid(long pid, int *status, int options);
+long     hy_pipe(int fds[2]);
+long     hy_dup2(int oldfd, int newfd);
+
 #endif

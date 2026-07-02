@@ -8,7 +8,7 @@
 # Installs:
 #   /usr/local/bin/hylian               — compiler binary
 #   /usr/local/bin/linkle               — build system wrapper
-#   /usr/local/lib/hylian/std/          — stdlib .o and .hyi files
+#   /usr/local/lib/hylian/std/          — stdlib .o, .hyi, and .hy files
 #   /usr/local/lib/hylian/linkle.py     — build system source
 #
 # Usage:
@@ -333,6 +333,18 @@ while IFS= read -r -d '' hyi; do
     hyi_copied=$((hyi_copied + 1))
 done < <(find "${RUNTIME_SRC}/std" -name "*.hyi" -print0 2>/dev/null)
 
+hy_copied=0
+while IFS= read -r -d '' hy; do
+    rel="${hy#${RUNTIME_SRC}/std/}"
+    dest="${STD_DIR}/${rel}"
+    dest_dir="$(dirname "$dest")"
+    if [ ! -d "$dest_dir" ]; then
+        maybe_sudo "$STD_DIR" -- mkdir -p "$dest_dir"
+    fi
+    maybe_sudo "$dest_dir" -- cp "$hy" "$dest"
+    hy_copied=$((hy_copied + 1))
+done < <(find "${RUNTIME_SRC}/std" -name "*.hy" -print0 2>/dev/null)
+
 plat_copied=0
 while IFS= read -r -d '' obj; do
     fname="$(basename "$obj")"
@@ -340,7 +352,7 @@ while IFS= read -r -d '' obj; do
     plat_copied=$((plat_copied + 1))
 done < <(find "${RUNTIME_SRC}/platform" -maxdepth 1 \( -name "*.o" -o -name "*.ld" \) -print0 2>/dev/null)
 
-ok "Stdlib modules:   ${std_copied} .o files  +  ${hyi_copied} .hyi files"
+ok "Stdlib modules:   ${std_copied} .o files  +  ${hyi_copied} .hyi files  +  ${hy_copied} .hy files"
 ok "Platform objects: ${plat_copied} files"
 
 # ── Extract and install linkle ────────────────────────────────────────────────

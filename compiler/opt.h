@@ -20,7 +20,13 @@ int opt_constant_prop(IRModule *mod);
    Returns the number of instructions eliminated. */
 int opt_dce(IRModule *mod);
 
-/* Convenience: run all three passes in a fixed-point loop until no
+/* Branch folding: constant-condition jumps collapse to unconditional
+   jump/NOP, jump chains are threaded to their final target, and code
+   after an unconditional jump/return up to the next label is NOP'd.
+   Returns the number of changes made. */
+int opt_branch_fold(IRModule *mod);
+
+/* Convenience: run all passes in a fixed-point loop until no
    more changes occur.  Returns total changes made across all passes. */
 int opt_run_all(IRModule *mod);
 

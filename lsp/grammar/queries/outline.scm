@@ -8,6 +8,21 @@
 ;
 ; ─────────────────────────────────────────────────────────────────────────────
 
+; ── Module declarations ────────────────────────────────────────────────────────
+
+(module_decl
+  name: (module_path
+    (identifier) @name)) @item
+
+; ── Module members (shown as "module :: funcName") ────────────────────────────
+
+(module_decl
+  name: (module_path
+    (identifier) @context)
+  (module_member
+    (func_decl
+      name: (identifier) @name))) @item
+
 ; ── Union classes ─────────────────────────────────────────────────────────────
 
 (union_class_decl

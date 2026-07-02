@@ -99,17 +99,9 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
   # ── Compile everything ───────────────────────────────────────────
   info "Compiling..."
 
-  # Tree-sitter vendor paths (relative to lsp/src/)
-  TS_INC="../vendor/tree-sitter/lib/include"
-  TS_SRC="../vendor/tree-sitter/lib/src/lib.c"
-  TSC_SRC="../vendor/tree-sitter-c/src/parser.c"
-
   run gcc \
       -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
       -O2 \
-      -I"${TS_INC}" \
-      -I../vendor/tree-sitter-c/src \
-      -I../vendor/tree-sitter-c/src/tree_sitter \
       lex_lsp.yy.c \
       parser_lsp.tab.c \
       ast.c \
@@ -119,8 +111,8 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
       typecheck.c \
       lsp_main.c \
       lsp_c_extractor.c \
-      "${TS_SRC}" \
-      "${TSC_SRC}" \
+      -ltree-sitter \
+      -ltree-sitter-c \
       -o ../hylian-lsp
   if [[ $? -ne 0 ]]; then
     fail "gcc compilation failed"

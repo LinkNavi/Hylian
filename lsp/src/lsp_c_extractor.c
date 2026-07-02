@@ -124,7 +124,8 @@ int c_extract_functions(const char *filepath,
         TSNode ret_node = {0}, name_node = {0}, params_node = {0};
 
         for (uint16_t i = 0; i < match.capture_count; i++) {
-            const char *cap_name = ts_query_capture_name_for_id(q, match.captures[i].index, NULL);
+            uint32_t cap_name_len;
+            const char *cap_name = ts_query_capture_name_for_id(q, match.captures[i].index, &cap_name_len);
             TSNode node = match.captures[i].node;
 
             if (strcmp(cap_name, "ret_type") == 0) ret_node = node;

@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include "ast.h"
 #include "codegen_asm.h"
+#include "codegen_elf.h"
 #include "ir.h"
 #include "lower.h"
 #include "opt.h"
@@ -657,6 +658,7 @@ int main(int argc, char **argv) {
     const char *target      = "linux";
     int dump_ir = 0;
     int freestanding = 0;
+    int emit_elf = 0; /* 0 = asm (default), 1 = direct ELF */
 
     /* Parse arguments:
          hylian <input.hy>
@@ -685,6 +687,14 @@ int main(int argc, char **argv) {
             dump_ir = 1;
         } else if (strcmp(argv[i], "--freestanding") == 0) {
             freestanding = 1;
+        } else if (strcmp(argv[i], "--emit") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "elf") == 0)       emit_elf = 1;
+            else if (strcmp(mode, "asm") == 0)  emit_elf = 0;
+            else {
+                fprintf(stderr, "hylian: unknown emit mode '%s' (must be asm or elf)\n", mode);
+                return 1;
+            }
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
         } else {
@@ -695,7 +705,7 @@ int main(int argc, char **argv) {
     }
 
     if (!output_file)
-        output_file = "output.asm";
+        output_file = emit_elf ? "output.o" : "output.asm";
 
     if (!input_file) {
         fprintf(stderr, "hylian: no input file specified\n");
@@ -727,7 +737,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n");
     }
 
-    {
+    if (emit_elf) {
+        if (codegen_elf(mod, output_file, input_file, target, freestanding) != 0) {
+            ir_module_free(mod);
+            return 1;
+        }
+    } else {
         FILE *out = fopen(output_file, "w");
         if (!out) {
             fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);

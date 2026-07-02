@@ -2,14 +2,18 @@ id = "hylian"
 name = "Hylian"
 version = "0.1.0"
 schema_version = 1
-authors = ["Hylian Contributors"]
-description = "Language support for the Hylian programming language, including syntax highlighting and LSP integration."
-repository = "https://github.com/LinkNavi/Hylian"
+authors = ["LinkNavi"]
+description = "Hylian language support: syntax highlighting, LSP, and tree-sitter grammar."
+languages = ["languages/hylian"]
 
-[language_servers.hylian-lsp]
-name = "Hylian LSP"
-languages = ["Hylian"]
+[lib]
+kind = "Rust"
+version = "0.3.0"
 
 [grammars.hylian]
 repository = "https://github.com/LinkNavi/tree-sitter-hylian"
-rev = "54ac4308679476809129412ab0f56717313be9aa"
+rev = "e164c26d2023d65ab0fb081857ae34d1db18fe70"
+
+[language_servers.hylian-lsp]
+language = "Hylian"
+languages = []

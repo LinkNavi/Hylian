@@ -7,6 +7,7 @@
   (switch_stmt)
   (unsafe_block)
   (enum_decl)
+  (module_decl)
 ] @indent.begin
 
 ; ── Indent end (closing braces dedent) ──────────────────────────────────────

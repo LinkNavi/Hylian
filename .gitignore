@@ -7,6 +7,7 @@ Termina/
 lsp/editors/nvim/
 lsp/vendor/tree-sitter/
 lsp/vendor/tree-sitter-c/
+lsp/tree-sitter-hylian
 
 # Build artefacts
 *.o

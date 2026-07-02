@@ -77,9 +77,11 @@ static int has_interpolation(const char *s) {
 "return"            { return RETURN; }
 "new"               { return NEW; }
 "nil"               { return NIL; }
+"null"              { return NIL; }
 "true"              { return TRUE_LIT; }
 "false"             { return FALSE_LIT; }
-"addrof_fn"  { return ADDROF_FN; }
+"addrof_fn"         { return ADDROF_FN; }
+"adrof_fn"          { return ADDROF_FN; }
 "while"             { return WHILE; }
 "for"               { return FOR; }
 "in"                { return IN; }
@@ -95,8 +97,10 @@ static int has_interpolation(const char *s) {
 "static"            { return STATIC; }
 "extern"            { return EXTERN; }
 "enum"              { return ENUM; }
+"union"             { return UNION_KW; }
 "void"              { return VOID; }
 "bool"              { return BOOL; }
+"as"                { return AS; }
 
 "int"               { return INT; }
 "str"               { return STRING; }
@@ -114,8 +118,8 @@ static int has_interpolation(const char *s) {
 "size_of" { return SIZE_OF; }
 [a-zA-Z_][a-zA-Z0-9_]*  { yylval.str = strdup(yytext); return IDENTIFIER; }
 [0-9]+\.[0-9]+           { yylval.str = strdup(yytext); return FLOAT_LITERAL; }
-0[xX][0-9a-fA-F]+        { yylval.num = (long)strtol(yytext, NULL, 16); return NUMBER; }
-[0-9]+                   { yylval.num = atoi(yytext); return NUMBER; }
+0[xX][0-9a-fA-F_]+  { yylval.num = (long)(unsigned long long)strtoull(yytext, NULL, 16); return NUMBER; }
+[0-9][0-9_]*         { yylval.num = (long)(unsigned long long)strtoull(yytext, NULL, 10); return NUMBER; }
 \"([^\\\"]|\\.)*\"       {
     /* yytext includes the surrounding quotes */
     if (has_interpolation(yytext + 1)) {
@@ -168,6 +172,9 @@ static int has_interpolation(const char *s) {
 ">>"                { return RSHIFT; }
 "^"                 { return XOR; }
 "$"                 { /* swallow stray $ (legacy prefix, no longer needed) */ }
+@target[ \t]*\([ \t]*[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\) {
+    /* Silently consume @target(...) — the LSP parses all targets */
+}
 .                   { lsp_diag_push(lsp_yylineno - 1, 0, lsp_yylineno - 1, 999, LSP_DIAG_ERROR, "unexpected character"); }
 
 %%

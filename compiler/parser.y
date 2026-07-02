@@ -123,7 +123,7 @@ void typelist_add(TypeList* l, Type t) {
 
 %token INCLUDE CLASS ENUM PUBLIC PRIVATE IF ELSE RETURN NEW NIL TRUE_LIT FALSE_LIT
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
-%token DEFER UNSAFE CONST STATIC EXTERN AMP
+%token UNSAFE CONST STATIC AMP
 %token INT STRING ERROR BOOL
 %token VOLATILE PACKED NAKED USIZE ISIZE UNION_KW
 %token TILDE LSHIFT RSHIFT XOR CAST SIZE_OF AS
@@ -154,7 +154,7 @@ void typelist_add(TypeList* l, Type t) {
 %type <field_node> field_decl
 %type <type_node> type nullable_type
 %type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
-%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list tuple_type_items switch_arms field_init_list
+%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list switch_arms field_init_list
 %type <node> include_path
 
 

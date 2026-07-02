@@ -4,7 +4,7 @@
 module.exports = grammar({
   name: "hylian",
 
-  extras: ($) => [/\s/, $.line_comment],
+  extras: ($) => [/\s/, $.line_comment, $.target_annotation],
 
   word: ($) => $.identifier,
 
@@ -13,6 +13,13 @@ module.exports = grammar({
     [$.type, $.identifier_expr],
     [$.tuple_type, $.paren_expr],
     [$.tuple_expr, $.paren_expr],
+    [$.module_decl, $.func_decl],
+    [$.rawptr_type, $.postfix_array_type],
+    [$.rawptr_type, $.postfix_ref_type],
+    [$.ref_type, $.postfix_array_type],
+    [$.ref_type, $.postfix_ref_type],
+    [$.interface_decl, $.postfix_ref_type],
+    [$.cast_expr, $.binary_expr],
   ],
 
   rules: {
@@ -21,15 +28,24 @@ module.exports = grammar({
         choice(
           $.include_stmt,
           $.ccpinclude_stmt,
+          $.module_decl,
+          $.module_header,
           $.class_decl,
           $.union_class_decl,
           $.func_decl,
+          $.interface_decl,
           $.static_var_stmt,
           $.const_var_stmt,
           $.static_array_stmt,
           $.enum_decl,
         ),
       ),
+
+    // ── Target annotation ───────────────────────────────────────────────────
+    // @target(linux) / @target(macos) — conditional compilation marker.
+    // Treated as an extra so it can appear anywhere without breaking parsing.
+    target_annotation: (_) =>
+      token(seq("@target", "(", /[a-zA-Z_][a-zA-Z0-9_]*/, ")")),
 
     // ── Comments ────────────────────────────────────────────────────────────
     line_comment: (_) => token(seq("//", /.*/)),
@@ -67,10 +83,12 @@ module.exports = grammar({
           choice(
             $.primitive_type,
             $.array_type,
+            $.postfix_array_type,
             $.multi_type,
             $.tuple_type,
             $.rawptr_type,
             $.ref_type,
+            $.postfix_ref_type,
             $.identifier,
           ),
           optional("?"),
@@ -79,6 +97,9 @@ module.exports = grammar({
 
     rawptr_type: ($) => seq("*", $.type),
     ref_type: ($) => seq("&", $.type),
+
+    // Postfix reference type: int&  (equivalent to &int)
+    postfix_ref_type: ($) => seq($.type, "&"),
 
     tuple_type: ($) =>
       seq(
@@ -111,6 +132,9 @@ module.exports = grammar({
 
     array_type: ($) =>
       seq("array", "<", $.type, optional(seq(",", $.integer_literal)), ">"),
+
+    // Postfix array type: str[]  (equivalent to array<str>)
+    postfix_array_type: ($) => seq($.type, "[", "]"),
 
     multi_type: ($) =>
       seq(
@@ -164,7 +188,8 @@ module.exports = grammar({
 
     class_body: ($) => repeat1($.class_member),
 
-    class_member: ($) => choice($.ctor_decl, $.field_decl, $.method_decl),
+    class_member: ($) =>
+      choice($.ctor_decl, $.field_decl, $.method_decl, $.interface_decl),
 
     ctor_decl: ($) =>
       seq(
@@ -198,6 +223,7 @@ module.exports = grammar({
     // ── Function declarations ────────────────────────────────────────────────
     func_decl: ($) =>
       seq(
+        optional("public"),
         optional("naked"),
         field("return_type", $.type),
         optional("?"),
@@ -211,7 +237,11 @@ module.exports = grammar({
     // ── Parameters ──────────────────────────────────────────────────────────
     param_list: ($) => commaSep1($.param),
 
-    param: ($) => seq(field("type", $.type), field("name", $.identifier)),
+    param: ($) =>
+      choice(
+        seq(field("type", $.type), field("name", $.identifier)),
+        seq(field("name", $.identifier), ":", field("type", $.type)),
+      ),
 
     // ── Block / statements ──────────────────────────────────────────────────
     block: ($) => seq("{", repeat($.statement), "}"),
@@ -393,6 +423,11 @@ module.exports = grammar({
     // ── Modifier keywords / Static & const globals ─────────────────────────
     static: (_) => "static",
     const: (_) => "const",
+    naked: (_) => "naked",
+    packed: (_) => "packed",
+    public: (_) => "public",
+    private: (_) => "private",
+    extern: (_) => "extern",
 
     static_var_stmt: ($) =>
       seq(
@@ -427,7 +462,11 @@ module.exports = grammar({
         ";",
       ),
 
-    asm_block: ($) => seq("asm{", field("body", $.asm_content), "}"),
+    asm_block: ($) =>
+      choice(
+        seq("asm", "{", field("body", $.asm_content), "}"),
+        seq("asm{", field("body", $.asm_content), "}"),
+      ),
 
     asm_content: (_) => token(repeat(/[^}]/)),
 
@@ -440,6 +479,7 @@ module.exports = grammar({
     // ── Expressions ──────────────────────────────────────────────────────────
     expression: ($) =>
       choice(
+        $.ternary_expr,
         $.binary_expr,
         $.unary_expr,
         $.postfix_expr,
@@ -469,6 +509,20 @@ module.exports = grammar({
       ),
 
     paren_expr: ($) => seq("(", $.expression, ")"),
+
+    // ── Ternary conditional ─────────────────────────────────────────────────
+    // condition ? true_expr : false_expr
+    ternary_expr: ($) =>
+      prec.right(
+        1,
+        seq(
+          field("condition", $.expression),
+          "?",
+          field("then", $.expression),
+          ":",
+          field("else", $.expression),
+        ),
+      ),
 
     tuple_expr: ($) =>
       seq("(", $.expression, repeat1(seq(",", $.expression)), ")"),
@@ -634,6 +688,43 @@ module.exports = grammar({
     identifier_expr: ($) => $.identifier,
 
     identifier: (_) => token(/[a-zA-Z_][a-zA-Z0-9_]*/),
+
+    // ── Module declarations ──────────────────────────────────────────────────
+    // module name { ... } — groups public functions and static vars
+    module_decl: ($) =>
+      seq(
+        "module",
+        field("name", $.module_path),
+        "{",
+        repeat($.module_member),
+        "}",
+      ),
+
+    // module name  — header-only declaration (used in .hyi files)
+    module_header: ($) => seq("module", field("name", $.module_path)),
+
+    module_member: ($) =>
+      choice(
+        $.func_decl,
+        $.interface_decl,
+        $.static_var_stmt,
+        $.const_var_stmt,
+        $.static_array_stmt,
+      ),
+
+    // ── Interface declarations (.hyi files) ──────────────────────────────────
+    // fn name(param: type, ...) -> type
+    // fn name(param: type, ...)
+    interface_decl: ($) =>
+      seq(
+        optional("public"),
+        "fn",
+        field("name", $.identifier),
+        "(",
+        optional($.param_list),
+        ")",
+        optional(seq("->", field("return_type", $.type))),
+      ),
   },
 });
 

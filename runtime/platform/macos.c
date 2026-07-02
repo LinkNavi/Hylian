@@ -40,3 +40,25 @@ int hy_mkdir(const char *path,int mode) { return (int)sc3(136,(long)path,mode,0)
 
 long hy_getcwd(char *buf, hy_size size) { (void)buf;(void)size; return -1; }
 long hy_getenv(const char *name, char *buf, hy_size buf_len) { (void)name;(void)buf;(void)buf_len; return -1; }
+
+/* ── process spawning ────────────────────────────────────────────────────── */
+
+long hy_fork(void) {
+    return sc3(2, 0, 0, 0);
+}
+
+long hy_execve(const char *path, char *const argv[], char *const envp[]) {
+    return sc3(59, (long)path, (long)argv, (long)envp);
+}
+
+long hy_waitpid(long pid, int *status, int options) {
+    return sc3(7, pid, (long)status, options);
+}
+
+long hy_pipe(int fds[2]) {
+    return sc3(42, (long)fds, 0, 0);
+}
+
+long hy_dup2(int oldfd, int newfd) {
+    return sc3(90, oldfd, newfd, 0);
+}

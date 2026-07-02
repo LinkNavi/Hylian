@@ -218,6 +218,7 @@ typedef struct {
     ASTNode base;
     char *name;
     int is_public;
+    int is_union;
     FieldNode **fields;
     int field_count;
     MethodNode **methods;

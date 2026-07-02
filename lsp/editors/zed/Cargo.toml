@@ -1,5 +1,5 @@
 [package]
-name = "hylian-zed-extension"
+name = "hylian"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,4 +7,4 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-zed_extension_api = "0.7.0"
+zed_extension_api = "0.3" # Use the latest compliant API version

@@ -21,11 +21,19 @@
 ] @keyword.unsafe
 
 [
+  "naked"
+  "packed"
+  "extern"
+] @keyword.unsafe
+
+[
   "class"
   "union"
+  "enum"
+  "module"
+  "fn"
   "public"
   "private"
-  "enum"
 ] @keyword.type
 
 [
@@ -47,8 +55,13 @@
 ] @keyword.import
 
 [
-  (static)
-  (const)
+  "static"
+  "const"
+  "naked"
+  "packed"
+  "public"
+  "private"
+  "extern"
 ] @keyword.modifier
 
 ; ── Types ───────────────────────────────────────────────────────────────────
@@ -115,6 +128,9 @@
 (func_decl
   name: (identifier) @function)
 
+(interface_decl
+  name: (identifier) @function)
+
 (method_decl
   name: (identifier) @function.method)
 
@@ -171,6 +187,12 @@
 (member_assign_stmt
   member: (identifier) @property)
 
+; ── Ternary conditional ────────────────────────────────────────────────────
+
+(ternary_expr
+  "?" @keyword.conditional
+  ":" @keyword.conditional)
+
 ; ── Operators ────────────────────────────────────────────────────────────────
 
 [
@@ -183,6 +205,7 @@
   "|"  "&"  "^"  "~"
   "<<"  ">>"
   "?"
+  "->"
 ] @operator
 
 ; ── Punctuation ──────────────────────────────────────────────────────────────
@@ -211,6 +234,18 @@
 ; ── Comments ─────────────────────────────────────────────────────────────────
 
 (line_comment) @comment
+
+(module_header
+  name: (module_path
+    (identifier) @namespace))
+
+(module_decl
+  name: (module_path
+    (identifier) @namespace))
+
+; ── Target annotations ──────────────────────────────────────────────────────
+
+(target_annotation) @keyword.directive
 
 ; ── Modules / include paths ───────────────────────────────────────────────────
 

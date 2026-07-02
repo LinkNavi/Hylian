@@ -30,11 +30,11 @@ extern const char *lsp_current_file;
 
 
 static const char *hylian_keywords[] = {
-    "if", "else", "while", "for", "in", "return", "new", "nil", "true", "false",
+    "if", "else", "while", "for", "in", "return", "new", "nil", "null", "true", "false",
     "break", "continue", "defer", "class", "public", "private",
     "include", "void", "int", "str", "bool", "float", "Error",
     "array", "multi", "any", "switch", "case", "default", "unsafe", "const", "static", "extern",
-    "volatile", "packed", "naked", "usize", "isize",
+    "volatile", "packed", "naked", "usize", "isize", "union", "as",
     "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
     "float32", "float64",
     NULL};
