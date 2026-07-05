@@ -750,6 +750,10 @@ static void scan_hyi_vendor_file(LspProject *proj, const char *filepath, const c
         if (!parse_hyi_sig(line, func_name, ret_type, params, sizeof(func_name)))
             continue;
 
+        /* Skip private helpers — functions whose name starts with '_'. */
+        if (func_name[0] == '_')
+            continue;
+
         char doc[512];
         char detail[512];
         if (params[0])
@@ -945,6 +949,75 @@ static void resolve_vendor_import(LspProject *proj, const char *inc)
     }
 }
 
+/* Parse a pure-Hylian stdlib .hy source file (e.g. runtime/std/process.hy)
+   and register its top-level functions/classes as stdlib completions, the
+   same way scan_hyi_vendor_file does for .hyi interface files.  This is what
+   makes the new "stdlib as .hy" format visible to completions. */
+static void scan_hy_stdlib_file(LspProject *proj, const char *filepath,
+                                const char *module_name)
+{
+    lsp_log("[lsp_analysis] scan_hy_stdlib_file: %s (module: %s)", filepath, module_name);
+    ProgramNode *prog = parse_file_from_disk(filepath);
+    if (!prog)
+        return;
+
+    for (int i = 0; i < prog->decl_count; i++)
+    {
+        ASTNode *d = prog->declarations[i];
+        if (!d)
+            continue;
+
+        if (d->type == NODE_FUNC)
+        {
+            FuncNode *fn = (FuncNode *)d;
+            /* Skip private helpers — functions whose name starts with '_'. */
+            if (fn->name && fn->name[0] == '_')
+                continue;
+            char ret[64];
+            type_to_str(fn->return_type, ret, sizeof(ret));
+            char sig[256];
+            build_sig(sig, sizeof(sig), ret, fn->name,
+                      fn->params, fn->param_count);
+            char doc[512];
+            snprintf(doc, sizeof(doc), "stdlib function from `%s`", module_name);
+
+            /* Qualified: module_name.func_name */
+            char qualified[256];
+            snprintf(qualified, sizeof(qualified), "%s.%s", module_name, fn->name);
+            add_completion_to(proj->stdlib_completions,
+                              &proj->stdlib_completion_count, MAX_COMPLETIONS,
+                              qualified, COMPLETE_FUNCTION, sig, doc);
+            /* Short name */
+            add_completion_to(proj->stdlib_completions,
+                              &proj->stdlib_completion_count, MAX_COMPLETIONS,
+                              fn->name, COMPLETE_FUNCTION, sig, doc);
+        }
+        else if (d->type == NODE_CLASS)
+        {
+            ClassNode *cn = (ClassNode *)d;
+            char doc[512];
+            snprintf(doc, sizeof(doc), "stdlib class from `%s`", module_name);
+            add_completion_to(proj->stdlib_completions,
+                              &proj->stdlib_completion_count, MAX_COMPLETIONS,
+                              cn->name, COMPLETE_CLASS, cn->name, doc);
+        }
+        else if (d->type == NODE_ENUM)
+        {
+            EnumNode *en = (EnumNode *)d;
+            char doc[512];
+            snprintf(doc, sizeof(doc), "stdlib enum from `%s`", module_name);
+            add_completion_to(proj->stdlib_completions,
+                              &proj->stdlib_completion_count, MAX_COMPLETIONS,
+                              en->name, COMPLETE_CLASS, en->name, doc);
+        }
+    }
+
+    /* Don't free prog — the AST owns strings that completions reference via
+       strdup'd copies inside add_completion_to (snprintf into fixed buffers),
+       so it is safe to free. */
+    /* (intentionally not freeing to keep things simple; process exits anyway) */
+}
+
 static void scan_hyi_stdlib(LspProject *proj, const char *stdlib_dir, const char *module_prefix)
 {
     lsp_log("[lsp_analysis] scan_hyi_stdlib: %s (module: %s)", stdlib_dir, module_prefix);
@@ -1004,6 +1077,29 @@ static void scan_hyi_stdlib(LspProject *proj, const char *stdlib_dir, const char
 
             /* Delegate to scan_hyi_vendor_file for full parsing (fns, classes, structs) */
             scan_hyi_vendor_file(proj, full, full_module);
+        }
+        else if (S_ISREG(st.st_mode) && nlen > 3 && strcmp(ent->d_name + nlen - 3, ".hy") == 0)
+        {
+            /* Pure-Hylian stdlib source file (new format). Parse it with the
+               LSP parser and register its public symbols as completions. */
+            char file_module[128];
+            size_t base_len = (size_t)nlen - 3;
+            if (base_len >= sizeof(file_module))
+                base_len = sizeof(file_module) - 1;
+            memcpy(file_module, ent->d_name, base_len);
+            file_module[base_len] = '\0';
+
+            char full_module[256];
+            if (module_prefix[0])
+            {
+                snprintf(full_module, sizeof(full_module), "%s.%s", module_prefix, file_module);
+            }
+            else
+            {
+                snprintf(full_module, sizeof(full_module), "%s", file_module);
+            }
+
+            scan_hy_stdlib_file(proj, full, full_module);
         }
     }
     closedir(d);
@@ -1090,6 +1186,51 @@ LspProject *lsp_project_create(const char *root_dir)
 
     snprintf(proj->root_dir, sizeof(proj->root_dir), "%s",
              root_dir ? root_dir : ".");
+
+    /* Default source directory (linkle.hy convention). May be overridden
+       below by parsing the project's linkle.hy for a custom `src` value. */
+    snprintf(proj->src_dir, sizeof(proj->src_dir), "src");
+
+    /* Try to read the `src` field from linkle.hy so include completions use
+       the right module path prefix (e.g. "Service.file" not "src.Service.file"). */
+    {
+        char linkle_path[1280];
+        snprintf(linkle_path, sizeof(linkle_path), "%s/linkle.hy", proj->root_dir);
+        FILE *lf = fopen(linkle_path, "r");
+        if (lf)
+        {
+            char line[512];
+            while (fgets(line, sizeof(line), lf))
+            {
+                /* Look for a line like:  src: "src"   or   src: "my_source" */
+                char *p = line;
+                while (*p == ' ' || *p == '\t') p++;
+                if (strncmp(p, "src", 3) != 0)
+                    continue;
+                p += 3;
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p != ':')
+                    continue;
+                p++;
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p != '"')
+                    continue;
+                p++;
+                char val[256];
+                int vi = 0;
+                while (*p && *p != '"' && *p != '\n' && *p != '\r' && vi < (int)sizeof(val) - 1)
+                    val[vi++] = *p++;
+                val[vi] = '\0';
+                if (vi > 0)
+                {
+                    snprintf(proj->src_dir, sizeof(proj->src_dir), "%s", val);
+                    lsp_log("[lsp_analysis] linkle.hy src dir: %s", proj->src_dir);
+                }
+                break;
+            }
+            fclose(lf);
+        }
+    }
 
     scan_dir(proj, proj->root_dir);
 
@@ -1807,14 +1948,118 @@ static void collect_locals(ProgramNode *prog, int line,
 }
 
 
-/* Known stdlib modules */
-static const char *stdlib_modules[] = {
-    "std.io",
-    "std.strings",
-    "std.errors",
-    "std.system.env",
-    "std.system.filesystem",
-    NULL};
+/* ── Dynamic stdlib module discovery ─────────────────────────────────────────
+   Instead of a hand-maintained list (which silently goes stale — see git
+   history), scan the actual runtime/std tree for .hy / .hyi module files.
+   Each stem is recorded once regardless of how many of .hy/.hyi/.c/.o exist
+   for it, so duplicate backing files never produce duplicate completions. */
+
+#define MAX_STDLIB_MODULES 128
+static char stdlib_module_buf[MAX_STDLIB_MODULES][160];
+static const char *stdlib_module_ptrs[MAX_STDLIB_MODULES + 1];
+static int stdlib_modules_scanned = 0;
+
+static int lsp_has_suffix(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
+
+/* Mirrors linkle.py's _find_runtime_dir() resolution order. */
+static int find_std_dir(char *out, size_t out_sz) {
+    const char *env = getenv("HYLIAN_LIB");
+    struct stat st;
+    if (env) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "%s/std", env);
+        if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(out, out_sz, "%s", buf);
+            return 1;
+        }
+        if (stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(out, out_sz, "%s", env);
+            return 1;
+        }
+    }
+    const char *candidates[] = {
+        "runtime/std", "../runtime/std", "../../runtime/std",
+        "/usr/local/lib/hylian/std", "/usr/lib/hylian/std", NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        if (stat(candidates[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(out, out_sz, "%s", candidates[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void record_module(const char *modname) {
+    for (int i = 0; i < stdlib_modules_scanned; i++)
+        if (strcmp(stdlib_module_buf[i], modname) == 0) return; /* dedupe */
+    if (stdlib_modules_scanned >= MAX_STDLIB_MODULES) return;
+    snprintf(stdlib_module_buf[stdlib_modules_scanned], sizeof(stdlib_module_buf[0]), "%s", modname);
+    stdlib_modules_scanned++;
+}
+
+/* Recursively walk `dir`, turning each .hy/.hyi file into a "std.foo.bar"
+   module name (directories become dotted path segments). */
+static void scan_std_dir(const char *dir, const char *prefix, int depth) {
+    if (depth > 4) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            char sub_prefix[256];
+            snprintf(sub_prefix, sizeof(sub_prefix), "%s.%s", prefix, ent->d_name);
+            scan_std_dir(path, sub_prefix, depth + 1);
+            continue;
+        }
+        if (!lsp_has_suffix(ent->d_name, ".hy") && !lsp_has_suffix(ent->d_name, ".hyi"))
+            continue;
+
+        char stem[256];
+        snprintf(stem, sizeof(stem), "%s", ent->d_name);
+        char *dot = strrchr(stem, '.');
+        if (dot) *dot = '\0';
+
+        char modname[300];
+        snprintf(modname, sizeof(modname), "%s.%s", prefix, stem);
+        record_module(modname);
+    }
+    closedir(d);
+}
+
+static const char **get_stdlib_modules(void) {
+    if (stdlib_modules_scanned == 0) {
+        char std_dir[512];
+        if (find_std_dir(std_dir, sizeof(std_dir)))
+            scan_std_dir(std_dir, "std", 0);
+
+        /* If nothing was found (e.g. installed binary with no accessible
+           runtime tree), fall back to a known-good minimum so completions
+           don't just disappear. */
+        if (stdlib_modules_scanned == 0) {
+            static const char *fallback[] = {
+                "std.io", "std.strings", "std.errors", "std.system.env",
+                "std.system.filesystem", "std.process", "std.init", "std.mem"
+            };
+            for (unsigned i = 0; i < sizeof(fallback) / sizeof(fallback[0]); i++)
+                record_module(fallback[i]);
+        }
+
+        for (int i = 0; i < stdlib_modules_scanned; i++)
+            stdlib_module_ptrs[i] = stdlib_module_buf[i];
+        stdlib_module_ptrs[stdlib_modules_scanned] = NULL;
+    }
+    return stdlib_module_ptrs;
+}
 
 /* Returns 1 if the cursor (line, col) is inside an unclosed `include { }` block.
    Also fills prefix_out with whatever partial module name is being typed. */
@@ -1887,13 +2132,24 @@ static int cursor_in_include(const char *source, int line, int col,
 
 /* Convert an absolute .hy filepath to a dot-separated module name relative
    to root_dir. e.g. /proj/Game/Player.hy -> "Game.Player" */
-static void filepath_to_module(const char *root_dir, const char *filepath,
+static void filepath_to_module(const char *root_dir, const char *src_dir,
+                               const char *filepath,
                                char *buf, int bufsz)
 {
     int rlen = (int)strlen(root_dir);
     const char *rel = filepath;
     if (strncmp(filepath, root_dir, rlen) == 0 && filepath[rlen] == '/')
         rel = filepath + rlen + 1;
+
+    /* Strip the source-directory prefix so module paths match what users
+       write in `include { ... }` (e.g. "Service.file", not "src.Service.file").
+       src_dir is relative to root_dir (e.g. "src"). */
+    if (src_dir && src_dir[0])
+    {
+        int slen = (int)strlen(src_dir);
+        if (strncmp(rel, src_dir, slen) == 0 && rel[slen] == '/')
+            rel += slen + 1;
+    }
 
     int len = (int)strlen(rel);
     /* strip .hy suffix */
@@ -2292,6 +2548,7 @@ int lsp_complete(LspState *st,
     if (cursor_in_include(source, line, col, inc_prefix, sizeof(inc_prefix)))
     {
         /* Stdlib modules */
+        const char **stdlib_modules = get_stdlib_modules();
         for (int i = 0; stdlib_modules[i] && count < max_out; i++)
         {
             if (inc_prefix[0] == '\0' ||
@@ -2308,7 +2565,8 @@ int lsp_complete(LspState *st,
             for (int f = 0; f < proj->file_count && count < max_out; f++)
             {
                 char mod[512];
-                filepath_to_module(proj->root_dir, proj->files[f].filepath,
+                filepath_to_module(proj->root_dir, proj->src_dir,
+                                   proj->files[f].filepath,
                                    mod, sizeof(mod));
                 if (mod[0] == '\0')
                     continue;
@@ -2476,45 +2734,54 @@ int lsp_complete(LspState *st,
             if (dup)
                 continue;
 
-            /* Only suggest short-name stdlib functions if the module is included */
-            if (src->kind == COMPLETE_FUNCTION)
+            /* Stdlib completions: only show the short form, and only when
+               the owning module is included by this file. Qualified names
+               like "std.process.spawn" are dropped entirely — they're just
+               clutter in global completions since you call spawn(), not
+               std.process.spawn(). Private helpers starting with '_' are
+               filtered at registration time. */
+            if (src->kind == COMPLETE_FUNCTION || src->kind == COMPLETE_METHOD)
             {
-                if (strncmp(src->label, "std.", 4) != 0)
+                const char *lbl = src->label;
+
+                /* Drop qualified stdlib names — short form only. */
+                if (strncmp(lbl, "std.", 4) == 0)
+                    goto skip_completion;
+
+                /* Short name — if it matches a stdlib function, require the
+                   module to be included. Non-stdlib short names (user funcs,
+                   builtins) pass through unchanged. */
+                for (int k = 0; k < proj->global_completion_count; k++)
                 {
-                    /* Not a fully qualified stdlib function, check if it's a short name from stdlib */
-                    int is_stdlib_short = 0;
-                    char fq_label[256];
-                    for (int k = 0; k < proj->global_completion_count; k++)
+                    CompletionItem *fq = &proj->global_completions[k];
+                    if (fq->kind != COMPLETE_FUNCTION && fq->kind != COMPLETE_METHOD)
+                        continue;
+                    if (strncmp(fq->label, "std.", 4) != 0)
+                        continue;
+                    const char *dot = strrchr(fq->label, '.');
+                    if (!dot || strcmp(dot + 1, lbl) != 0)
+                        continue;
+
+                    /* It's a stdlib short name — check the include. */
+                    size_t mod_len = (size_t)(dot - fq->label);
+                    char mod[128];
+                    if (mod_len >= sizeof(mod))
+                        goto skip_completion;
+                    memcpy(mod, fq->label, mod_len);
+                    mod[mod_len] = '\0';
+                    int found = 0;
+                    for (int inc = 0; inc < include_count; inc++)
                     {
-                        CompletionItem *fq = &proj->global_completions[k];
-                        if (fq->kind == COMPLETE_FUNCTION && strncmp(fq->label, "std.", 4) == 0)
+                        if (strcmp(includes[inc], mod) == 0)
                         {
-                            const char *dot = strrchr(fq->label, '.');
-                            if (dot && strcmp(dot + 1, src->label) == 0)
-                            {
-                                is_stdlib_short = 1;
-                                size_t mod_len = dot - fq->label;
-                                char mod[128];
-                                if (mod_len < sizeof(mod))
-                                {
-                                    memcpy(mod, fq->label, mod_len);
-                                    mod[mod_len] = '\0';
-                                    int found = 0;
-                                    for (int inc = 0; inc < include_count; inc++)
-                                    {
-                                        if (strcmp(includes[inc], mod) == 0)
-                                        {
-                                            found = 1;
-                                            break;
-                                        }
-                                    }
-                                    log_function_resolution(src->label, mod, st->file->filepath);
-                                    if (!found)
-                                        goto skip_completion;
-                                }
-                            }
+                            found = 1;
+                            break;
                         }
                     }
+                    log_function_resolution(lbl, mod, st->file->filepath);
+                    if (!found)
+                        goto skip_completion;
+                    break;
                 }
             }
 

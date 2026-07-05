@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <sys/stat.h>
 #include "ast.h"
 #include "codegen_asm.h"
 #include "codegen_elf.h"
@@ -449,27 +450,64 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
             std_rel[slen] = '\0';
 
             char *project_root = dir_of(src_dir);
+            int src_len = (int)strlen(src_dir);
 
+            /* Installed stdlib dir (set by linkle via HYLIAN_LIB, or the
+               default /usr/local/lib/hylian/std). This is where process.hy,
+               sys.hy, init.hy etc. live for an installed toolchain. */
+            const char *hylian_lib = getenv("HYLIAN_LIB");
+            char inst_std[1024] = "";
+            if (hylian_lib) {
+                snprintf(inst_std, sizeof(inst_std), "%s/std", hylian_lib);
+                /* If $HYLIAN_LIB/std doesn't exist, try $HYLIAN_LIB itself */
+                struct stat _ist;
+                if (stat(inst_std, &_ist) != 0 || !S_ISDIR(_ist.st_mode))
+                    snprintf(inst_std, sizeof(inst_std), "%s", hylian_lib);
+            } else {
+                strcpy(inst_std, "/usr/local/lib/hylian/std");
+            }
+            int inst_len = (int)strlen(inst_std);
+
+            /* Candidate paths for the .hyi interface file:
+               1. <project_root>/runtime/std/<rel>.hyi  (source-tree layout)
+               2. runtime/std/<rel>.hyi                 (relative)
+               3. <src_dir>/<rel>.hyi                   (installed layout:
+                                                        src_dir IS the std dir)
+               4. <src_dir>/<rel>.hyi via std/ subdir   (src_dir = runtime/ )
+               5. <inst_std>/<rel>.hyi                  (installed toolchain) */
             char *hyi1 = malloc(strlen(project_root) + 14 + slen + 5);
             sprintf(hyi1, "%s/runtime/std/%s.hyi", project_root, std_rel);
             char *hyi2 = malloc(14 + slen + 5);
             sprintf(hyi2, "runtime/std/%s.hyi", std_rel);
+            char *hyi3 = malloc(src_len + 2 + slen + 5);
+            sprintf(hyi3, "%s/%s.hyi", src_dir, std_rel);
+            char *hyi4 = malloc(src_len + 6 + slen + 5);
+            sprintf(hyi4, "%s/std/%s.hyi", src_dir, std_rel);
+            char *hyi5 = malloc(inst_len + 2 + slen + 5);
+            sprintf(hyi5, "%s/%s.hyi", inst_std, std_rel);
 
+            /* Same candidates for the .hy source file */
             char *hy1 = malloc(strlen(project_root) + 14 + slen + 4);
             sprintf(hy1, "%s/runtime/std/%s.hy", project_root, std_rel);
             char *hy2 = malloc(14 + slen + 4);
             sprintf(hy2, "runtime/std/%s.hy", std_rel);
+            char *hy3 = malloc(src_len + 2 + slen + 4);
+            sprintf(hy3, "%s/%s.hy", src_dir, std_rel);
+            char *hy4 = malloc(src_len + 6 + slen + 4);
+            sprintf(hy4, "%s/std/%s.hy", src_dir, std_rel);
+            char *hy5 = malloc(inst_len + 2 + slen + 4);
+            sprintf(hy5, "%s/%s.hy", inst_std, std_rel);
 
             free(project_root);
             free(std_rel);
 
             char *hyi_path = NULL;
-            const char *hyi_cands[] = { hyi1, hyi2, NULL };
+            const char *hyi_cands[] = { hyi1, hyi2, hyi3, hyi4, hyi5, NULL };
             for (int ci = 0; hyi_cands[ci]; ci++) {
                 FILE *probe = fopen(hyi_cands[ci], "r");
                 if (probe) { fclose(probe); hyi_path = strdup(hyi_cands[ci]); break; }
             }
-            free(hyi1); free(hyi2);
+            free(hyi1); free(hyi2); free(hyi3); free(hyi4); free(hyi5);
 
             if (hyi_path && !already_visited(hyi_path)) {
                 mark_visited(hyi_path);
@@ -491,12 +529,12 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
 
             /* If a .hy exists alongside the .hyi, compile it as pure-Hylian stdlib */
             char *hy_path = NULL;
-            const char *hy_cands[] = { hy1, hy2, NULL };
+            const char *hy_cands[] = { hy1, hy2, hy3, hy4, hy5, NULL };
             for (int ci = 0; hy_cands[ci]; ci++) {
                 FILE *probe = fopen(hy_cands[ci], "r");
                 if (probe) { fclose(probe); hy_path = strdup(hy_cands[ci]); break; }
             }
-            free(hy1); free(hy2);
+            free(hy1); free(hy2); free(hy3); free(hy4); free(hy5);
 
             if (hy_path && !already_visited(hy_path)) {
                 char *hy_dir = dir_of(hy_path);

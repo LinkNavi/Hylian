@@ -56,6 +56,10 @@ typedef struct {
     /* Root directory of the workspace (absolute path, no trailing slash) */
     char root_dir[1024];
 
+    /* Source directory from linkle.hy (relative to root_dir, default "src").
+       Used to turn file paths into module names for include completions. */
+    char src_dir[256];
+
     /* All known source files */
     ProjectFile files[MAX_PROJECT_FILES];
     int         file_count;

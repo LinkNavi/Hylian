@@ -677,11 +677,6 @@ STD_MODULES = [
         "stem": os.path.join("system", "env"),
         "link_libs": [],
     },
-    {
-        "include": "std.process",
-        "stem": "process",
-        "link_libs": [],
-    },
     {"include": "std.crypto", "stem": "crypto", "link_libs": ["-lssl", "-lcrypto"]},
     {
         "include": "std.networking.tcp",
@@ -703,6 +698,20 @@ STD_MODULES = [
 ]
 
 
+def _stdlib_cache_dir(target):
+    """Return a writable directory for cached stdlib .asm/.o outputs.
+    Falls back to a temp dir if HOME is unset."""
+    base = os.environ.get("HYLIAN_CACHE")
+    if not base:
+        home = os.path.expanduser("~")
+        if not home or home == "~":
+            home = "/tmp"
+        base = os.path.join(home, ".cache", "hylian", "std-obj")
+    d = os.path.join(base, target)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def _runtime_obj(stem_rel, target, verbose):
     """
     Find or build a stdlib .o from stem_rel (e.g. "io", "networking/tcp").
@@ -713,7 +722,9 @@ def _runtime_obj(stem_rel, target, verbose):
 
     The source-tree layout has files directly under runtime/std/ while the
     installed layout has them under the std root.  We try both.
-    """
+
+    Build outputs (.asm/.o) are written to a writable cache directory when the
+    source tree is read-only (e.g. a system-wide install under /usr/local)."""
     runtime_dir = _find_runtime_dir()
 
     # Try std/ subdirectory (source-tree layout: runtime/std/io.o)
@@ -751,7 +762,26 @@ def _runtime_obj(stem_rel, target, verbose):
             std_dir = os.path.join(runtime_dir, "std")
             if not os.path.isdir(std_dir):
                 std_dir = runtime_dir
-            asm_out = stem + ".asm"
+
+            # If the source dir is writable, build alongside the source
+            # (source-tree layout). Otherwise redirect outputs to a writable
+            # cache so we don't try to write into /usr/local/lib/hylian/std.
+            src_dir = os.path.dirname(hy_path)
+            if os.access(src_dir, os.W_OK):
+                asm_out = stem + ".asm"
+                out_obj = obj_path
+            else:
+                cache = _stdlib_cache_dir(target)
+                # Use a flat, unique name based on stem_rel so different
+                # modules don't collide (e.g. "system/env" -> "system_env").
+                flat = stem_rel.replace(os.sep, "_").replace("/", "_")
+                asm_out = os.path.join(cache, flat + ".asm")
+                out_obj = os.path.join(cache, flat + ".o")
+                # If the cached .o is fresh relative to the source, reuse it.
+                if os.path.exists(out_obj) and _is_fresh(out_obj, hy_path):
+                    dim(f"cached     {rel}")
+                    return out_obj
+
             compile_cmd = [
                 hylian_bin,
                 hy_path,
@@ -768,11 +798,11 @@ def _runtime_obj(stem_rel, target, verbose):
             # Assemble the generated .asm → .o
             fmt = NASM_FORMATS.get(target, "elf64")
             _run(
-                ["nasm", "-f", fmt, "-w-label-redef-late", asm_out, "-o", obj_path],
+                ["nasm", "-f", fmt, "-w-label-redef-late", asm_out, "-o", out_obj],
                 verbose,
                 label=f"ASM  {os.path.relpath(asm_out)}",
             )
-            return obj_path
+            return out_obj
 
         # Fallback: .c (C source) — compile with gcc
         if os.path.exists(c_path):
@@ -780,6 +810,16 @@ def _runtime_obj(stem_rel, target, verbose):
                 rel = os.path.relpath(c_path)
             except:
                 rel = c_path
+            src_dir = os.path.dirname(c_path)
+            if os.access(src_dir, os.W_OK):
+                out_obj = obj_path
+            else:
+                cache = _stdlib_cache_dir(target)
+                flat = stem_rel.replace(os.sep, "_").replace("/", "_")
+                out_obj = os.path.join(cache, flat + ".o")
+                if os.path.exists(out_obj) and _is_fresh(out_obj, c_path):
+                    dim(f"cached     {rel}")
+                    return out_obj
             gcc_flags = [
                 "gcc",
                 "-O2",
@@ -792,13 +832,13 @@ def _runtime_obj(stem_rel, target, verbose):
             # Add kernel-specific flags for freestanding targets
             if target in ("kernel", "limine"):
                 gcc_flags.extend(["-mno-sse", "-mno-mmx", "-mno-red-zone"])
-            gcc_flags.extend([c_path, "-o", obj_path])
+            gcc_flags.extend([c_path, "-o", out_obj])
             _run(
                 gcc_flags,
                 verbose,
                 label=f"CC   {rel}",
             )
-            return obj_path
+            return out_obj
 
         # Last resort: .asm — assemble with nasm
         if os.path.exists(asm_path):
@@ -806,13 +846,20 @@ def _runtime_obj(stem_rel, target, verbose):
                 rel = os.path.relpath(asm_path)
             except:
                 rel = asm_path
+            src_dir = os.path.dirname(asm_path)
+            if os.access(src_dir, os.W_OK):
+                out_obj = obj_path
+            else:
+                cache = _stdlib_cache_dir(target)
+                flat = stem_rel.replace(os.sep, "_").replace("/", "_")
+                out_obj = os.path.join(cache, flat + ".o")
             fmt = NASM_FORMATS.get(target, "elf64")
             _run(
-                ["nasm", "-f", fmt, "-w-label-redef-late", asm_path, "-o", obj_path],
+                ["nasm", "-f", fmt, "-w-label-redef-late", asm_path, "-o", out_obj],
                 verbose,
                 label=f"ASM  {rel}",
             )
-            return obj_path
+            return out_obj
 
     raise BuildError(
         f"stdlib module not found: {stem_rel}\n"
