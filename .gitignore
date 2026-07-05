@@ -29,7 +29,6 @@ lsp/hylian-lsp
 lsp/editors/zed/target
 
 # Hylian source files used as test inputs
-*.hy
 
 # mdBook output
 docs/book/
