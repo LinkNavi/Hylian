@@ -30,6 +30,7 @@ lsp/editors/zed/target
 
 # Hylian source files used as test inputs
 
+
 # mdBook output
 docs/book/
 vendors/

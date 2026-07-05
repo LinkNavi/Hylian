@@ -83,3 +83,25 @@ long hylian_mkdir(char *path,long path_len) {
     hy_memcpy(tmp,path,path_len); tmp[path_len]='\0';
     return hy_mkdir(tmp,0755);
 }
+
+long hylian_mount(char *source,long source_len,char *target,long target_len,char *fstype,long fstype_len,long flags) {
+    char src[256],dst[256],fst[64];
+    if(source_len>0){ if(source_len>255)return -1; hy_memcpy(src,source,source_len); src[source_len]='\0'; }
+    else { src[0]='\0'; }
+    if(!target||target_len<=0||target_len>255)return -1;
+    hy_memcpy(dst,target,target_len); dst[target_len]='\0';
+    if(!fstype||fstype_len<=0||fstype_len>63)return -1;
+    hy_memcpy(fst,fstype,fstype_len); fst[fstype_len]='\0';
+    return hy_mount(src[0]?src:0, dst, fst, (unsigned long)flags, 0);
+}
+
+long hylian_umount(char *target,long target_len) {
+    if(!target||target_len<=0)return -1;
+    char tmp[257]; if(target_len>256)return -1;
+    hy_memcpy(tmp,target,target_len); tmp[target_len]='\0';
+    return hy_umount(tmp, 0);
+}
+
+long hylian_reboot(long cmd) {
+    return hy_reboot((int)cmd);
+}

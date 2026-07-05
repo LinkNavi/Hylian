@@ -1,0 +1,6 @@
+Direct machine-code encoding into an in-memory buffer:
+
+libhymir/       # MIR types, IR->MIR lowering — pure C, no target knowledge
+libhyregalloc/  # linear scan over MIR, target owns register set
+libhyx64/       # x86-64 encoder: MIRValue+op -> bytes+relocs
+libhyobj/       # ELF (and later PE/Mach-O) writer, takes bytes+relocs+symbols

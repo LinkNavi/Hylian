@@ -89,6 +89,21 @@ long hy_getcwd(char *buf, hy_size size) {
     return sc3(79, (long)buf, (long)size, 0);
 }
 
+long hy_mount(const char *source, const char *target, const char *fstype, unsigned long flags, const void *data) {
+    // mount syscall = 165: (source, target, filesystemtype, mountflags, data)
+    return sc6(165, (long)source, (long)target, (long)fstype, (long)flags, (long)data, 0);
+}
+
+long hy_umount(const char *target, int flags) {
+    // umount2 syscall = 166
+    return sc3(166, (long)target, flags, 0);
+}
+
+long hy_reboot(int cmd) {
+    // reboot syscall = 169, requires magic numbers
+    return sc6(169, 0xfee1dead, 672274793 /* 0x28121969 */, cmd, 0, 0, 0);
+}
+
 /* getenv via /proc/self/environ — no libc needed.
    Scans null-separated KEY=VALUE entries for NAME=.
    Returns length written to buf on success, -1 on failure. */

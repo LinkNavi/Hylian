@@ -17,6 +17,9 @@ long     hy_fsize(int fd);
 int      hy_mkdir(const char *path, int mode);
 long     hy_getcwd(char *buf, hy_size size);
 long     hy_getenv(const char *name, char *buf, hy_size buf_len);
+long     hy_mount(const char *source, const char *target, const char *fstype, unsigned long flags, const void *data);
+long     hy_umount(const char *target, int flags);
+long     hy_reboot(int cmd);
 
 /* process spawning */
 long     hy_fork(void);

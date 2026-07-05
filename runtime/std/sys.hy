@@ -34,6 +34,8 @@ static int _SYS_WAIT4  = 61;
 static int _SYS_PIPE2  = 293;
 @target(linux)
 static int _SYS_DUP2   = 33;
+@target(linux)
+static int _SYS_GETPID = 39;
 
 @target(linux)
 static int _SYS_MOUNT  = 165;
