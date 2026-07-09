@@ -13,4 +13,7 @@ add_project_arguments('-flto', language : 'c')
 add_project_link_arguments('-flto', language : 'c')
 
 subdir('libhymir')
+subdir('libhyregalloc')
+subdir('libhyx64')
+subdir('libhyobj')
 subdir('tests')

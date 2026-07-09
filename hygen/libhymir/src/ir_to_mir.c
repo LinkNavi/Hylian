@@ -6,7 +6,7 @@
 /* ---- tiny temp_id/var_name -> MIRType maps ---- */
 
 typedef struct { int temp_id; MIRType type; } TempTypeEntry;
-typedef struct { char *name; MIRType type; } VarTypeEntry;
+typedef struct { char *name; MIRType type; int is_local; int local_id; } VarTypeEntry;
 
 typedef struct {
     TempTypeEntry *temps; int temp_count, temp_cap;
@@ -47,13 +47,36 @@ static MIRType tenv_get_temp(const TypeEnv *e, int temp_id) {
 
 static void tenv_set_var(TypeEnv *e, const char *name, MIRType t) {
     for (int i = 0; i < e->var_count; i++)
-        if (strcmp(e->vars[i].name, name) == 0) { e->vars[i].type = t; return; }
+        if (strcmp(e->vars[i].name, name) == 0) { e->vars[i].type = t; e->vars[i].is_local = 0; return; }
     if (e->var_count == e->var_cap) {
         e->var_cap *= 2;
         e->vars = realloc(e->vars, e->var_cap * sizeof(VarTypeEntry));
     }
     e->vars[e->var_count].name = strdup(name);
     e->vars[e->var_count].type = t;
+    e->vars[e->var_count].is_local = 0;
+    e->vars[e->var_count].local_id = -1;
+    e->var_count++;
+}
+
+/* params and ALLOCA'd locals go through here instead of tenv_set_var - they
+   need real per-call-frame storage (a MIRV_LOCAL slot), not the global/static
+   symbol mechanism, or two different functions with a same-named local (or
+   two calls to the same recursive function) would alias onto one another. */
+static void tenv_set_local(TypeEnv *e, const char *name, MIRType t, int local_id) {
+    for (int i = 0; i < e->var_count; i++)
+        if (strcmp(e->vars[i].name, name) == 0) {
+            e->vars[i].type = t; e->vars[i].is_local = 1; e->vars[i].local_id = local_id;
+            return;
+        }
+    if (e->var_count == e->var_cap) {
+        e->var_cap *= 2;
+        e->vars = realloc(e->vars, e->var_cap * sizeof(VarTypeEntry));
+    }
+    e->vars[e->var_count].name = strdup(name);
+    e->vars[e->var_count].type = t;
+    e->vars[e->var_count].is_local = 1;
+    e->vars[e->var_count].local_id = local_id;
     e->var_count++;
 }
 
@@ -61,6 +84,31 @@ static MIRType tenv_get_var(const TypeEnv *e, const char *name) {
     for (int i = 0; i < e->var_count; i++)
         if (strcmp(e->vars[i].name, name) == 0) return e->vars[i].type;
     return MIR_I64;
+}
+
+/* returns the local slot id, or -1 if `name` is a true global/static instead */
+static int tenv_local_id(const TypeEnv *e, const char *name) {
+    for (int i = 0; i < e->var_count; i++)
+        if (strcmp(e->vars[i].name, name) == 0) return e->vars[i].is_local ? e->vars[i].local_id : -1;
+    return -1;
+}
+
+/* builds the right MIRValue (local slot or global symbol) for referencing
+   the current value location of a Hylian variable by name - the one place
+   this decision gets made, so LOAD_VAR/STORE_VAR/ADDROF/asm-block variable
+   substitution all stay consistent with each other. */
+static MIRValue var_location(const TypeEnv *e, const char *name, MIRType t) {
+    int lid = tenv_local_id(e, name);
+    return lid >= 0 ? mir_local(lid, t) : mir_global(name, t);
+}
+
+/* used by STORE_VAR - the variable's local/global status and slot were
+   already decided at declaration time (ALLOCA/param/STATIC_VAR); a store
+   must not silently reset that, only refresh the tracked type */
+static void tenv_update_type(TypeEnv *e, const char *name, MIRType t) {
+    for (int i = 0; i < e->var_count; i++)
+        if (strcmp(e->vars[i].name, name) == 0) { e->vars[i].type = t; return; }
+    tenv_set_var(e, name, t); /* not previously declared - fall back to global, safe default */
 }
 
 /* Hylian's surface type names -> MIRType. Only int/float/bool exist as
@@ -134,9 +182,13 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
 
         case IR_FUNC_BEGIN: {
             fn = mir_func_new(mod, ins->str_extra ? ins->str_extra : "?");
+            fn->param_count = ins->param_count;
             for (int p = 0; p < ins->param_count; p++) {
                 MIRType t = type_name_to_mir(ins->params[p].type_name);
-                if (ins->params[p].name) tenv_set_var(&env, ins->params[p].name, t);
+                if (ins->params[p].name) {
+                    int lid = mir_new_local(fn);
+                    tenv_set_local(&env, ins->params[p].name, t, lid);
+                }
             }
             break;
         }
@@ -148,7 +200,10 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         case IR_ALLOCA: {
             /* str_extra = var name, str_extra2 = type name */
             MIRType t = type_name_to_mir(ins->str_extra2);
-            if (ins->str_extra) tenv_set_var(&env, ins->str_extra, t);
+            if (ins->str_extra) {
+                int lid = mir_new_local(fn);
+                tenv_set_local(&env, ins->str_extra, t, lid);
+            }
             break;
         }
 
@@ -198,16 +253,16 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
             MIRType t = tenv_get_var(&env, ins->str_extra);
             MIRInstr *m = mir_emit(fn, MIR_LOAD);
             m->dest = mir_vreg(ins->dest.temp_id, t);
-            m->src1 = mir_global(ins->str_extra, t); /* frontend resolves local vs global later */
+            m->src1 = var_location(&env, ins->str_extra, t);
             tenv_set_temp(&env, ins->dest.temp_id, t);
             break;
         }
 
         case IR_STORE_VAR: {
             MIRType t = tenv_get_temp(&env, ins->src1.temp_id);
-            tenv_set_var(&env, ins->str_extra, t);
+            tenv_update_type(&env, ins->str_extra, t);
             MIRInstr *m = mir_emit(fn, MIR_STORE);
-            m->dest = mir_global(ins->str_extra, t);
+            m->dest = var_location(&env, ins->str_extra, t);
             m->src1 = lower_operand(&ins->src1, &env, mod, fn);
             break;
         }
@@ -370,6 +425,29 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
 
         /* ---- calls ---- */
         case IR_CALL: {
+            /* `syscall(nr, a0, a1, ...)` is a compiler builtin, not a real
+               function - it lowers straight to MIR_SYSCALL, which already
+               does the Linux syscall ABI shuffling correctly (arg4 in r10,
+               not rcx). This replaces sys.hy's whole family of naked asm
+               wrappers (_sc3/_sc5/_sc_pread/_sc_pwrite/_sc_mmap) with a
+               single call the stdlib can use directly at any arity -
+               mmap's 6 real args, pread's 4, exit's 1, whatever the
+               specific syscall needs, no fixed-shape wrapper required. */
+            if (ins->str_extra && strcmp(ins->str_extra, "syscall") == 0) {
+                if (ins->arg_count < 1) {
+                    fprintf(stderr, "[ir_to_mir] syscall() needs at least a syscall number\n");
+                    break;
+                }
+                if (ins->arg_count > 7)
+                    fprintf(stderr, "[ir_to_mir] syscall() with >6 real args not supported\n");
+                MIRValue *args = lower_args(ins->args, ins->arg_count, &env, mod, fn);
+                MIRInstr *m = mir_emit(fn, MIR_SYSCALL);
+                m->args = args; m->arg_count = ins->arg_count;
+                m->dest = mir_vreg(ins->dest.temp_id, MIR_I64);
+                tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
+                break;
+            }
+
             MIRValue *args = lower_args(ins->args, ins->arg_count, &env, mod, fn);
             mir_build_call(fn, ins->str_extra, args, ins->arg_count, mir_vreg(ins->dest.temp_id, MIR_I64));
             tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
@@ -531,9 +609,10 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         case IR_ADDROF: {
-            MIRInstr *m = mir_emit(fn, MIR_LEA_GLOBAL);
+            int lid = tenv_local_id(&env, ins->str_extra);
+            MIRInstr *m = mir_emit(fn, lid >= 0 ? MIR_LEA_LOCAL : MIR_LEA_GLOBAL);
             m->dest = mir_vreg(ins->dest.temp_id, MIR_PTR);
-            m->src1 = mir_global(ins->str_extra, MIR_PTR); /* local-vs-global resolved later */
+            m->src1 = lid >= 0 ? mir_local(lid, MIR_PTR) : mir_global(ins->str_extra, MIR_PTR);
             tenv_set_temp(&env, ins->dest.temp_id, MIR_PTR);
             break;
         }
@@ -715,21 +794,139 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         /* ---- known, currently-unsolved gaps (same as codegen_elf.c) ---- */
-        case IR_INTERP_STR:
-            /* existing ELF backend only passes seg_count to hylian_interp_build,
-               never the actual segment data - that's a real bug upstream, not
-               just an unlowered op. Needs real design before mirroring it. */
-            warn_unhandled(ins);
-            mir_emit(fn, MIR_NOP);
-            break;
+        case IR_INTERP_STR: {
+            /* Literal-only interpolation is fully solvable here: since every
+               literal segment's content is known at compile time, the whole
+               result can just be precomputed and interned as one ordinary
+               string constant - same as a plain string literal, no runtime
+               buffer/copy needed at all.
 
-        case IR_ASM_BLOCK:
-            /* needs a real x86 assembler to turn text into MIR_ASM_RAW bytes -
-               that's libhyx64's job, not this pass's. Matches codegen_elf.c's
-               current stance (warn + skip) rather than pretending to solve it. */
-            warn_unhandled(ins);
-            mir_emit(fn, MIR_NOP);
+               Expression segments are a different story: InterpSegment's
+               is_expr=1 case carries raw, UNPARSED expression source text
+               (see ast.h) - lower.c hands it straight through without ever
+               evaluating it into IR. ir_to_mir.c has no parser/typechecker
+               available to it (that machinery is lower.c's alone), so it
+               structurally cannot evaluate that text itself. This is a real
+               gap in lower.c, not something fixable from this pass - so
+               instead of faking success, this drops each expr segment's
+               contribution with a specific, loud diagnostic naming exactly
+               which segment couldn't be evaluated and why, and still
+               produces a real (if incomplete) result from whatever literal
+               segments exist. */
+            size_t cap = 64;
+            char *buf = malloc(cap);
+            size_t len = 0;
+            int had_expr = 0;
+
+            for (int s = 0; s < ins->extra_seg_count; s++) {
+                InterpSegment *seg = &ins->extra_segs[s];
+                if (seg->is_expr) {
+                    had_expr = 1;
+                    fprintf(stderr,
+                        "[ir_to_mir] IR_INTERP_STR: expression segment '%s' was not "
+                        "evaluated (lower.c hands interp-string expressions through as "
+                        "raw unparsed source text - ir_to_mir.c has no expression "
+                        "evaluator available to it, that needs a fix in lower.c itself, "
+                        "not here). This segment is omitted from the result.\n",
+                        seg->text ? seg->text : "?");
+                    continue;
+                }
+                const char *t = seg->text ? seg->text : "";
+                size_t tlen = strlen(t);
+                if (len + tlen + 1 > cap) {
+                    while (len + tlen + 1 > cap) cap *= 2;
+                    buf = realloc(buf, cap);
+                }
+                memcpy(buf + len, t, tlen);
+                len += tlen;
+            }
+            buf[len] = '\0';
+
+            if (had_expr)
+                fprintf(stderr,
+                    "[ir_to_mir] IR_INTERP_STR: result is INCOMPLETE (literal segments "
+                    "only) - one or more {expr} segments above couldn't be evaluated\n");
+
+            const char *lbl = mir_module_intern_string(mod, buf, (int)len);
+            MIRInstr *m = mir_emit(fn, MIR_LEA_GLOBAL);
+            m->dest = mir_vreg(ins->dest.temp_id, MIR_PTR);
+            m->src1 = mir_global(lbl, MIR_PTR);
+            tenv_set_temp(&env, ins->dest.temp_id, MIR_PTR);
+            free(buf);
             break;
+        }
+
+        case IR_ASM_BLOCK: {
+            /* rewrite {varname} -> {N} and build args[] so MIR stays
+               frontend-blind (it never sees Hylian variable names) - the
+               mini-assembler in libhyx64 only ever deals with positional
+               placeholders, resolving them to real registers post-regalloc. */
+            const char *src = ins->str_extra ? ins->str_extra : "";
+            size_t cap = strlen(src) + 256;
+            char *out = malloc(cap);
+            size_t out_len = 0;
+
+            char names[16][128];
+            int name_count = 0;
+
+            while (*src) {
+                if (*src == '{') {
+                    const char *end = src + 1;
+                    while (*end && *end != '}') end++;
+                    int len = (int)(end - (src + 1));
+                    if (len > 0 && len < 127) {
+                        char varname[128];
+                        memcpy(varname, src + 1, len);
+                        varname[len] = '\0';
+
+                        int idx = -1;
+                        for (int i = 0; i < name_count; i++)
+                            if (strcmp(names[i], varname) == 0) { idx = i; break; }
+                        if (idx < 0 && name_count < 16) {
+                            size_t cpylen = strlen(varname) < sizeof(names[0]) - 1 ? strlen(varname) : sizeof(names[0]) - 1;
+                            memcpy(names[name_count], varname, cpylen);
+                            names[name_count][cpylen] = '\0';
+                            idx = name_count++;
+                        }
+
+                        char numbuf[16];
+                        int nlen = snprintf(numbuf, sizeof(numbuf), "{%d}", idx < 0 ? 0 : idx);
+                        if (out_len + nlen >= cap) { cap = (out_len + nlen) * 2; out = realloc(out, cap); }
+                        memcpy(out + out_len, numbuf, nlen);
+                        out_len += nlen;
+                    }
+                    src = *end ? end + 1 : end;
+                } else {
+                    if (out_len + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+                    out[out_len++] = *src++;
+                }
+            }
+            out[out_len] = '\0';
+
+            MIRValue *args = name_count > 0 ? malloc(name_count * sizeof(MIRValue)) : NULL;
+            for (int i = 0; i < name_count; i++) {
+                MIRType t = tenv_get_var(&env, names[i]);
+                /* IROP_NONE-shaped lookup: reuse LOAD_VAR's own convention -
+                   the variable's *current value*, not its address, is what
+                   {varname} has always meant here (matches the old codegen's
+                   {varname} -> "rbp - N" being used as/inside a memory operand
+                   by the asm author themselves, e.g. writing {ptr} directly
+                   where a register holding a pointer value is expected). */
+                MIRInstr *ld = mir_emit(fn, MIR_LOAD);
+                int v = mir_new_vreg(fn);
+                ld->dest = mir_vreg(v, t);
+                ld->src1 = var_location(&env, names[i], t);
+                args[i] = mir_vreg(v, t);
+            }
+
+            MIRInstr *m = mir_emit(fn, MIR_ASM_TEXT);
+            m->asm_text = out; /* transfers ownership - freed with the MIR module's lifetime is
+                                   out of scope here; this leaks today, same as other str_extra
+                                   copies in this pass - not solved in this session */
+            m->args = args;
+            m->arg_count = name_count;
+            break;
+        }
 
         case IR_NOP:
             mir_emit(fn, MIR_NOP);

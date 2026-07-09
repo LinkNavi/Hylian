@@ -4,3 +4,24 @@ libhymir/       # MIR types, IR->MIR lowering — pure C, no target knowledge
 libhyregalloc/  # linear scan over MIR, target owns register set
 libhyx64/       # x86-64 encoder: MIRValue+op -> bytes+relocs
 libhyobj/       # ELF (and later PE/Mach-O) writer, takes bytes+relocs+symbols
+
+What needs to be done for each release:
+
+0.1.0:
+
+Rewrite Linkle In Either CPP or Hylian, minimal at most package support
+Clean Package Creation and Import Jank
+Asm and elf compilation removed
+hygen fully working with only x86_64 and linux support
+A good example of actual use
+Repo Cleaned
+Primitives like \n
+Docs done
+Bug Hunted
+Social Media Post
+
+0.2.0:
+Full windows support
+Improved safety
+Improved Typechecking
+

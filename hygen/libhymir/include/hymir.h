@@ -36,6 +36,7 @@ typedef enum {
     MIRV_IMM_FLOAT,
     MIRV_LABEL,    /* block/label id */
     MIRV_GLOBAL,   /* symbol name (string interned elsewhere) */
+    MIRV_LOCAL,    /* per-call-frame local slot id - see mir_local() */
 } MIRValueKind;
 
 typedef struct {
@@ -47,6 +48,7 @@ typedef struct {
         double   imm_float;
         int      label_id;
         const char *global_name;
+        int      local_id;
     };
 } MIRValue;
 
@@ -99,6 +101,22 @@ typedef enum {
     MIR_SAVE_REGS, MIR_RESTORE_REGS,
 
     MIR_MEMSET, MIR_MEMCPY,  /* self-contained, no libc call */
+    MIR_SYSCALL,             /* dest = syscall(nr=args[0], args[1..arg_count-1]) - raw
+                                 kernel call, Linux syscall ABI (arg4 in r10, not rcx).
+                                 nr is a runtime value (loaded into rax), not extra_int,
+                                 since Hylian's stdlib already treats syscall numbers as
+                                 ordinary function parameters (_sc3/_sc5 wrappers). */
+
+    MIR_ASM_TEXT,            /* inline asm block. asm_text holds real x86 text with
+                                 {0},{1},... placeholders instead of the user's {varname} -
+                                 the frontend (ir_to_mir.c) does that rewrite so MIR itself
+                                 stays frontend-blind (it never sees Hylian variable names).
+                                 args[N] is the operand {N} refers to, and is a normal MIR
+                                 use - regalloc sees it exactly like a call arg, so it can't
+                                 reallocate that vreg's register out from under the asm
+                                 block. libhyx64's mini-assembler resolves {N} to a real
+                                 register name (or loads a spill into scratch) and encodes
+                                 the result for real, post-regalloc, in lower_x64.c. */
 
     MIR_NOP,
 } MIROp;
@@ -122,6 +140,10 @@ typedef struct {
        bytes (e.g. for fixed short privileged sequences it hand-assembles once). */
     const uint8_t *raw_bytes;
     int            raw_len;
+
+    /* MIR_ASM_TEXT: x86 asm source text with {0},{1},... placeholders -
+       see the MIR_ASM_TEXT opcode comment above. */
+    const char    *asm_text;
 } MIRInstr;
 
 typedef struct {
@@ -130,6 +152,10 @@ typedef struct {
     int       count;
     int       cap;
     int       vreg_count;   /* next fresh vreg id to allocate */
+    int       local_count;  /* next fresh local slot id to allocate - see mir_new_local() */
+    int       param_count;  /* how many of the first local_count slots are incoming params,
+                                in declaration order - backend's prologue uses this to know
+                                how many SysV arg registers to spill into local slots */
     int       is_naked;     /* skip prologue/epilogue, e.g. syscall wrappers/ISR */
 } MIRFunc;
 
@@ -167,12 +193,14 @@ void       mir_module_free(MIRModule *mod);
 MIRFunc   *mir_func_new(MIRModule *mod, const char *name);
 MIRInstr  *mir_emit(MIRFunc *fn, MIROp op);
 int        mir_new_vreg(MIRFunc *fn);
+int        mir_new_local(MIRFunc *fn); /* allocates a fresh per-call-frame local slot id */
 
 MIRValue mir_vreg(int id, MIRType type);
 MIRValue mir_imm_int(int64_t v, MIRType type);
 MIRValue mir_imm_float(double v, MIRType type);
 MIRValue mir_label(int id);
 MIRValue mir_global(const char *name, MIRType type);
+MIRValue mir_local(int id, MIRType type);
 MIRValue mir_none(void);
 
 /* interns a string constant into the module, returns a stable label name

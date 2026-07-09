@@ -1,0 +1,20 @@
+Projects should be workspase based with two types:
+
+Binary:
+Actual programms that can be run
+
+Libraries:
+Just a workspace that adds functionallity to the Binaries
+
+Theorised formats:
+
+C and hy files just get compiled together, hyi file is just a way for the user to include files and for the lsp to know what variables are defined and what can be called
+
+Do research to see how packages are handled in Zig's and Go's repo
+
+
+Packages Requirements:
+
+Versioning checking
+A sole place to upload packages, no searching for repos
+A way to just avoid dependecy hell 

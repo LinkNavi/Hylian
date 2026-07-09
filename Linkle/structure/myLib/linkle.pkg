@@ -1,0 +1,8 @@
+name = "myLib"
+version = "1.2.0"
+type = "Bin"          # or "Lib"
+hylian = "0.2.0"         # compiler version requirement
+
+[deps]
+nayru = "^2.0.0"         # from hylian.lol registry
+

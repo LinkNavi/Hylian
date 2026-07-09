@@ -5,8 +5,8 @@
 # Installs:
 #   /usr/local/bin/hylian               — compiler binary
 #   /usr/local/bin/linkle               — build system wrapper
-#   /usr/local/lib/hylian/std/          — stdlib .o, .hyi, and .hy files
-#   /usr/local/lib/hylian/std/platform/ — platform .o files (linux, kernel, limine…)
+#   /usr/local/lib/hylian/std/          — stdlib .hy (and .hyi/.o if present)
+#   /usr/local/lib/hylian/std/platform/ — platform files (linux, kernel, limine…)
 #   /usr/local/lib/hylian/linkle.py     — build system source
 #
 # Usage:
@@ -169,10 +169,6 @@ if [ "$NO_BUILD" -eq 0 ]; then
             exit 1
         fi
         ok "Compiler built"
-
-        info "Building runtime objects"
-        python3 build_runtime.py $build_args
-        ok "Runtime built"
     fi
 else
     step "Skipping build (--no-build)"
@@ -195,23 +191,20 @@ if [ ! -f "./hylian" ]; then
 fi
 ok "Compiler binary: ./hylian"
 
-if [ ! -d "./runtime" ]; then
-    fail "Runtime directory './runtime' not found."
+if [ ! -d "./stdlib" ]; then
+    fail "Stdlib directory './stdlib' not found."
     exit 1
 fi
 
-# Count all .o files across runtime/std/ AND runtime/platform/
-std_count=$(find ./runtime/std -name "*.o" 2>/dev/null | wc -l | tr -d ' ')
-plat_count=$(find ./runtime/platform -name "*.o" 2>/dev/null | wc -l | tr -d ' ')
-total_count=$((std_count + plat_count))
+# Count all .hy source files across the whole ./stdlib tree (includes
+# nested dirs like stdlib/os/ and stdlib/platform/)
+hy_count=$(find ./stdlib -name "*.hy" 2>/dev/null | wc -l | tr -d ' ')
 
-if [ "$total_count" -eq 0 ]; then
-    fail "No runtime .o files found in ./runtime/"
-    fail "Run ./build.sh (or python3 build_runtime.py) first."
+if [ "$hy_count" -eq 0 ]; then
+    fail "No .hy files found in ./stdlib/"
     exit 1
 fi
-ok "Stdlib modules:   ${std_count} .o files"
-ok "Platform objects: ${plat_count} .o files (linux, kernel, limine…)"
+ok "Stdlib sources: ${hy_count} .hy files"
 
 if [ ! -f "./linkle.py" ]; then
     fail "linkle.py not found."
@@ -227,7 +220,7 @@ for d in \
     "$BIN_DIR" \
     "$STD_DIR" \
     "$PLATFORM_DIR" \
-    "$STD_DIR/system" \
+    "$STD_DIR/os" \
     "$STD_DIR/networking"
 do
     if [ ! -d "$d" ]; then
@@ -246,50 +239,23 @@ maybe_sudo "$BIN_DIR" -- cp ./hylian "${BIN_DIR}/hylian"
 maybe_sudo "$BIN_DIR" -- chmod 755   "${BIN_DIR}/hylian"
 ok "hylian  →  ${BIN_DIR}/hylian"
 
-# ── Step 5: Install stdlib runtime (.o and .hyi) ──────────────────────────────
+# ── Step 5: Install stdlib ────────────────────────────────────────────────────
+#
+# ./stdlib/ now holds the whole standard library tree, including the
+# platform-specific files under ./stdlib/platform/ (e.g. linux_x86_64.hy).
+# We walk it once and mirror the relative paths into STD_DIR, so
+# stdlib/platform/linux_x86_64.hy lands at std/platform/linux_x86_64.hy —
+# i.e. exactly at PLATFORM_DIR, with no separate platform-copy step needed.
 
-step "Installing stdlib runtime"
+step "Installing stdlib"
 
-# Copy every .o from runtime/std/ → STD_DIR/, preserving subdirectory structure
-std_copied=0
-while IFS= read -r -d '' obj; do
-    rel="${obj#./runtime/std/}"          # e.g. "io.o" or "networking/tcp.o"
-    dest="${STD_DIR}/${rel}"
-    dest_dir="$(dirname "$dest")"
-
-    if [ ! -d "$dest_dir" ]; then
-        maybe_sudo "$STD_DIR" -- mkdir -p "$dest_dir"
-    fi
-
-    maybe_sudo "$dest_dir" -- cp "$obj" "$dest"
-    [ "$VERBOSE" -eq 1 ] && dim "std  $rel"
-    std_copied=$((std_copied + 1))
-done < <(find ./runtime/std -name "*.o" -print0)
-
-ok "Copied ${std_copied} stdlib .o files → ${STD_DIR}"
-
-# Copy every .hyi interface file
-hyi_copied=0
-while IFS= read -r -d '' hyi; do
-    rel="${hyi#./runtime/std/}"
-    dest="${STD_DIR}/${rel}"
-    dest_dir="$(dirname "$dest")"
-
-    if [ ! -d "$dest_dir" ]; then
-        maybe_sudo "$STD_DIR" -- mkdir -p "$dest_dir"
-    fi
-
-    maybe_sudo "$dest_dir" -- cp "$hyi" "$dest"
-    [ "$VERBOSE" -eq 1 ] && dim "hyi  $rel"
-    hyi_copied=$((hyi_copied + 1))
-done < <(find ./runtime/std -name "*.hyi" -print0)
-
-ok "Copied ${hyi_copied} .hyi interface files → ${STD_DIR}"
-
-# Copy every .hy source file (so the compiler can rebuild from source)
 hy_copied=0
-while IFS= read -r -d '' hy; do
-    rel="${hy#./runtime/std/}"
+hyi_copied=0
+o_copied=0
+ld_copied=0
+
+while IFS= read -r -d '' src; do
+    rel="${src#./stdlib/}"
     dest="${STD_DIR}/${rel}"
     dest_dir="$(dirname "$dest")"
 
@@ -297,54 +263,27 @@ while IFS= read -r -d '' hy; do
         maybe_sudo "$STD_DIR" -- mkdir -p "$dest_dir"
     fi
 
-    maybe_sudo "$dest_dir" -- cp "$hy" "$dest"
-    [ "$VERBOSE" -eq 1 ] && dim "hy   $rel"
-    hy_copied=$((hy_copied + 1))
-done < <(find ./runtime/std -name "*.hy" -print0)
+    maybe_sudo "$dest_dir" -- cp "$src" "$dest"
+    [ "$VERBOSE" -eq 1 ] && dim "std  $rel"
+
+    case "$src" in
+        *.hy)  hy_copied=$((hy_copied + 1)) ;;
+        *.hyi) hyi_copied=$((hyi_copied + 1)) ;;
+        *.o)   o_copied=$((o_copied + 1)) ;;
+        *.ld)  ld_copied=$((ld_copied + 1)) ;;
+    esac
+done < <(find ./stdlib -type f \( -name "*.hy" -o -name "*.hyi" -o -name "*.o" -o -name "*.ld" \) -print0)
 
 ok "Copied ${hy_copied} .hy source files → ${STD_DIR}"
+[ "$hyi_copied" -gt 0 ] && ok "Copied ${hyi_copied} .hyi interface files → ${STD_DIR}"
+[ "$o_copied" -gt 0 ]   && ok "Copied ${o_copied} .o object files → ${STD_DIR}"
+[ "$ld_copied" -gt 0 ]  && ok "Copied ${ld_copied} linker scripts → ${PLATFORM_DIR}"
 
-# ── Step 6: Install platform objects ──────────────────────────────────────────
-#
-# Platform files live at runtime/platform/{linux,kernel,limine,macos,windows}.o
-# They must be installed to STD_DIR/platform/ so that linkle can find them
-# at /usr/local/lib/hylian/std/platform/<target>.o
-#
-# This is the bug that caused:
-#   ✗ no platform file for target 'linux': /usr/local/lib/hylian/std/platform/linux.c
-
-step "Installing platform objects"
-
-plat_copied=0
-while IFS= read -r -d '' obj; do
-    fname="$(basename "$obj")"
-    dest="${PLATFORM_DIR}/${fname}"
-
-    maybe_sudo "$PLATFORM_DIR" -- cp "$obj" "$dest"
-    [ "$VERBOSE" -eq 1 ] && dim "platform  $fname"
-    plat_copied=$((plat_copied + 1))
-done < <(find ./runtime/platform -maxdepth 1 -name "*.o" -print0)
-
-# Also copy linker scripts (.ld files) from runtime/platform/
-ld_copied=0
-while IFS= read -r -d '' ld; do
-    fname="$(basename "$ld")"
-    dest="${PLATFORM_DIR}/${fname}"
-
-    maybe_sudo "$PLATFORM_DIR" -- cp "$ld" "$dest"
-    [ "$VERBOSE" -eq 1 ] && dim "linker script  $fname"
-    ld_copied=$((ld_copied + 1))
-done < <(find ./runtime/platform -maxdepth 1 -name "*.ld" -print0)
-
-ok "Copied ${plat_copied} platform .o files → ${PLATFORM_DIR}"
-[ "$ld_copied" -gt 0 ] && ok "Copied ${ld_copied} linker scripts → ${PLATFORM_DIR}"
-
-if [ "$plat_copied" -eq 0 ]; then
-    warn "No platform .o files found in ./runtime/platform/"
-    warn "Run 'python3 build_runtime.py' to build them, then re-run install."
+if [ ! -d "./stdlib/platform" ] || [ -z "$(find ./stdlib/platform -type f 2>/dev/null)" ]; then
+    warn "No platform files found in ./stdlib/platform/"
 fi
 
-# ── Step 7: Install linkle & hylian-release ──────────────────────────────────
+# ── Step 6: Install linkle & hylian-release ──────────────────────────────────
 
 step "Installing linkle"
 
@@ -386,7 +325,7 @@ RELEASE_EOF
     ok "hylian-release  →  ${BIN_DIR}/hylian-release"
 fi
 
-# ── Step 8: Smoke test ────────────────────────────────────────────────────────
+# ── Step 7: Smoke test ────────────────────────────────────────────────────────
 
 step "Smoke test"
 
@@ -405,11 +344,11 @@ else
 fi
 
 # Quick sanity: make sure the platform directory was actually populated
-if [ -f "${PLATFORM_DIR}/linux.o" ] || [ -f "${PLATFORM_DIR}/kernel.o" ]; then
-    ok "Platform objects present at ${PLATFORM_DIR}"
+if [ -n "$(find "${PLATFORM_DIR}" -type f 2>/dev/null)" ]; then
+    ok "Platform files present at ${PLATFORM_DIR}"
 else
     warn "Platform directory appears empty: ${PLATFORM_DIR}"
-    warn "Re-run with: python3 build_runtime.py && ./install.sh --no-build"
+    warn "Check that ./stdlib/platform/ contains files, then re-run install."
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────

@@ -1,0 +1,11 @@
+project example
+
+myApp{
+path: ./myApp
+type: Bin
+}
+
+myLib{
+path: ./myLib
+type: Lib
+}

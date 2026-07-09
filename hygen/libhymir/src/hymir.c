@@ -51,6 +51,10 @@ int mir_new_vreg(MIRFunc *fn) {
     return fn->vreg_count++;
 }
 
+int mir_new_local(MIRFunc *fn) {
+    return fn->local_count++;
+}
+
 MIRInstr *mir_emit(MIRFunc *fn, MIROp op) {
     if (fn->count == fn->cap) {
         fn->cap *= 2;
@@ -101,6 +105,14 @@ MIRValue mir_global(const char *name, MIRType type) {
     v.kind = MIRV_GLOBAL;
     v.type = type;
     v.global_name = name;
+    return v;
+}
+
+MIRValue mir_local(int id, MIRType type) {
+    MIRValue v = {0};
+    v.kind = MIRV_LOCAL;
+    v.type = type;
+    v.local_id = id;
     return v;
 }
 
@@ -182,6 +194,8 @@ const char *mir_op_name(MIROp op) {
     case MIR_OUTB: return "outb"; case MIR_INB: return "inb";
     case MIR_SAVE_REGS: return "save_regs"; case MIR_RESTORE_REGS: return "restore_regs";
     case MIR_MEMSET: return "memset"; case MIR_MEMCPY: return "memcpy";
+    case MIR_SYSCALL: return "syscall";
+    case MIR_ASM_TEXT: return "asm_text";
     case MIR_NOP: return "nop";
     }
     return "?";
@@ -194,6 +208,7 @@ static void dump_val(const MIRValue *v, FILE *out) {
     case MIRV_IMM_FLOAT: fprintf(out, "%f", v->imm_float); break;
     case MIRV_LABEL: fprintf(out, ".L%d", v->label_id); break;
     case MIRV_GLOBAL: fprintf(out, "@%s", v->global_name); break;
+    case MIRV_LOCAL: fprintf(out, "local%d", v->local_id); break;
     }
 }
 
@@ -240,6 +255,19 @@ static int is_float_op(MIROp op) {
     }
 }
 
+static int scan_max_vreg_id(const MIRFunc *fn) {
+    int max_id = -1;
+    for (int i = 0; i < fn->count; i++) {
+        const MIRInstr *ins = &fn->instrs[i];
+        const MIRValue *vs[3] = { &ins->dest, &ins->src1, &ins->src2 };
+        for (int k = 0; k < 3; k++)
+            if (vs[k]->kind == MIRV_VREG && vs[k]->vreg > max_id) max_id = vs[k]->vreg;
+        for (int a = 0; a < ins->arg_count; a++)
+            if (ins->args[a].kind == MIRV_VREG && ins->args[a].vreg > max_id) max_id = ins->args[a].vreg;
+    }
+    return max_id + 1;
+}
+
 MIRVerifyResult mir_verify(const MIRModule *mod) {
     MIRVerifyResult r = {1, ""};
 
@@ -247,9 +275,19 @@ MIRVerifyResult mir_verify(const MIRModule *mod) {
         MIRFunc *fn = mod->funcs[fi];
         if (fn->count == 0) continue;
 
+        /* fn->vreg_count only counts mir_new_vreg() calls - frontends that
+           assign vreg ids some other way (e.g. reusing the source IR's own
+           temp counter directly, which ir_to_mir.c does for most temps)
+           can leave it undercounting the real max id used. Scan for the
+           real bound instead of trusting it, same defense regalloc_run
+           already has for exactly this reason. */
+        int nvregs = fn->vreg_count;
+        int scanned = scan_max_vreg_id(fn);
+        if (scanned > nvregs) nvregs = scanned;
+
         /* track vreg definitions seen so far (dense-ish ids, linear scan is fine
            for typical function sizes) */
-        int *defined = calloc(fn->vreg_count + 1, sizeof(int));
+        int *defined = calloc(nvregs + 1, sizeof(int));
 
         for (int i = 0; i < fn->count; i++) {
             MIRInstr *ins = &fn->instrs[i];
@@ -293,7 +331,11 @@ MIRVerifyResult mir_verify(const MIRModule *mod) {
             if (ins->dest.kind == MIRV_VREG) defined[ins->dest.vreg] = 1;
         }
 
-        if (!is_terminator(fn->instrs[fn->count - 1].op)) {
+        /* naked functions opt out of normal function conventions - they may
+           legitimately end via a non-returning syscall (exit), an infinite
+           loop, or a jump out via inline asm, none of which are one of the
+           recognized terminator ops */
+        if (!fn->is_naked && !is_terminator(fn->instrs[fn->count - 1].op)) {
             snprintf(r.msg, sizeof(r.msg),
                 "func %s: doesn't end in a terminator (ret/jmp/jmp_if/jmp_unless/iret)",
                 fn->name);
