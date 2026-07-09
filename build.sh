@@ -102,7 +102,11 @@ fi
     exit 1
   fi
 
-  run gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c  codegen_elf.c typecheck.c compiler.c -o ../hylian
+  run  gcc lex.yy.c parser.tab.c ast.c ir.c ir_to_mir.c lower.c opt.c codegen_hygen.c typecheck.c compiler.c \
+  -I../hygen/libhymir/include -I../hygen/libhyregalloc/include -I../hygen/libhyx64/include -I../hygen/libhyobj/include \
+  ../hygen/build/libhymir/libhymir.a ../hygen/build/libhyregalloc/libhyregalloc.a \
+  ../hygen/build/libhyx64/libhyx64.a ../hygen/build/libhyobj/libhyobj.a \
+  -o ../hylian
 
   if [[ $? -ne 0 ]]; then
     fail "gcc compilation failed"

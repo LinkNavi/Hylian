@@ -162,8 +162,11 @@ if [ "$NO_BUILD" -eq 0 ]; then
             cd compiler
             bison -d parser.y 2>/dev/null
             flex lexer.l 2>/dev/null
-            gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c codegen_elf.c typecheck.c compiler.c -o ../hylian
-        )
+           gcc lex.yy.c parser.tab.c ast.c ir.c ir_to_mir.c lower.c opt.c codegen_hygen.c typecheck.c compiler.c \
+  -I../hygen/libhymir/include -I../hygen/libhyregalloc/include -I../hygen/libhyx64/include -I../hygen/libhyobj/include \
+  ../hygen/build/libhymir/libhymir.a ../hygen/build/libhyregalloc/libhyregalloc.a \
+  ../hygen/build/libhyx64/libhyx64.a ../hygen/build/libhyobj/libhyobj.a \
+  -o ../hylian        )
         if [ $? -ne 0 ]; then
             fail "Compiler build failed — aborting install."
             exit 1

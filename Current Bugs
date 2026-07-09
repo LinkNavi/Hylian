@@ -1,0 +1,31 @@
+➜  Hylian git:(master) ✗ hylian hello.hy
+/usr/local/lib/hylian/std/io.hy:84: error: syntax error, unexpected IF, expecting LBRACE
+  hint: control-flow keyword in an unexpected position — check surrounding braces and semicolons
+/usr/local/lib/hylian/std/string.hy:151: error: syntax error, unexpected LPAREN, expecting LBRACKET or SEMICOLON or ASSIGN
+  hint: unexpected ( — did you forget the function name or a type annotation?
+/usr/local/lib/hylian/std/string.hy:189: error: syntax error, unexpected LPAREN, expecting LBRACKET or SEMICOLON or ASSIGN
+  hint: unexpected ( — did you forget the function name or a type annotation?
+/usr/local/lib/hylian/std/string.hy:195: error: syntax error, unexpected LPAREN, expecting LBRACKET or SEMICOLON or ASSIGN
+  hint: unexpected ( — did you forget the function name or a type annotation?
+hello.hy:0: error: call to undefined function 'syscall'
+hello.hy:0: error: call to undefined function 'syscall'
+hello.hy:0: error: call to undefined function 'syscall'
+hello.hy:0: error: call to undefined function 'syscall'
+hello.hy:0: error: call to undefined function 'syscall'
+hello.hy:0: error: call to undefined function '_is_space'
+hello.hy:0: error: call to undefined function '_is_space'
+hello.hy:0: error: call to undefined function '_to_upper_byte'
+hello.hy:0: error: call to undefined function '_to_lower_byte'
+hylian: lower.c:483: lower_expr: Assertion `ins->str_extra != NULL && "IR_STORE_PTR: pointee type not propagated"' failed.
+[1]    27518 IOT instruction (core dumped)  hylian hello.hy
+➜  Hylian git:(master) ✗
+
+Specifics:
+
+WE NEED ELSE IF SUPPORT (urgent)
+
+Lsp auto complete has both stdlib.io and std.io, most likely something to do with devInstall.sh
+
+typecheck doesnt like syscall
+
+cant file underscore funcs

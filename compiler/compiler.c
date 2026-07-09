@@ -4,8 +4,7 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include "ast.h"
-#include "codegen_asm.h"
-#include "codegen_elf.h"
+#include "codegen_hygen.h"
 #include "ir.h"
 #include "lower.h"
 #include "opt.h"
@@ -696,12 +695,11 @@ int main(int argc, char **argv) {
     const char *target      = "linux";
     int dump_ir = 0;
     int freestanding = 0;
-    int emit_elf = 0; /* 0 = asm (default), 1 = direct ELF */
 
     /* Parse arguments:
          hylian <input.hy>
-         hylian <input.hy> -o <output.asm>
-         hylian <input.hy> -o <output.asm> --src-dir <dir>
+         hylian <input.hy> -o <output.o>
+         hylian <input.hy> -o <output.o> --src-dir <dir>
          hylian <input.hy> --target <linux|macos|windows|limine>
          hylian <input.hy> --dump-ir
          hylian <input.hy> --freestanding */
@@ -725,29 +723,21 @@ int main(int argc, char **argv) {
             dump_ir = 1;
         } else if (strcmp(argv[i], "--freestanding") == 0) {
             freestanding = 1;
-        } else if (strcmp(argv[i], "--emit") == 0 && i + 1 < argc) {
-            const char *mode = argv[++i];
-            if (strcmp(mode, "elf") == 0)       emit_elf = 1;
-            else if (strcmp(mode, "asm") == 0)  emit_elf = 0;
-            else {
-                fprintf(stderr, "hylian: unknown emit mode '%s' (must be asm or elf)\n", mode);
-                return 1;
-            }
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
         } else {
             fprintf(stderr, "hylian: unknown option '%s'\n", argv[i]);
-            fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir] [--freestanding]\n");
+            fprintf(stderr, "usage: hylian <input.hy> [-o output.o] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir] [--freestanding]\n");
             return 1;
         }
     }
 
     if (!output_file)
-        output_file = emit_elf ? "output.o" : "output.asm";
+        output_file = "output.o";
 
     if (!input_file) {
         fprintf(stderr, "hylian: no input file specified\n");
-        fprintf(stderr, "usage: hylian <input.hy> [-o output.asm] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir]\n");
+        fprintf(stderr, "usage: hylian <input.hy> [-o output.o] [--src-dir dir] [--target linux|macos|windows|limine] [--dump-ir]\n");
         return 1;
     }
 
@@ -775,20 +765,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n");
     }
 
-    if (emit_elf) {
-        if (codegen_elf(mod, output_file, input_file, target, freestanding) != 0) {
-            ir_module_free(mod);
-            return 1;
-        }
-    } else {
-        FILE *out = fopen(output_file, "w");
-        if (!out) {
-            fprintf(stderr, "hylian: cannot open output file '%s'\n", output_file);
-            ir_module_free(mod);
-            return 1;
-        }
-        codegen_ir(mod, out, input_file, target, freestanding);
-        fclose(out);
+    /* hygen always emits a linkable ELF64 object; there's no separate
+       "asm text" output mode anymore, so -o without --emit-elf should
+       still land on a .o rather than the old .asm default. */
+    if (codegen_hygen(mod, output_file, input_file, target, freestanding) != 0) {
+        ir_module_free(mod);
+        return 1;
     }
     ir_module_free(mod);
     printf("Generated %s\n", output_file);

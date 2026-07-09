@@ -401,13 +401,6 @@ RegAllocResult regalloc_run(const MIRFunc *fn, const RegAllocTarget *target) {
     int nvregs = fn->vreg_count;
     int scanned = scan_max_vreg(fn);
     if (scanned > nvregs) nvregs = scanned;
-
-    if (nvregs < 0) {
-        /* fn->vreg_count was garbage/negative — bail out rather than
-           feed a negative count into malloc sizing below */
-        res.vreg_count = 0;
-        return res;
-    }
     if (nvregs == 0) { res.vreg_count = 0; return res; }
 
     res.vreg_locs = calloc(nvregs, sizeof(MCLoc));
