@@ -376,6 +376,16 @@ static void index_program(ProgramNode *prog,
 }
 
 
+static int scan_dir_is_internal(const char *name) {
+    static const char *skip[] = {
+        "stdlib", "runtime", "compiler", "lsp", "hygen",
+        "node_modules", "target", "build", "dist", ".git", NULL
+    };
+    for (int i = 0; skip[i]; i++)
+        if (strcmp(name, skip[i]) == 0) return 1;
+    return 0;
+}
+
 static void scan_dir(LspProject *proj, const char *dir_path)
 {
     lsp_log("[lsp_analysis] scan_dir: %s", dir_path);
@@ -403,6 +413,8 @@ static void scan_dir(LspProject *proj, const char *dir_path)
 
         if (S_ISDIR(st.st_mode))
         {
+            if (scan_dir_is_internal(ent->d_name))
+                continue;
             scan_dir(proj, full);
         }
         else if (S_ISREG(st.st_mode))

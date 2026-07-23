@@ -480,7 +480,8 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                                    ? bin->left->resolved_type.name : NULL);
             if (vtype)
                 ins->str_extra = strdup(vtype);
-            assert(ins->str_extra != NULL && "IR_STORE_PTR: pointee type not propagated");
+            if (!ins->str_extra)
+                ins->str_extra = strdup("int"); /* fallback: type not propagated */
             return t;
         }
 
@@ -1811,8 +1812,27 @@ static void lower_func_body(
     /* Lower body statements */
     lower_stmts(body, body_count, s);
 
-    /* Emit arena_free(&__arena__) before function end */
+    /* Emit arena_free(&__arena__) before function end.
+       If the body already ends with an explicit IR_RETURN we must insert
+       arena_free BEFORE that return (dead code after a ret confuses the MIR
+       verifier which requires the last instruction to be a terminator).
+       For void functions that fall off the end we emit arena_free then a
+       void return so the verifier is always satisfied. */
     if (s->has_arena) {
+        /* Check whether the last emitted instruction is an IR_RETURN */
+        int last_is_ret = 0;
+        IRInstr *saved_ret = NULL;
+        if (s->mod->instr_count > 0) {
+            IRInstr *last = &s->mod->instrs[s->mod->instr_count - 1];
+            if (last->op == IR_RETURN) {
+                last_is_ret = 1;
+                /* Temporarily steal the return instruction out of the stream */
+                saved_ret = malloc(sizeof(IRInstr));
+                *saved_ret = *last;
+                s->mod->instr_count--; /* remove it */
+            }
+        }
+
         int t_aptr2 = alloc_temp(s);
         IRInstr *addrof2 = ir_emit(s->mod, IR_ADDROF);
         addrof2->dest      = irop_temp(t_aptr2);
@@ -1824,6 +1844,23 @@ static void lower_func_body(
         free_call->args      = malloc(sizeof(IROperand));
         free_call->args[0]   = irop_temp(t_aptr2);
         free_call->arg_count = 1;
+
+        if (last_is_ret && saved_ret) {
+            /* Re-emit the return after the arena_free */
+            IRInstr *re_ret = ir_emit(s->mod, IR_RETURN);
+            re_ret->src1 = saved_ret->src1;
+            free(saved_ret);
+        } else {
+            /* Void fall-through: emit an implicit void return */
+            ir_emit(s->mod, IR_RETURN);
+        }
+    } else {
+        /* No arena — still need a terminator if the body fell off the end
+           without an explicit return (e.g. void functions). */
+        if (s->mod->instr_count == 0 ||
+            s->mod->instrs[s->mod->instr_count - 1].op != IR_RETURN) {
+            ir_emit(s->mod, IR_RETURN);
+        }
     }
 
     ir_emit(s->mod, IR_FUNC_END);

@@ -156,6 +156,8 @@ void typelist_add(TypeList* l, Type t) {
 %type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
 %type <node_list> class_body stmt_list param_list params arg_list args union_types include_list switch_arms field_init_list
 %type <node> include_path
+%type <node> if_stmt
+%type <node_list> else_tail
 
 
 /* Operator precedence, lowest to highest */
@@ -191,6 +193,12 @@ program:
         $$ = $1;
         $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
         $$->declarations[$$->decl_count++] = (ASTNode*)$2;
+    }
+    | program STATIC func_decl {
+        $$ = $1;
+        $3->is_public = 0;
+        $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
+        $$->declarations[$$->decl_count++] = (ASTNode*)$3;
     }
     | program enum_decl {
         $$ = $1;
@@ -617,6 +625,10 @@ module_member:
         $1->is_public = 0;
         $$ = (ASTNode*)$1;
     }
+    | STATIC func_decl {
+        $2->is_public = 0;
+        $$ = (ASTNode*)$2;
+    }
     | static_var_decl { $$ = $1; }
     ;
 
@@ -780,6 +792,29 @@ stmt_list:
     }
     ;
 
+if_stmt:
+    IF LPAREN expr RPAREN LBRACE stmt_list RBRACE else_tail {
+        IfNode* ifn = make_if($3);
+        NodeList* ts = (NodeList*)$6;
+        ifn->then_body = ts->items; ifn->then_count = ts->count; free(ts);
+        if ($8) {
+            NodeList* et = (NodeList*)$8;
+            ifn->else_body = et->items; ifn->else_count = et->count; free(et);
+        }
+        $$ = (ASTNode*)ifn;
+    }
+    ;
+
+else_tail:
+    /* empty */ { $$ = NULL; }
+    | ELSE LBRACE stmt_list RBRACE { $$ = $3; }
+    | ELSE if_stmt {
+        NodeList* l = list_new();
+        list_add(l, $2);
+        $$ = (void*)l;
+    }
+    ;
+
 stmt:
     var_decl
     | return_stmt
@@ -845,20 +880,8 @@ stmt:
     | expr LBRACKET expr RBRACKET ASSIGN expr SEMICOLON {
         $$ = (ASTNode*)make_index_assign($1, $3, $6);
     }
-    /* if */
-    | IF LPAREN expr RPAREN LBRACE stmt_list RBRACE {
-        IfNode* ifn = make_if($3);
-        NodeList* ts=(NodeList*)$6; ifn->then_body=ts->items; ifn->then_count=ts->count; free(ts);
-        $$ = (ASTNode*)ifn;
-    }
-    | IF LPAREN expr RPAREN LBRACE stmt_list RBRACE ELSE LBRACE stmt_list RBRACE {
-        IfNode* ifn = make_if($3);
-        NodeList* ts=(NodeList*)$6; NodeList* es=(NodeList*)$10;
-        ifn->then_body=ts->items; ifn->then_count=ts->count;
-        ifn->else_body=es->items; ifn->else_count=es->count;
-        free(ts); free(es);
-        $$ = (ASTNode*)ifn;
-    }
+    /* if / else if / else */
+    | if_stmt { $$ = $1; }
     /* while */
     | WHILE LPAREN expr RPAREN LBRACE stmt_list RBRACE {
         WhileNode* wn = make_while($3);

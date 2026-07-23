@@ -309,6 +309,8 @@ static Type infer_expr(ASTNode *node) {
                 result = make_simple_type("void", 0);
             } else if (strcmp(fc->name, "inb") == 0) {
                 result = make_simple_type("int", 0);
+            } else if (strcmp(fc->name, "syscall") == 0) {
+                result = make_simple_type("int", 0);
             } else {
             /* 1. Check user-defined functions first */
             FuncInfo *fi = func_lookup(fc->name);
