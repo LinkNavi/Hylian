@@ -1,0 +1,12 @@
+Rewrite Zora to support Hylian {
+no dep commands for Hylian yet,
+should just build and link hy files,
+use linkle.py for reference,
+should be less clunky than linkle.py
+use the installed stdlib in:
+➜  lsp git:(master) ✗ ls /usr/local/lib/hylian/std
+io.hy  net.hy  networking  os  platform  string.hy  time.hy
+➜  lsp git:(master) ✗
+}
+
+Improve Toml Errors

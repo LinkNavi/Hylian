@@ -475,12 +475,21 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
         }
 
         case MIR_CALL: {
-            /* NOTE: doesn't yet resolve the parallel-move hazard where an
-               argument's source vreg is already sitting in a later arg's
-               destination register - real fix needs a proper move scheduler.
-               Fine for calls with few live crossing args; flagged, not silent. */
-            for (int a = 0; a < ins->arg_count && a < X64_SYSV_ARG_REG_COUNT; a++)
-                load_operand(&ctx, ins->args[a], x64_sysv_arg_regs[a]);
+            /* Same parallel-move hazard and fix as MIR_SYSCALL above: an
+               argument's source vreg can already be sitting in a later
+               arg's destination register, so materialize every arg into a
+               scratch register and push it before any destination register
+               is touched, then pop into place in reverse. All the pushes
+               are popped again before `call` executes, so rsp is back to
+               its pre-call value and the call's own return-address push
+               isn't affected. */
+            int n = ins->arg_count < X64_SYSV_ARG_REG_COUNT ? ins->arg_count : X64_SYSV_ARG_REG_COUNT;
+            for (int a = 0; a < n; a++) {
+                X64Reg r = load_operand(&ctx, ins->args[a], X64_RAX);
+                enc_push(out_code, r);
+            }
+            for (int a = n - 1; a >= 0; a--)
+                enc_pop(out_code, x64_sysv_arg_regs[a]);
             if (ins->arg_count > X64_SYSV_ARG_REG_COUNT)
                 fprintf(stderr, "[lower_x64] call with >6 args not yet supported (stack args)\n");
             if (ins->callee) {
@@ -564,21 +573,36 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
 
         case MIR_SYSCALL: {
             /* args[0] = syscall number (runtime value), args[1..] = real args.
-               same parallel-move caveat as MIR_CALL: if an arg's source vreg
-               already lives in a later arg's destination register (rdi/rsi/
-               rdx/r10/r8/r9), this can clobber it. r10 is also still in the
-               regalloc-allocatable pool, so it's not even scratch-reserved
-               like rax/rdx/rcx/r11 - flagged here, not solved yet. */
+               Parallel-move fix: an arg's source vreg can already be sitting
+               in a *later* arg's fixed destination register (rdi/rsi/rdx/
+               r10/r8/r9 - r10 in particular is still in the regalloc pool,
+               not scratch-reserved). Loading straight into destination
+               registers one at a time would let an earlier load clobber a
+               later arg's source. Instead, materialize every arg (and the
+               syscall number) into a scratch register and push it to the
+               stack *before* any destination register is touched, then pop
+               them into place in reverse - stack slots can't alias GP
+               registers, so this sidesteps the hazard entirely regardless
+               of how many args or what cycles exist between them. */
             int real_argc = ins->arg_count - 1;
             if (real_argc < 0) {
                 fprintf(stderr, "[lower_x64] MIR_SYSCALL with no syscall-number arg\n");
                 break;
             }
-            for (int a = 0; a < real_argc && a < X64_SYSCALL_ARG_REG_COUNT; a++)
-                load_operand(&ctx, ins->args[a + 1], x64_syscall_arg_regs[a]);
+            int n = real_argc < X64_SYSCALL_ARG_REG_COUNT ? real_argc : X64_SYSCALL_ARG_REG_COUNT;
             if (real_argc > X64_SYSCALL_ARG_REG_COUNT)
                 fprintf(stderr, "[lower_x64] syscall with >6 args not supported\n");
+
             load_operand(&ctx, ins->args[0], X64_RAX); /* syscall number */
+            enc_push(out_code, X64_RAX);
+            for (int a = 0; a < n; a++) {
+                X64Reg r = load_operand(&ctx, ins->args[a + 1], X64_RAX);
+                enc_push(out_code, r);
+            }
+            for (int a = n - 1; a >= 0; a--)
+                enc_pop(out_code, x64_syscall_arg_regs[a]);
+            enc_pop(out_code, X64_RAX); /* syscall number, back from the bottom */
+
             enc_syscall(out_code);
             store_result(&ctx, ins->dest, X64_RAX);
             break;

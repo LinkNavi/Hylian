@@ -1976,33 +1976,40 @@ static int lsp_has_suffix(const char *s, const char *suf) {
     return ls >= lf && strcmp(s + ls - lf, suf) == 0;
 }
 
-/* Mirrors linkle.py's _find_runtime_dir() resolution order. */
-static int find_std_dir(char *out, size_t out_sz) {
-    const char *env = getenv("HYLIAN_LIB");
+/* Finds every std-dir candidate that actually exists, instead of stopping
+   at the first hit. stdlib/ is the project's real standard library going
+   forward; runtime/std is the old C-runtime tree being migrated away from.
+   Scanning both (stdlib first) means completions stay available for
+   anything not yet ported out of runtime/std, without the stale tree
+   shadowing or duplicating what's already in stdlib. As runtime/std files
+   get retired, their completions disappear on their own - no LSP change
+   needed later. */
+static int find_std_dirs(char out[][512], int max_dirs) {
+    int n = 0;
     struct stat st;
-    if (env) {
+
+    const char *env = getenv("HYLIAN_LIB");
+    if (env && n < max_dirs) {
         char buf[512];
         snprintf(buf, sizeof(buf), "%s/std", env);
         if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) {
-            snprintf(out, out_sz, "%s", buf);
-            return 1;
-        }
-        if (stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
-            snprintf(out, out_sz, "%s", env);
-            return 1;
+            snprintf(out[n++], 512, "%s", buf);
+        } else if (stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(out[n++], 512, "%s", env);
         }
     }
+
     const char *candidates[] = {
+        "stdlib", "../stdlib", "../../stdlib",
         "runtime/std", "../runtime/std", "../../runtime/std",
         "/usr/local/lib/hylian/std", "/usr/lib/hylian/std", NULL
     };
-    for (int i = 0; candidates[i]; i++) {
+    for (int i = 0; candidates[i] && n < max_dirs; i++) {
         if (stat(candidates[i], &st) == 0 && S_ISDIR(st.st_mode)) {
-            snprintf(out, out_sz, "%s", candidates[i]);
-            return 1;
+            snprintf(out[n++], 512, "%s", candidates[i]);
         }
     }
-    return 0;
+    return n;
 }
 
 static void record_module(const char *modname) {
@@ -2050,9 +2057,10 @@ static void scan_std_dir(const char *dir, const char *prefix, int depth) {
 
 static const char **get_stdlib_modules(void) {
     if (stdlib_modules_scanned == 0) {
-        char std_dir[512];
-        if (find_std_dir(std_dir, sizeof(std_dir)))
-            scan_std_dir(std_dir, "std", 0);
+        char std_dirs[8][512];
+        int dir_count = find_std_dirs(std_dirs, 8);
+        for (int i = 0; i < dir_count; i++)
+            scan_std_dir(std_dirs[i], "std", 0);
 
         /* If nothing was found (e.g. installed binary with no accessible
            runtime tree), fall back to a known-good minimum so completions

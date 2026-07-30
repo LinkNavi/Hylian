@@ -25,6 +25,29 @@ static void tenv_free(TypeEnv *e) {
     free(e->temps); free(e->vars);
 }
 
+/* MIR local slot ids are per-function-frame (see local_offset() in
+   lower_x64.c), but `vars` is one flat table shared across the whole
+   module's IR_FUNC_BEGIN...IR_FUNC_END stream. Without clearing local
+   (is_local=1) entries between functions, two different functions that
+   happen to share a parameter/local name (e.g. two functions each with an
+   `int size` param) alias onto whichever one registered first - the second
+   function's references silently resolve to a slot id that belongs to a
+   completely different stack frame. Global/static entries (is_local=0) are
+   registered once at module scope and must survive this, so only locals
+   are dropped. Call at the start of every IR_FUNC_BEGIN. */
+static void tenv_clear_locals(TypeEnv *e) {
+    int kept = 0;
+    for (int i = 0; i < e->var_count; i++) {
+        if (e->vars[i].is_local) {
+            free(e->vars[i].name);
+            continue;
+        }
+        if (kept != i) e->vars[kept] = e->vars[i];
+        kept++;
+    }
+    e->var_count = kept;
+}
+
 static void tenv_set_temp(TypeEnv *e, int temp_id, MIRType t) {
     for (int i = 0; i < e->temp_count; i++)
         if (e->temps[i].temp_id == temp_id) { e->temps[i].type = t; return; }
@@ -181,6 +204,7 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         switch (ins->op) {
 
         case IR_FUNC_BEGIN: {
+            tenv_clear_locals(&env);
             fn = mir_func_new(mod, ins->str_extra ? ins->str_extra : "?");
             fn->param_count = ins->param_count;
             for (int p = 0; p < ins->param_count; p++) {
@@ -201,8 +225,22 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
             /* str_extra = var name, str_extra2 = type name */
             MIRType t = type_name_to_mir(ins->str_extra2);
             if (ins->str_extra) {
-                int lid = mir_new_local(fn);
-                tenv_set_local(&env, ins->str_extra, t, lid);
+                /* Parameters already got a local slot from IR_FUNC_BEGIN,
+                   and the function prologue stores the incoming register
+                   arg into that exact slot id. lower.c also emits an
+                   ALLOCA for every parameter (so codegen has type info for
+                   locals generally) - allocating a *second* slot here would
+                   silently repoint every later LOAD_VAR/STORE_VAR at an
+                   unrelated, never-written slot while the prologue keeps
+                   writing to the original one. Reuse the existing slot
+                   instead of shadowing it. */
+                int existing = tenv_local_id(&env, ins->str_extra);
+                if (existing >= 0) {
+                    tenv_update_type(&env, ins->str_extra, t);
+                } else {
+                    int lid = mir_new_local(fn);
+                    tenv_set_local(&env, ins->str_extra, t, lid);
+                }
             }
             break;
         }
@@ -506,9 +544,15 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         case IR_ARENA_ALLOC: {
-            MIRValue *args = malloc(sizeof(MIRValue));
-            args[0] = mir_imm_int(ins->extra_int, MIR_I64);
-            mir_build_call(fn, "arena_alloc", args, 1, mir_vreg(ins->dest.temp_id, MIR_PTR));
+            /* arena_alloc(Arena *a, size_t size) - src1 is the __arena__
+               pointer computed by lower.c's IR_ADDROF; extra_int is the
+               class size. Both must reach the call, in that order, to
+               match runtime/std/mem.c's signature - dropping src1 leaves
+               the size in the pointer slot and garbage in the size slot. */
+            MIRValue *args = malloc(2 * sizeof(MIRValue));
+            args[0] = lower_operand(&ins->src1, &env, mod, fn);
+            args[1] = mir_imm_int(ins->extra_int, MIR_I64);
+            mir_build_call(fn, "arena_alloc", args, 2, mir_vreg(ins->dest.temp_id, MIR_PTR));
             tenv_set_temp(&env, ins->dest.temp_id, MIR_PTR);
             break;
         }

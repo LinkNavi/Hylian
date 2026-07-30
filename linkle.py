@@ -664,6 +664,10 @@ def _is_fresh(obj, src):
 STD_MODULES = [
     # std.mem is always linked — codegen unconditionally emits extern arena_init/arena_alloc/arena_free
     {"include": "__always__", "stem": "mem", "link_libs": []},
+    # runtime.hy (stdlib/runtime.hy) backs the print/println *syntax* itself
+    # (hylian_print/hylian_println) — the compiler emits calls to these
+    # regardless of whether std.io is included, so this is __always__ too.
+    {"include": "__always__", "stem": "runtime", "link_libs": []},
     {"include": "std.io", "stem": "io", "link_libs": []},
     {"include": "std.errors", "stem": "errors", "link_libs": []},
     {"include": "std.strings", "stem": "strings", "link_libs": []},
@@ -727,8 +731,14 @@ def _runtime_obj(stem_rel, target, verbose):
     source tree is read-only (e.g. a system-wide install under /usr/local)."""
     runtime_dir = _find_runtime_dir()
 
-    # Try std/ subdirectory (source-tree layout: runtime/std/io.o)
+    # stdlib/ is the project's real standard library going forward -
+    # runtime/std is the old C-runtime tree being migrated away from. Check
+    # stdlib/ first (in the source tree) so modules that have already been
+    # ported there (e.g. mem.hy) get picked up automatically, falling back
+    # to runtime/std for anything not yet ported.
+    stdlib_dir = os.path.join(HYLIAN_ROOT, "stdlib")
     candidates = [
+        os.path.join(stdlib_dir, stem_rel),
         os.path.join(runtime_dir, "std", stem_rel),
         os.path.join(runtime_dir, stem_rel),  # installed layout
     ]

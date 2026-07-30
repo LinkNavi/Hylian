@@ -1,192 +1,110 @@
-# Error Handling in Hylian
+# Error Handling
 
-Hylian uses a lightweight, explicit error handling model built around the `Error?` type. There is no exception system and no stack unwinding — errors are values, and the programmer decides what to do with them at every call site.
+Hylian's error model is built around `Error?` as a return type, plus two compiler
+builtins — `Err(...)` to construct an error and `panic(...)` to abort. There's no
+exception system and no stack unwinding.
 
----
+> **Current status:** `Error?` as a return type (returning `nil` for success) works
+> today. Actually constructing an error with `Err(...)`, calling `panic(...)`, or
+> calling `.message()`/`.code()` on an error value does **not** currently link — see
+> [Known Limitations](known-limitations.md#errnil-panic-and-errormessagecode-dont-link)
+> for exactly why (a missing/misnamed runtime symbol and, for `panic`, a chain of
+> further missing dependencies even in the old C runtime). The patterns below
+> describe the intended design as the parser and typechecker implement it; treat them
+> as not-yet-runnable until that's fixed.
 
 ## The `Error?` Type
 
-`Error?` is a nullable pointer to an `Error` object.
-
-- `nil` — no error occurred; the operation succeeded
-- non-nil — an error occurred; the value points to an `Error` object carrying details
-
-Because `Error?` is just a nullable type, it composes naturally with Hylian's type system. Any function that may fail declares `Error?` as its return type. Functions that cannot fail use a concrete return type or `void`.
+`Error?` is `Error` with the nullable (`?`) modifier — `nil` means success, non-nil
+means an `Error` value carrying details. Any function that can fail declares `Error?`
+as its return type:
 
 ```hylian
-// This function may fail
 Error? writeFile(str path) {
     // ...
+    return nil;
 }
 
-// This function cannot fail
+// Cannot fail — no need for Error?
 int add(int a, int b) {
     return a + b;
 }
 ```
 
----
-
 ## Returning Errors
-
-Inside a function that returns `Error?`, use `return Err("message")` to signal failure and `return nil` to signal success.
-
-### Signalling failure
 
 ```hylian
 Error? validateUsername(str name) {
-    if (name == "") {
+    if (is_empty(name)) {
         return Err("username cannot be empty");
     }
     return nil;
 }
 ```
 
-### Signalling success
-
-```hylian
-Error? connect(str host) {
-    // ... connection logic ...
-    return nil;
-}
-```
-
-The error message passed to `Err()` should be a human-readable description of what went wrong. It is accessible to callers via `.message()`.
-
----
+`Err(msg)` and `panic(msg)` are recognized by name directly in `typecheck.c` and
+`lower.c` — they are not ordinary stdlib functions you `include`, and there's no
+`Error` class declared anywhere in `stdlib/` to look at; the compiler special-cases
+both call names.
 
 ## Checking Errors
-
-The return value of an `Error?`-returning function should be captured in a variable and then checked with an `if` statement. A non-nil `Error?` is truthy; `nil` is falsy.
 
 ```hylian
 Error? err = validateUsername("Alice");
 if (err) {
-    // err is non-nil — something went wrong
     panic(err.message());
 }
-// reaching here means err == nil, i.e. success
+// reaching here means err == nil
 ```
 
-You can also check inline without naming the variable, though capturing it is required if you want to inspect the message:
+A non-nil `Error?` is truthy in an `if`; `nil` is falsy.
 
-```hylian
-Error? err = writeFile("/tmp/out.txt");
-if (err) {
-    panic(err.message());
-}
-```
-
----
-
-## The `Error` Object
-
-When `Error?` is non-nil, it points to an `Error` object with the following methods:
+## `Error`'s Methods
 
 | Method | Return type | Description |
 |---|---|---|
-| `.message()` | `str` | Returns the human-readable error string passed to `Err()` |
-| `.code()` | `int` | Returns an integer error code. Currently always `0` |
-
-```hylian
-Error? err = doThing();
-if (err) {
-    str msg = err.message();
-    int code = err.code();
-    println("Error {{code}}: {{msg}}");
-}
-```
-
-> **Note:** `.code()` always returns `0` in the current version of the compiler. It is reserved for future use when numeric error codes are assigned to standard library errors.
-
----
+| `.message()` | `str` | The string passed to `Err(...)`. |
+| `.code()` | `int` | An integer error code. |
 
 ## `panic`
 
-`panic` is used for unrecoverable errors — situations where the program cannot safely continue. It prints its message to stderr and immediately exits with status code `1`. It never returns.
+`panic(msg)` prints to stderr and terminates — intended for unrecoverable situations
+(a programming mistake, a state the program genuinely can't continue from), not for
+expected failure conditions like a missing file or bad user input, which should
+propagate as `Error?` instead.
 
-```hylian
-panic("out of memory");
-```
-
-`panic` accepts a `str` argument. A common pattern is to pass `err.message()` directly:
-
-```hylian
-Error? err = connect("example.com");
-if (err) {
-    panic(err.message());
-}
-```
-
-Use `panic` when:
-- An error represents a programming mistake (e.g. an invalid argument that should never occur)
-- The program has entered a state it cannot recover from
-- You are in a context where propagating an error upward is not possible
-
-Do not use `panic` for expected failure conditions (e.g. a file not found, a bad user input). Those should be propagated as `Error?` return values so the caller can decide what to do.
-
----
-
-## The Full Pattern
-
-The idiomatic Hylian error handling pattern is:
-
-1. A function that may fail returns `Error?`
-2. It returns `Err("description")` on failure and `nil` on success
-3. The caller captures the return value, checks it with `if (err)`, and either handles the error, propagates it, or panics
-
-### Propagating an error upward
-
-If the current function also returns `Error?`, you can propagate an error by returning it directly:
+## Propagating and Handling
 
 ```hylian
 Error? processFile(str path) {
     Error? err = readFile(path);
     if (err) {
-        return err;
+        return err;             // propagate
     }
-
-    Error? parseErr = parseContents(path);
-    if (parseErr) {
-        return parseErr;
-    }
-
     return nil;
 }
-```
 
-### Handling an error locally
-
-```hylian
 Error? run() {
     Error? err = connectToServer("example.com");
     if (err) {
-        println("Could not connect: {{err.message()}}. Using offline mode.");
-        // fall through to offline logic
+        println("Could not connect, falling back to offline mode");
+        // handle locally, fall through
     }
     return nil;
 }
-```
 
-### Panicking on unrecoverable errors
-
-```hylian
 Error? main() {
     Error? err = initSubsystem();
     if (err) {
-        panic(err.message());
+        panic(err.message());   // unrecoverable — bail out
     }
     return nil;
 }
 ```
 
----
-
 ## Error Handling with Classes
 
-Methods on classes can return `Error?` just like free functions. The caller checks the result the same way.
-
-### Defining a method that may fail
+Methods return `Error?` the same way free functions do:
 
 ```hylian
 public class BankAccount {
@@ -196,66 +114,16 @@ public class BankAccount {
         balance = initialBalance;
     }
 
-    int getBalance() {
-        return balance;
-    }
-
     Error? withdraw(int amount) {
-        if (amount <= 0) {
-            return Err("withdrawal amount must be positive");
-        }
         if (amount > balance) {
             return Err("insufficient funds");
         }
         balance = balance - amount;
         return nil;
     }
-
-    Error? deposit(int amount) {
-        if (amount <= 0) {
-            return Err("deposit amount must be positive");
-        }
-        balance = balance + amount;
-        return nil;
-    }
 }
 ```
 
-### Calling a method that may fail
-
-```hylian
-BankAccount account = new BankAccount(500);
-
-Error? err = account.withdraw(200);
-if (err) {
-    println("Withdrawal failed: {{err.message()}}");
-}
-
-Error? err2 = account.withdraw(1000);
-if (err2) {
-    panic(err2.message());
-}
-```
-
-### Propagating from a method
-
-A method on one class can call a method on another and propagate the error upward:
-
-```hylian
-public class PaymentProcessor {
-    private BankAccount source;
-
-    PaymentProcessor(BankAccount acct) {
-        source = acct;
-    }
-
-    Error? charge(int amount) {
-        Error? err = source.withdraw(amount);
-        if (err) {
-            return err;
-        }
-        // ... process the charge ...
-        return nil;
-    }
-}
-```
+Note this example also depends on class field access (`balance`), which — independent
+of the `Error?`/`Err()` issues above — has its own current gap; see
+[Known Limitations](known-limitations.md#class-fields-dont-work-yet--implicit-or-explicit).

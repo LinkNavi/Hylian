@@ -1,5 +1,12 @@
 # Vendor Packages and Native FFI
 
+> **Scope note:** this page describes the `.hyi`/vendor FFI system and `linkle`'s
+> vendor tooling. It was spot-checked for obviously stale references (old `std.*`
+> include paths, the retired `codegen_asm.c`) but, unlike
+> [Syntax](syntax.md)/[Modules](modules.md)/the [stdlib docs](../stdlib/README.md), its examples
+> were not independently recompiled against the current backend in this pass. See
+> [Known Limitations](known-limitations.md) for what's been directly verified.
+
 The vendor system lets you wrap native shared libraries and distribute pure-Hylian helper code as self-contained packages inside your project. Vendor packages live in the `vendors/` directory and are declared in `linkle.hy`. Once declared, they are imported with the same `include` syntax used for the standard library.
 
 ---
@@ -191,7 +198,7 @@ Include a vendor package the same way you include any other module:
 
 ```hylian
 include {
-    std.io,
+    io,
     vendors.mylib,
 }
 
@@ -503,7 +510,6 @@ The optional `.hy` companion adds a convenience wrapper that centralises error c
 
 ```hylian
 include {
-    std.errors,
     vendors.vulkan,
 }
 
@@ -523,7 +529,7 @@ Structs are declared without `new` — they are stack-allocated and zero-initial
 
 ```hylian
 include {
-    std.io,
+    io,
     vendors.vulkan,
 }
 
@@ -712,7 +718,7 @@ target clean() {
 
 ```hylian
 include {
-    std.io,
+    io,
     vendors.glfw,
     vendors.gl,
 }
@@ -863,7 +869,9 @@ if (win == null) {
 
 ### 🔴 Bug Fixes
 
-**Static array `+16` header offset** (`lower.c`, `codegen_asm.c`)
+**Static array `+16` header offset** (`lower.c`, then-current codegen backend — this
+predates the `codegen_hygen.c`/`ir_to_mir.c` MIR backend described elsewhere in this
+documentation set)
 
 `IR_ARRAY_LOAD`/`IR_ARRAY_STORE` were unconditionally adding `+16` to skip a heap-array header that doesn't exist for flat `.data` static arrays. This caused crashes and memory corruption when indexing any `static T name[N]` array used in FFI code. Fixed by detecting flat vs heap layout in `lower.c` and branching on `ins->extra_int` in `codegen_asm.c`.
 

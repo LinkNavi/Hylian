@@ -4,22 +4,34 @@
 
 # Language Reference
 
+- [Overview](language/README.md)
 - [Syntax](language/syntax.md)
-  - Types, variables, functions, classes, enums, switch, pointers, tuples, unsafe, const, static arrays, bitwise ops, struct literals, `as` casts, `null`, digit separators, `union class`, and more
+  - Types, variables, operators, functions, control flow, classes, enums,
+    arrays/`multi`, pointers, casting, `unsafe`/`naked`/inline assembly, `@target`
+    conditional compilation, and includes
 - [Error Handling](language/error-handling.md)
 - [Modules & Standard Library](language/modules.md)
-  - Module visibility: `public` functions, statics, consts, and enums
+  - The `include` system, path resolution, and `module`/`public` visibility
+- [Known Limitations](language/known-limitations.md)
+  - What currently parses and typechecks but doesn't yet compile-and-link cleanly
 - [Vendor Packages & FFI](language/vendors.md)
-  - Wrapping C libraries, `.hyi` interface files, auto-generating bindings with `bindgen.py`, filtered bindgen for large SDKs, and native-feeling FFI patterns
+  - Wrapping C libraries, `.hyi` interface files, and native-feeling FFI patterns
 - [Kernel Development Guide](language/kernel.md)
-  - [x86-64 Intrinsics Quick Reference](intrinsics-quick-reference.md)
-  - [Intrinsics Implementation Details](intrinsics-implementation.md)
-  - [Before/After Comparison Examples](examples/intrinsics_comparison.md)
+  - Freestanding/kernel mode, bare-metal examples
+- [Termina Backend](language/termina-backend.md)
+- [Intrinsics: Before/After Comparison](examples/intrinsics_comparison.md)
 
 # Standard Library
 
-- [std.io](stdlib/std.io.md)
-- [std.errors](stdlib/std.errors.md)
-- [std.strings](stdlib/std.strings.md)
-- [std.system.env](stdlib/std.system.env.md)
-- [std.system.filesystem](stdlib/std.system.filesystem.md)
+- [Overview](stdlib/README.md)
+- [io](stdlib/io.md) — console output/input
+- [string](stdlib/string.md) — string manipulation
+- [mem](stdlib/mem.md) — the arena allocator backing `new` (always linked)
+- [runtime](stdlib/runtime.md) — builtins behind the `print`/`println` syntax (always linked)
+- [net](stdlib/net.md) — raw IPv4/TCP sockets
+- [time](stdlib/time.md) — wall-clock time and sleep
+- [os.exec](stdlib/os.exec.md) — process creation and control
+- [os.fs](stdlib/os.fs.md) — filesystem operations
+- [os.mount](stdlib/os.mount.md) — mounting and power control
+- [os.user](stdlib/os.user.md) — user/group identity
+- [platform.linux_x86_64](stdlib/platform.linux_x86_64.md) — syscall numbers, flags, `raw_alloc`/`raw_free`

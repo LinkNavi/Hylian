@@ -25,6 +25,25 @@ static void tenv_free(TypeEnv *e) {
     free(e->temps); free(e->vars);
 }
 
+/* Keep in sync with compiler/ir_to_mir.c: MIR local slot ids are
+   per-function-frame, but `vars` is one flat table shared across the whole
+   module's IR_FUNC_BEGIN...IR_FUNC_END stream. Clear local (is_local=1)
+   entries between functions so two functions sharing a param/local name
+   don't alias onto each other's slot ids; global/static entries
+   (is_local=0) must survive since they're module-scoped. */
+static void tenv_clear_locals(TypeEnv *e) {
+    int kept = 0;
+    for (int i = 0; i < e->var_count; i++) {
+        if (e->vars[i].is_local) {
+            free(e->vars[i].name);
+            continue;
+        }
+        if (kept != i) e->vars[kept] = e->vars[i];
+        kept++;
+    }
+    e->var_count = kept;
+}
+
 static void tenv_set_temp(TypeEnv *e, int temp_id, MIRType t) {
     for (int i = 0; i < e->temp_count; i++)
         if (e->temps[i].temp_id == temp_id) { e->temps[i].type = t; return; }
@@ -181,6 +200,7 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         switch (ins->op) {
 
         case IR_FUNC_BEGIN: {
+            tenv_clear_locals(&env);
             fn = mir_func_new(mod, ins->str_extra ? ins->str_extra : "?");
             fn->param_count = ins->param_count;
             for (int p = 0; p < ins->param_count; p++) {
@@ -198,11 +218,21 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
             break;
 
         case IR_ALLOCA: {
-            /* str_extra = var name, str_extra2 = type name */
+            /* str_extra = var name, str_extra2 = type name.
+               Keep in sync with compiler/ir_to_mir.c: parameters already
+               got a local slot from IR_FUNC_BEGIN (which the prologue
+               writes the incoming register arg into), so allocating a
+               second slot here for the same name would silently repoint
+               LOAD_VAR/STORE_VAR at an unrelated, never-written slot. */
             MIRType t = type_name_to_mir(ins->str_extra2);
             if (ins->str_extra) {
-                int lid = mir_new_local(fn);
-                tenv_set_local(&env, ins->str_extra, t, lid);
+                int existing = tenv_local_id(&env, ins->str_extra);
+                if (existing >= 0) {
+                    tenv_update_type(&env, ins->str_extra, t);
+                } else {
+                    int lid = mir_new_local(fn);
+                    tenv_set_local(&env, ins->str_extra, t, lid);
+                }
             }
             break;
         }
@@ -506,9 +536,13 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         case IR_ARENA_ALLOC: {
-            MIRValue *args = malloc(sizeof(MIRValue));
-            args[0] = mir_imm_int(ins->extra_int, MIR_I64);
-            mir_build_call(fn, "arena_alloc", args, 1, mir_vreg(ins->dest.temp_id, MIR_PTR));
+            /* arena_alloc(Arena *a, size_t size) - keep in sync with
+               compiler/ir_to_mir.c: pass both the arena pointer (src1) and
+               the size (extra_int), matching runtime/std/mem.c. */
+            MIRValue *args = malloc(2 * sizeof(MIRValue));
+            args[0] = lower_operand(&ins->src1, &env, mod, fn);
+            args[1] = mir_imm_int(ins->extra_int, MIR_I64);
+            mir_build_call(fn, "arena_alloc", args, 2, mir_vreg(ins->dest.temp_id, MIR_PTR));
             tenv_set_temp(&env, ins->dest.temp_id, MIR_PTR);
             break;
         }

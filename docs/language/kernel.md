@@ -1,5 +1,11 @@
 # Kernel Development Guide
 
+> **Scope note:** this page covers `--freestanding`/bare-metal development, a
+> different pipeline from the syscall-based `stdlib/` tree documented under
+> [Standard Library](../stdlib/README.md). It was not independently
+> recompiled against the current backend in this pass — see
+> [Known Limitations](known-limitations.md) for what has been.
+
 Hylian has first-class support for bare-metal and kernel development. With the `--freestanding` compiler flag, low-level type primitives, hardware-oriented class and function modifiers, and the `kernel` standard library module, you can write a complete operating system kernel entirely in Hylian.
 
 ---

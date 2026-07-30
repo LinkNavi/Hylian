@@ -498,7 +498,6 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
             sprintf(hy5, "%s/%s.hy", inst_std, std_rel);
 
             free(project_root);
-            free(std_rel);
 
             char *hyi_path = NULL;
             const char *hyi_cands[] = { hyi1, hyi2, hyi3, hyi4, hyi5, NULL };
@@ -536,12 +535,26 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
             free(hy1); free(hy2); free(hy3); free(hy4); free(hy5);
 
             if (hy_path && !already_visited(hy_path)) {
-                char *hy_dir = dir_of(hy_path);
-                ProgramNode *dep = compile_file(hy_path, hy_dir);
-                free(hy_dir);
+                /* Pass the std ROOT (not hy_path's own directory) as src_dir,
+                   so sibling includes inside nested std modules (e.g.
+                   os/exec.hy's `include { platform.linux_x86_64, string }`)
+                   resolve relative to the std root instead of to os/. hy_path
+                   was built as "<root>/<std_rel>.hy", so strip that known
+                   suffix back off to recover <root>. */
+                size_t suffix_len = strlen(std_rel) + 4; /* "/" + std_rel + ".hy" */
+                size_t path_len = strlen(hy_path);
+                char *hy_root;
+                if (path_len > suffix_len) {
+                    hy_root = strndup(hy_path, path_len - suffix_len);
+                } else {
+                    hy_root = dir_of(hy_path); /* shouldn't happen, fallback */
+                }
+                ProgramNode *dep = compile_file(hy_path, hy_root);
+                free(hy_root);
                 if (dep) merge_programs(program, dep);
             }
             if (hy_path) free(hy_path);
+            free(std_rel);
 
             continue;
         }

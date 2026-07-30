@@ -1,5 +1,11 @@
 # Termina Backend
 
+> **Scope note:** `termina` is a real, separate value accepted by the compiler's
+> `--target` flag (`compiler/compiler.c`), but this page's description of the VM/
+> bytecode design was not independently re-verified against the current backend in
+> this pass — treat it as design documentation rather than a verified reference, the
+> way [Syntax](syntax.md) and the [stdlib docs](../stdlib/README.md) are.
+
 The Termina backend is a bytecode compiler target for the Hylian programming language. It generates portable bytecode that runs on the Termina virtual machine, a simple 64-bit RISC-style VM designed specifically for Hylian.
 
 ## Overview
