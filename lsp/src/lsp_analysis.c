@@ -10,6 +10,7 @@
 #include "lsp_log.h"
 #include "ast.h"
 #include "typecheck.h"
+#include "diag.h"
 #include <unistd.h>
 
 static void log_include_processing(const char *include_name, const char *current_file)
@@ -22,11 +23,17 @@ static void log_function_resolution(const char *func_name, const char *module_na
     lsp_log("[lsp_analysis] Resolving function: %s in module: %s (from file: %s)", func_name, module_name, current_file);
 }
 
-extern int lsp_yyparse(void);
-extern void lsp_yyrestart(FILE *f);
-extern int lsp_yylineno;
+/* The LSP now uses the COMPILER'S frontend verbatim — same lexer.l, parser.y,
+   ast.c and typecheck.c — rather than the near-copies it used to carry in
+   lsp/src. Those copies drifted (the LSP grammar had no `else if`, its
+   typechecker didn't know stdlib constants or class methods) and reported
+   errors for code that compiled and ran fine. One frontend means that class of
+   bug cannot recur. Hence the plain yy* names here instead of lsp_yy*. */
+extern int yyparse(void);
+extern void yyrestart(FILE *f);
+extern int yylineno;
 extern ProgramNode *root;
-extern const char *lsp_current_file;
+extern const char *current_parse_file;
 
 
 static const char *hylian_keywords[] = {
@@ -204,6 +211,98 @@ static void build_sig(char *buf, int bufsz,
 }
 
 
+
+/* Bridge the shared frontend's diagnostics into the LSP's buffer.
+   diag_emit() reports a 1-based line and, for now, no column; LSP positions
+   are 0-based, and a whole-line range is the honest representation of "we know
+   the line, not the column" rather than pretending to a precise span. */
+
+/* Register everything a parsed stdlib program declares, so the shared
+   typechecker resolves it exactly as it would in a real compile. This is the
+   piece that stops the editor reporting `STDERR_FD` as undefined and
+   `c.arg(...)` as "no method 'arg' on type 'Cmd'". */
+static void ext_add(TCExternal **exts, int *n, const char *name,
+                    const char *type_name, TCExternalKind kind, int params)
+{
+    if (!name || !name[0]) return;
+    for (int k = 0; k < *n; k++)
+        if ((*exts)[k].kind == kind && strcmp((*exts)[k].name, name) == 0) return;
+    *exts = realloc(*exts, (*n + 1) * sizeof(TCExternal));
+    (*exts)[*n].name = strdup(name);
+    (*exts)[*n].type_name = strdup(type_name ? type_name : "int");
+    (*exts)[*n].kind = kind;
+    (*exts)[*n].param_count = params;
+    (*n)++;
+}
+
+static void register_stdlib_externals(LspProject *proj, TCExternal **exts, int *n)
+{
+    for (int i = 0; i < proj->stdlib_program_count; i++)
+    {
+        ProgramNode *prog = proj->stdlib_programs[i];
+        if (!prog) continue;
+
+        for (int d = 0; d < prog->decl_count; d++)
+        {
+            ASTNode *decl = prog->declarations[d];
+            if (!decl) continue;
+            char ret[64];
+
+            if (decl->type == NODE_FUNC) {
+                FuncNode *fn = (FuncNode *)decl;
+                type_to_str(fn->return_type, ret, sizeof(ret));
+                ext_add(exts, n, fn->name, ret, TC_EXT_FUNC, fn->param_count);
+
+            } else if (decl->type == NODE_STATIC_VAR) {
+                /* constants: STDOUT_FD, O_RDONLY, NR_WRITE, ... */
+                StaticVarNode *sv = (StaticVarNode *)decl;
+                type_to_str(sv->var_type, ret, sizeof(ret));
+                ext_add(exts, n, sv->var_name, ret, TC_EXT_VAR, 0);
+
+            } else if (decl->type == NODE_CLASS) {
+                ClassNode *cn = (ClassNode *)decl;
+                for (int m = 0; m < cn->method_count; m++) {
+                    MethodNode *mn = cn->methods[m];
+                    if (!mn) continue;
+                    type_to_str(mn->return_type, ret, sizeof(ret));
+                    char mangled[256];
+                    snprintf(mangled, sizeof(mangled), "%s__%s", cn->name, mn->name);
+                    /* mangled for obj.method(), bare for calls inside the class */
+                    ext_add(exts, n, mangled, ret, TC_EXT_FUNC, mn->param_count + 1);
+                    ext_add(exts, n, mn->name, ret, TC_EXT_FUNC, mn->param_count + 1);
+                }
+
+            } else if (decl->type == NODE_MODULE) {
+                ModuleNode *mn = (ModuleNode *)decl;
+                ext_add(exts, n, mn->name, "void", TC_EXT_MODULE, 0);
+                for (int f = 0; f < mn->func_count; f++) {
+                    FuncNode *fn = mn->funcs[f];
+                    if (!fn) continue;
+                    type_to_str(fn->return_type, ret, sizeof(ret));
+                    char mangled[256];
+                    snprintf(mangled, sizeof(mangled), "%s__%s", mn->name, fn->name);
+                    ext_add(exts, n, mangled, ret, TC_EXT_FUNC, fn->param_count);
+                }
+            }
+        }
+    }
+}
+
+void lsp_diag_sink(DiagSeverity sev, const char *file, int line, int col,
+                          const char *message, const char *hint, void *user)
+{
+    (void)file; (void)user;
+    int l = line > 0 ? line - 1 : 0;
+    int c = col > 0 ? col : 0;
+
+    char full[768];
+    if (hint && hint[0]) snprintf(full, sizeof(full), "%s (%s)", message, hint);
+    else                 snprintf(full, sizeof(full), "%s", message);
+
+    LspDiagSeverity s = sev == DIAG_WARNING ? LSP_DIAG_WARNING : LSP_DIAG_ERROR;
+    lsp_diag_push(l, c, l, 999, s, full);
+}
+
 static ProgramNode *parse_source(const char *filepath, const char *source)
 {
     lsp_log("[lsp_analysis] parse_source: file=%s", filepath);
@@ -214,10 +313,10 @@ static ProgramNode *parse_source(const char *filepath, const char *source)
     rewind(tmp);
 
     root = NULL;
-    lsp_current_file = filepath;
-    lsp_yyrestart(tmp);
-    lsp_yylineno = 1;
-    lsp_yyparse();
+    current_parse_file = filepath;
+    yyrestart(tmp);
+    yylineno = 1;
+    yyparse();
     fclose(tmp);
 
     ProgramNode *prog = root;
@@ -376,10 +475,197 @@ static void index_program(ProgramNode *prog,
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+   Zora project discovery
+   ═══════════════════════════════════════════════════════════════════════════════
+
+   A Zora project's Zora.toml declares its source layout via
+   `sources = ["src/main.hy"]` under a `[target.Name]` table; a Zora
+   *workspace* root has no sources of its own, just `[workspace] members =
+   [...]` naming its sub-project directories. The editor's workspace root can
+   be either kind (or neither, e.g. two standalone projects opened side by
+   side with no manifest tying them together) — all three need to resolve to
+   the right per-file src_dir for include-path completions. */
+
+/* First quoted string on/after `line`, e.g. `sources = ["src/main.hy"]` ->
+   "src/main.hy". */
+static int toml_first_quoted(const char *line, char *out, int outsz) {
+    const char *q = strchr(line, '"');
+    if (!q) return 0;
+    q++;
+    const char *end = strchr(q, '"');
+    if (!end) return 0;
+    int len = (int)(end - q);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, q, len);
+    out[len] = '\0';
+    return 1;
+}
+
+/* "src/main.hy" -> "src". "" if the source lives directly at the project
+   root (no slash). */
+static void dirname_of(const char *path, char *out, int outsz) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) { out[0] = '\0'; return; }
+    int len = (int)(slash - path);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+}
+
+/* Read one Zora.toml and record it as a discovered project rooted at
+   `subdir` (relative to proj->root_dir; "" for the workspace root itself),
+   with src_dir taken from its target's `sources = [...]` entry. */
+static void add_zora_project_from_toml(LspProject *proj, const char *toml_path,
+                                       const char *subdir) {
+    FILE *f = fopen(toml_path, "r");
+    if (!f) return;
+    char line[512];
+    char src_file[256] = "";
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "sources", 7) == 0) {
+            char *eq = strchr(p, '=');
+            if (eq && toml_first_quoted(eq, src_file, sizeof(src_file)))
+                break;
+        }
+    }
+    fclose(f);
+
+    if (proj->zora_project_count >= MAX_ZORA_PROJECTS) return;
+    ZoraProjectInfo *zp = &proj->zora_projects[proj->zora_project_count++];
+    snprintf(zp->subdir, sizeof(zp->subdir), "%s", subdir ? subdir : "");
+    if (src_file[0]) {
+        char sd[256];
+        dirname_of(src_file, sd, sizeof(sd));
+        snprintf(zp->src_dir, sizeof(zp->src_dir), "%s", sd);
+    } else {
+        snprintf(zp->src_dir, sizeof(zp->src_dir), "src"); /* convention fallback */
+    }
+    lsp_log("[lsp_analysis] Zora project: subdir='%s' src_dir='%s'", zp->subdir, zp->src_dir);
+}
+
+/* Discover every Zora project under proj->root_dir:
+     - a `[workspace]` Zora.toml at the root -> one entry per member
+     - a `[project]` Zora.toml at the root   -> the root itself is the project
+     - neither                               -> look one level down for any
+       subdirectory with its own Zora.toml (standalone projects opened
+       together with no workspace manifest)
+   Falls back to a single root-level "src" entry (the previous hardcoded
+   default) if none of the above finds anything, so plain/non-Zora projects
+   keep working exactly as before. */
+static void discover_zora_projects(LspProject *proj) {
+    proj->zora_project_count = 0;
+
+    char root_toml[1280];
+    snprintf(root_toml, sizeof(root_toml), "%s/Zora.toml", proj->root_dir);
+    FILE *f = fopen(root_toml, "r");
+    int  is_workspace = 0;
+    char members_raw[2048] = "";
+
+    if (f) {
+        char line[512];
+        int in_members = 0;
+        while (fgets(line, sizeof(line), f)) {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncmp(p, "[workspace]", 11) == 0) { is_workspace = 1; continue; }
+            if (is_workspace && !in_members && strncmp(p, "members", 7) == 0) {
+                strncat(members_raw, p, sizeof(members_raw) - strlen(members_raw) - 1);
+                if (!strchr(p, ']')) in_members = 1; /* array spans multiple lines */
+                continue;
+            }
+            if (in_members) {
+                strncat(members_raw, p, sizeof(members_raw) - strlen(members_raw) - 1);
+                if (strchr(p, ']')) in_members = 0;
+            }
+        }
+        fclose(f);
+    }
+
+    if (is_workspace) {
+        const char *p = members_raw;
+        while ((p = strchr(p, '"')) != NULL) {
+            p++;
+            const char *end = strchr(p, '"');
+            if (!end) break;
+            char member[256];
+            int len = (int)(end - p);
+            if (len >= (int)sizeof(member)) len = sizeof(member) - 1;
+            memcpy(member, p, len);
+            member[len] = '\0';
+            char member_toml[1280];
+            snprintf(member_toml, sizeof(member_toml), "%s/%s/Zora.toml", proj->root_dir, member);
+            add_zora_project_from_toml(proj, member_toml, member);
+            p = end + 1;
+        }
+    } else if (f) {
+        /* Root Zora.toml exists and isn't a workspace: a single project
+           rooted at root_dir itself. */
+        add_zora_project_from_toml(proj, root_toml, "");
+    } else {
+        /* No root Zora.toml: check one level down for standalone project
+           folders. */
+        DIR *d = opendir(proj->root_dir);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.') continue;
+                char sub_toml[1280];
+                snprintf(sub_toml, sizeof(sub_toml), "%s/%s/Zora.toml", proj->root_dir, ent->d_name);
+                struct stat st;
+                if (stat(sub_toml, &st) == 0 && S_ISREG(st.st_mode))
+                    add_zora_project_from_toml(proj, sub_toml, ent->d_name);
+            }
+            closedir(d);
+        }
+    }
+
+    if (proj->zora_project_count == 0) {
+        ZoraProjectInfo *zp = &proj->zora_projects[proj->zora_project_count++];
+        zp->subdir[0] = '\0';
+        snprintf(zp->src_dir, sizeof(zp->src_dir), "src");
+    }
+}
+
+/* Pick the Zora project a filepath belongs to (longest-matching subdir
+   prefix wins), for resolving `include { ... }` module paths correctly
+   inside a multi-project Zora workspace where each member has its own
+   independent src/ tree. */
+static const ZoraProjectInfo *zora_project_for_file(const LspProject *proj,
+                                                     const char *filepath) {
+    const ZoraProjectInfo *best = NULL;
+    int best_len = -1;
+    for (int i = 0; i < proj->zora_project_count; i++) {
+        const ZoraProjectInfo *zp = &proj->zora_projects[i];
+        if (zp->subdir[0] == '\0') {
+            if (best_len < 0) { best = zp; best_len = 0; }
+            continue;
+        }
+        char prefix[1280];
+        snprintf(prefix, sizeof(prefix), "%s/%s/", proj->root_dir, zp->subdir);
+        int plen = (int)strlen(prefix);
+        if (strncmp(filepath, prefix, plen) == 0 && plen > best_len) {
+            best = zp;
+            best_len = plen;
+        }
+    }
+    return best;
+}
+
 static int scan_dir_is_internal(const char *name) {
     static const char *skip[] = {
         "stdlib", "runtime", "compiler", "lsp", "hygen",
-        "node_modules", "target", "build", "dist", ".git", NULL
+        "node_modules", "target", "build", "dist", ".git",
+        /* Zora's build output — .o files, cached objects, the final binary.
+           None of it is Hylian source, but without this the LSP recursed
+           into it anyway (only .hy files get indexed once inside, so this
+           was previously harmless besides wasted directory walks — until a
+           project's zora-build/ started accumulating stale copies of
+           generated .hy, e.g. from a codegen step, which then showed up as
+           duplicate/ghost completions). */
+        "zora-build", ".hylian-cache", NULL
     };
     for (int i = 0; skip[i]; i++)
         if (strcmp(name, skip[i]) == 0) return 1;
@@ -1030,6 +1316,49 @@ static void scan_hy_stdlib_file(LspProject *proj, const char *filepath,
     /* (intentionally not freeing to keep things simple; process exits anyway) */
 }
 
+
+/* Parse every .hy under `dir` with the shared compiler frontend and keep the
+   resulting ASTs on the project, so the typechecker can be told about the real
+   symbols they declare.
+   Diagnostics from stdlib sources are deliberately discarded — a problem in
+   the stdlib is not something to underline in the user's buffer. */
+static void scan_hy_stdlib(LspProject *proj, const char *dir, int depth)
+{
+    if (depth > 4 || proj->stdlib_program_count >= MAX_STDLIB_PROGRAMS) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL)
+    {
+        if (ent->d_name[0] == '.') continue;
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
+
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            scan_hy_stdlib(proj, full, depth + 1);
+            continue;
+        }
+
+        size_t nlen = strlen(ent->d_name);
+        if (nlen < 4 || strcmp(ent->d_name + nlen - 3, ".hy") != 0) continue;
+        if (proj->stdlib_program_count >= MAX_STDLIB_PROGRAMS) break;
+
+        int saved_count = lsp_diag_count;
+        ProgramNode *prog = parse_file_from_disk(full);
+        lsp_diag_count = saved_count;   /* drop stdlib diagnostics */
+
+        if (prog) {
+            proj->stdlib_programs[proj->stdlib_program_count++] = prog;
+            lsp_log("[lsp_analysis] indexed stdlib source: %s", full);
+        }
+    }
+    closedir(d);
+}
+
 static void scan_hyi_stdlib(LspProject *proj, const char *stdlib_dir, const char *module_prefix)
 {
     lsp_log("[lsp_analysis] scan_hyi_stdlib: %s (module: %s)", stdlib_dir, module_prefix);
@@ -1199,50 +1528,19 @@ LspProject *lsp_project_create(const char *root_dir)
     snprintf(proj->root_dir, sizeof(proj->root_dir), "%s",
              root_dir ? root_dir : ".");
 
-    /* Default source directory (linkle.hy convention). May be overridden
-       below by parsing the project's linkle.hy for a custom `src` value. */
+    /* Default source directory, used as a fallback for any file that
+       doesn't fall under a discovered Zora project below. */
     snprintf(proj->src_dir, sizeof(proj->src_dir), "src");
 
-    /* Try to read the `src` field from linkle.hy so include completions use
-       the right module path prefix (e.g. "Service.file" not "src.Service.file"). */
-    {
-        char linkle_path[1280];
-        snprintf(linkle_path, sizeof(linkle_path), "%s/linkle.hy", proj->root_dir);
-        FILE *lf = fopen(linkle_path, "r");
-        if (lf)
-        {
-            char line[512];
-            while (fgets(line, sizeof(line), lf))
-            {
-                /* Look for a line like:  src: "src"   or   src: "my_source" */
-                char *p = line;
-                while (*p == ' ' || *p == '\t') p++;
-                if (strncmp(p, "src", 3) != 0)
-                    continue;
-                p += 3;
-                while (*p == ' ' || *p == '\t') p++;
-                if (*p != ':')
-                    continue;
-                p++;
-                while (*p == ' ' || *p == '\t') p++;
-                if (*p != '"')
-                    continue;
-                p++;
-                char val[256];
-                int vi = 0;
-                while (*p && *p != '"' && *p != '\n' && *p != '\r' && vi < (int)sizeof(val) - 1)
-                    val[vi++] = *p++;
-                val[vi] = '\0';
-                if (vi > 0)
-                {
-                    snprintf(proj->src_dir, sizeof(proj->src_dir), "%s", val);
-                    lsp_log("[lsp_analysis] linkle.hy src dir: %s", proj->src_dir);
-                }
-                break;
-            }
-            fclose(lf);
-        }
-    }
+    /* Discover the Zora project(s) under root_dir (single [project], or one
+       per [workspace] member, or standalone sibling projects) so that
+       per-file module-path resolution below uses the right src_dir instead
+       of a single hardcoded "src". Sets proj->src_dir to the root/first
+       project's src_dir too, for any code still reading the single field. */
+    discover_zora_projects(proj);
+    if (proj->zora_project_count > 0)
+        snprintf(proj->src_dir, sizeof(proj->src_dir), "%s",
+                 proj->zora_projects[0].src_dir);
 
     scan_dir(proj, proj->root_dir);
 
@@ -1253,6 +1551,24 @@ LspProject *lsp_project_create(const char *root_dir)
     char local_std[1024];
     snprintf(local_std, sizeof(local_std), "%s/runtime/std", proj->root_dir);
     scan_hyi_stdlib(proj, local_std, "std");
+
+    /* Parse the real pure-Hylian stdlib. $HYLIAN_LIB wins (that's what the
+       compiler and Zora honour), then the installed location, then a repo
+       checkout's stdlib/ — same search order the toolchain uses, so the editor
+       and the compiler agree on which stdlib they're talking about. */
+    proj->stdlib_program_count = 0;
+    const char *env_lib = getenv("HYLIAN_LIB");
+    if (env_lib && env_lib[0]) {
+        scan_hy_stdlib(proj, env_lib, 0);
+    }
+    if (proj->stdlib_program_count == 0)
+        scan_hy_stdlib(proj, "/usr/local/lib/hylian/std", 0);
+    if (proj->stdlib_program_count == 0) {
+        char repo_std[1024];
+        snprintf(repo_std, sizeof(repo_std), "%s/stdlib", proj->root_dir);
+        scan_hy_stdlib(proj, repo_std, 0);
+    }
+    lsp_log("[lsp_analysis] stdlib programs indexed: %d", proj->stdlib_program_count);
 
     /* Scan vendors directory upfront for any .hyi files */
     char vendors_path[1024];
@@ -1390,7 +1706,7 @@ void lsp_project_update_file(LspProject *proj,
     /* Run typecheck — also pushes to lsp_diag */
     if (pf->program)
     {
-        TCExternalFunc *exts = NULL;
+        TCExternal *exts = NULL;
         int ext_count = 0;
 
 
@@ -1399,28 +1715,58 @@ void lsp_project_update_file(LspProject *proj,
         {
             char ret[64], name[128];
             parse_c_sig(hylian_builtins[i].detail, ret, name);
-            exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+            exts = realloc(exts, (ext_count + 1) * sizeof(TCExternal));
             exts[ext_count].name = strdup(hylian_builtins[i].name);
-            exts[ext_count].return_type = strdup(ret);
+            exts[ext_count].type_name = strdup(ret);
             exts[ext_count].param_count = 0;
-            exts[ext_count].is_module = 0;
+            exts[ext_count].kind = TC_EXT_FUNC;
             ext_count++;
         }
 
-        /* 2. Stdlib functions from .hyi (both full and short names) */
+        /* 2. Everything the stdlib index knows about.
+              This used to register FUNCTIONS ONLY, which is why the editor
+              flagged `STDERR_FD` as an undefined variable and `c.arg("-l")` as
+              "no method 'arg' on type 'Cmd'" for code that compiled fine:
+              constants and class methods were simply never told to the
+              typechecker. Methods are registered as `Class__method`, which is
+              how the typechecker looks them up. */
         for (int i = 0; i < proj->stdlib_completion_count; i++)
         {
             CompletionItem *it = &proj->stdlib_completions[i];
-            if (it->kind != COMPLETE_FUNCTION)
-                continue;
 
-            char ret[64], name[128];
-            parse_c_sig(it->detail, ret, name);
+            TCExternalKind kind;
+            char ret[64] = "", name[128] = "";
+
+            if (it->kind == COMPLETE_FUNCTION || it->kind == COMPLETE_METHOD) {
+                parse_c_sig(it->detail, ret, name);
+                kind = TC_EXT_FUNC;
+            } else if (it->kind == COMPLETE_VARIABLE || it->kind == COMPLETE_FIELD) {
+                /* constants like STDERR_FD, O_RDONLY, NR_WRITE */
+                snprintf(ret, sizeof(ret), "%s", it->detail[0] ? it->detail : "int");
+                kind = TC_EXT_VAR;
+            } else if (it->kind == COMPLETE_MODULE) {
+                kind = TC_EXT_MODULE;
+            } else {
+                continue; /* classes/enums are types, resolved separately */
+            }
+
+            /* The index stores methods as "Class.method"; the typechecker wants
+               "Class__method". Register both spellings so a bare `method` call
+               inside the class body resolves too. */
+            char primary[256];
+            const char *dot = strchr(it->label, '.');
+            if (kind == TC_EXT_FUNC && dot) {
+                int cls_len = (int)(dot - it->label);
+                snprintf(primary, sizeof(primary), "%.*s__%s",
+                         cls_len, it->label, dot + 1);
+            } else {
+                snprintf(primary, sizeof(primary), "%s", it->label);
+            }
 
             int already = 0;
             for (int k = 0; k < ext_count; k++)
             {
-                if (strcmp(exts[k].name, it->label) == 0)
+                if (exts[k].kind == kind && strcmp(exts[k].name, primary) == 0)
                 {
                     already = 1;
                     break;
@@ -1428,11 +1774,11 @@ void lsp_project_update_file(LspProject *proj,
             }
             if (!already)
             {
-                exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
-                exts[ext_count].name = strdup(it->label);
-                exts[ext_count].return_type = strdup(ret);
-                exts[ext_count].param_count = 0;
-                exts[ext_count].is_module = 0;
+                exts = realloc(exts, (ext_count + 1) * sizeof(TCExternal));
+                exts[ext_count].name = strdup(primary);
+                exts[ext_count].type_name = strdup(ret);
+                exts[ext_count].param_count = -1;
+                exts[ext_count].kind = kind;
                 ext_count++;
             }
         }
@@ -1464,11 +1810,11 @@ void lsp_project_update_file(LspProject *proj,
                     }
                     if (!already)
                     {
-                        exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                        exts = realloc(exts, (ext_count + 1) * sizeof(TCExternal));
                         exts[ext_count].name = strdup(fn->name);
-                        exts[ext_count].return_type = strdup(ret);
+                        exts[ext_count].type_name = strdup(ret);
                         exts[ext_count].param_count = 0;
-                        exts[ext_count].is_module = 0;
+                        exts[ext_count].kind = TC_EXT_FUNC;
                         ext_count++;
                     }
                 }
@@ -1494,12 +1840,32 @@ void lsp_project_update_file(LspProject *proj,
                         }
                         if (!already)
                         {
-                            exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                            exts = realloc(exts, (ext_count + 1) * sizeof(TCExternal));
                             exts[ext_count].name = strdup(mn->name);
-                            exts[ext_count].return_type = strdup(ret);
-                            exts[ext_count].param_count = 0;
-                            exts[ext_count].is_module = 0;
+                            exts[ext_count].type_name = strdup(ret);
+                            exts[ext_count].param_count = -1;
+                            exts[ext_count].kind = TC_EXT_FUNC;
                             ext_count++;
+                        }
+                        /* Also under Class__method — a bare name only covers
+                           calls from inside the class body; `obj.method()`
+                           from outside is looked up mangled. */
+                        {
+                            char mangled_m[256];
+                            snprintf(mangled_m, sizeof(mangled_m), "%s__%s",
+                                     cn->name, mn->name);
+                            int mdup = 0;
+                            for (int k = 0; k < ext_count; k++)
+                                if (strcmp(exts[k].name, mangled_m) == 0) { mdup = 1; break; }
+                            if (!mdup)
+                            {
+                                exts = realloc(exts, (ext_count + 1) * sizeof(TCExternal));
+                                exts[ext_count].name = strdup(mangled_m);
+                                exts[ext_count].type_name = strdup(ret);
+                                exts[ext_count].param_count = -1;
+                                exts[ext_count].kind = TC_EXT_FUNC;
+                                ext_count++;
+                            }
                         }
                     }
                 }
@@ -1520,14 +1886,14 @@ void lsp_project_update_file(LspProject *proj,
                 /* Add the module name as a namespace marker */
                 int already = 0;
                 for (int k = 0; k < ext_count; k++)
-                    if (exts[k].is_module && strcmp(exts[k].name, mn->name) == 0) { already = 1; break; }
+                    if (exts[k].kind == TC_EXT_MODULE && strcmp(exts[k].name, mn->name) == 0) { already = 1; break; }
                 if (!already)
                 {
-                    exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                    exts = realloc(exts, (ext_count + 1) * sizeof(TCExternal));
                     exts[ext_count].name        = strdup(mn->name);
-                    exts[ext_count].return_type = strdup("void");
+                    exts[ext_count].type_name = strdup("void");
                     exts[ext_count].param_count = 0;
-                    exts[ext_count].is_module   = 1;
+                    exts[ext_count].kind = TC_EXT_MODULE;
                     ext_count++;
                 }
 
@@ -1540,28 +1906,35 @@ void lsp_project_update_file(LspProject *proj,
                     snprintf(mangled, sizeof(mangled), "%s__%s", mn->name, fn->name);
                     int fdup = 0;
                     for (int k = 0; k < ext_count; k++)
-                        if (!exts[k].is_module && strcmp(exts[k].name, mangled) == 0) { fdup = 1; break; }
+                        if (exts[k].kind == TC_EXT_FUNC && strcmp(exts[k].name, mangled) == 0) { fdup = 1; break; }
                     if (!fdup)
                     {
                         char ret[64];
                         type_to_str(fn->return_type, ret, sizeof(ret));
-                        exts = realloc(exts, (ext_count + 1) * sizeof(TCExternalFunc));
+                        exts = realloc(exts, (ext_count + 1) * sizeof(TCExternal));
                         exts[ext_count].name        = strdup(mangled);
-                        exts[ext_count].return_type = strdup(ret);
+                        exts[ext_count].type_name = strdup(ret);
                         exts[ext_count].param_count = fn->param_count;
-                        exts[ext_count].is_module   = 0;
+                        exts[ext_count].kind = TC_EXT_FUNC;
                         ext_count++;
                     }
                 }
             }
         }
 
-        lsp_typecheck_with_externals(pf->program, filepath, exts, ext_count);
+        /* Real stdlib symbols, parsed from source with the shared frontend. */
+        register_stdlib_externals(proj, &exts, &ext_count);
+
+        /* One typechecker for the CLI and the LSP; the externals carry the
+           stdlib symbols this buffer's includes would have provided. */
+        tc_set_externals(exts, ext_count);
+        typecheck(pf->program, filepath);
+        tc_set_externals(NULL, 0);
 
         for (int i = 0; i < ext_count; i++)
         {
             free((char *)exts[i].name);
-            free((char *)exts[i].return_type);
+            free((char *)exts[i].type_name);
         }
         free(exts);
     }
@@ -1658,7 +2031,7 @@ LspState *lsp_analyze(LspProject *proj,
             lsp_diag_clear();
             st->file->program = parse_source(filepath, source);
             if (st->file->program)
-                lsp_typecheck(st->file->program, filepath);
+                typecheck(st->file->program, filepath);
             st->file->diag_count =
                 lsp_diag_count < LSP_DIAG_MAX ? lsp_diag_count : LSP_DIAG_MAX;
             memcpy(st->file->diags, lsp_diags,
@@ -2585,7 +2958,21 @@ int lsp_complete(LspState *st,
             for (int f = 0; f < proj->file_count && count < max_out; f++)
             {
                 char mod[512];
-                filepath_to_module(proj->root_dir, proj->src_dir,
+                /* Resolve against whichever Zora project this file actually
+                   belongs to — in a multi-project workspace (root Zora.toml
+                   with [workspace] members) each member has its own src/
+                   tree, so a single proj->root_dir/proj->src_dir pair would
+                   produce module paths like "Corebins.src.modules.cat"
+                   instead of the "modules.cat" the compiler actually
+                   resolves from that member's own src_dir. */
+                const ZoraProjectInfo *zp = zora_project_for_file(proj, proj->files[f].filepath);
+                char eff_root[1280];
+                if (zp && zp->subdir[0])
+                    snprintf(eff_root, sizeof(eff_root), "%s/%s", proj->root_dir, zp->subdir);
+                else
+                    snprintf(eff_root, sizeof(eff_root), "%s", proj->root_dir);
+                const char *eff_src_dir = zp ? zp->src_dir : proj->src_dir;
+                filepath_to_module(eff_root, eff_src_dir,
                                    proj->files[f].filepath,
                                    mod, sizeof(mod));
                 if (mod[0] == '\0')

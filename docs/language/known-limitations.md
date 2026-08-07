@@ -189,9 +189,11 @@ string currently can't be passed straight to `print`/`println` — only to a var
 
 ### There is no tuple / multi-return type
 
-`ast.h` explicitly notes tuple support "was unimplemented" and has been removed
-entirely. `(int, int) divmod(...)` style multi-return syntax you may see referenced
-elsewhere does not exist in the current grammar — functions return exactly one `type`.
+Tuples were removed entirely: the tuple `Type` kind is gone from `ast.h`, there is no
+tuple rule in `compiler/parser.y`, and `tuple_type`/`tuple_expr` have been removed from
+the tree-sitter grammar too (they used to linger there, so editors happily highlighted
+tuple syntax that the compiler rejects outright). `(int, int) divmod(...)` style
+multi-return syntax does not exist — functions return exactly one `type`.
 
 ---
 

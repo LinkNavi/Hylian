@@ -34,6 +34,69 @@ static int has_interpolation(const char *s) {
     return 0;
 }
 
+/* Decode backslash escapes in a quoted string literal, in place of the raw
+   source text. `src` still includes the surrounding double quotes and the
+   result keeps them, because every downstream consumer (lower.c, the interp
+   splitter, the .hyi reader) expects a quoted literal and strips the quotes
+   itself.
+   Before this existed the escapes were simply never processed anywhere in the
+   pipeline - "\n" was the two characters '\' and 'n', which is why the
+   runtime had to write its newline from a byte-valued local instead of a
+   string constant.
+   A decoded '"' is emitted as a bare quote inside the body. That's safe
+   because the quote-stripping downstream only looks at the first and last
+   character, never rescans for a closing quote. An unrecognized escape keeps
+   its backslash and the following character verbatim, so a typo stays visible
+   instead of silently vanishing. */
+static char *decode_escapes(const char *src) {
+    size_t len = strlen(src);
+    char *out = malloc(len + 1); /* decoding never grows the string */
+    size_t o = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        if (src[i] != '\\' || i + 1 >= len) { out[o++] = src[i]; continue; }
+        char c = src[++i];
+        switch (c) {
+        case 'n':  out[o++] = '\n'; break;
+        case 't':  out[o++] = '\t'; break;
+        case 'r':  out[o++] = '\r'; break;
+        case '0':  out[o++] = '\0'; break;
+        case 'a':  out[o++] = '\a'; break;
+        case 'b':  out[o++] = '\b'; break;
+        case 'f':  out[o++] = '\f'; break;
+        case 'v':  out[o++] = '\v'; break;
+        case 'e':  out[o++] = 27;   break; /* ESC, for ANSI colour codes */
+        case '\\': out[o++] = '\\'; break;
+        case '\'': out[o++] = '\''; break;
+        case '"':  out[o++] = '"';  break;
+        case 'x': {
+            /* \xNN - exactly one or two hex digits */
+            int val = 0, digits = 0;
+            while (digits < 2 && i + 1 < len) {
+                char h = src[i + 1];
+                int d;
+                if      (h >= '0' && h <= '9') d = h - '0';
+                else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+                else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+                else break;
+                val = val * 16 + d;
+                i++;
+                digits++;
+            }
+            if (digits == 0) { out[o++] = '\\'; out[o++] = 'x'; }
+            else             { out[o++] = (char)val; }
+            break;
+        }
+        default:
+            out[o++] = '\\';
+            out[o++] = c;
+            break;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
 /* Strip underscore digit-separators from a numeric literal string */
 static char *strip_underscores(const char *s) {
     char *buf = malloc(strlen(s) + 1);
@@ -125,6 +188,7 @@ static char *strip_underscores(const char *s) {
 "volatile"          { return VOLATILE; }
 "packed"            { return PACKED; }
 "union"             { return UNION_KW; }
+"struct"            { return STRUCT; }
 "naked"             { return NAKED; }
 "usize"             { return USIZE; }
 "isize"             { return ISIZE; }
@@ -154,12 +218,12 @@ static char *strip_underscores(const char *s) {
     return NUMBER;
 }
 \"([^\\\"]|\\.)*\"       {
-    /* yytext includes the surrounding quotes */
+    /* yytext includes the surrounding quotes; decode_escapes keeps them */
     if (has_interpolation(yytext + 1)) {
-        yylval.str = strdup(yytext);
+        yylval.str = decode_escapes(yytext);
         return INTERP_STRING;
     }
-    yylval.str = strdup(yytext);
+    yylval.str = decode_escapes(yytext);
     return STRING_LITERAL;
 }
 

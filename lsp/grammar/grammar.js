@@ -11,8 +11,6 @@ module.exports = grammar({
   conflicts: ($) => [
     [$.func_decl, $.method_decl],
     [$.type, $.identifier_expr],
-    [$.tuple_type, $.paren_expr],
-    [$.tuple_expr, $.paren_expr],
     [$.module_decl, $.func_decl],
     [$.rawptr_type, $.postfix_array_type],
     [$.rawptr_type, $.postfix_ref_type],
@@ -31,6 +29,7 @@ module.exports = grammar({
           $.module_decl,
           $.module_header,
           $.class_decl,
+          $.struct_decl,
           $.union_class_decl,
           $.func_decl,
           $.interface_decl,
@@ -85,7 +84,6 @@ module.exports = grammar({
             $.array_type,
             $.postfix_array_type,
             $.multi_type,
-            $.tuple_type,
             $.rawptr_type,
             $.ref_type,
             $.postfix_ref_type,
@@ -101,12 +99,10 @@ module.exports = grammar({
     // Postfix reference type: int&  (equivalent to &int)
     postfix_ref_type: ($) => seq($.type, "&"),
 
-    tuple_type: ($) =>
-      seq(
-        "(",
-        seq($.type, optional("?"), repeat1(seq(",", $.type, optional("?")))),
-        ")",
-      ),
+    // NOTE: there is deliberately no tuple_type here. Tuples were removed from
+    // the language (see compiler/ast.h - the tuple Type kind is gone), and a
+    // grammar that still accepted them made the editor happily highlight and
+    // fold syntax the compiler rejects outright.
 
     primitive_type: (_) =>
       choice(
@@ -157,6 +153,23 @@ module.exports = grammar({
         optional("packed"),
         optional("public"),
         "class",
+        field("name", $.identifier),
+        "{",
+        optional($.class_body),
+        "}",
+      ),
+
+    // ── Struct declarations ──────────────────────────────────────────────────
+    // `struct Point { int x; int y; int sum() { ... } }`
+    // A by-value aggregate: public fields, methods allowed, NO constructor
+    // (that's what `class` is for). Shares class_body, so fields and methods
+    // parse identically inside either — including methods, which is the whole
+    // point of the C++-shaped syntax.
+    struct_decl: ($) =>
+      seq(
+        optional("packed"),
+        optional("public"),
+        "struct",
         field("name", $.identifier),
         "{",
         optional($.class_body),
@@ -497,7 +510,6 @@ module.exports = grammar({
         $.nil_literal,
         $.identifier_expr,
         $.paren_expr,
-        $.tuple_expr,
         $.volatile_read_expr,
         $.cast_expr,
         $.as_cast_expr,
@@ -524,8 +536,7 @@ module.exports = grammar({
         ),
       ),
 
-    tuple_expr: ($) =>
-      seq("(", $.expression, repeat1(seq(",", $.expression)), ")"),
+    // NOTE: no tuple_expr either - see the tuple_type note above.
 
     binary_expr: ($) =>
       choice(

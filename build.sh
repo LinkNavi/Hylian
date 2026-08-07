@@ -102,7 +102,7 @@ fi
     exit 1
   fi
 
-  run  gcc lex.yy.c parser.tab.c ast.c ir.c ir_to_mir.c lower.c opt.c codegen_hygen.c typecheck.c compiler.c \
+  run  gcc lex.yy.c parser.tab.c ast.c diag.c ir.c ir_to_mir.c lower.c opt.c codegen_hygen.c typecheck.c compiler.c \
   -I../hygen/libhymir/include -I../hygen/libhyregalloc/include -I../hygen/libhyx64/include -I../hygen/libhyobj/include \
   ../hygen/build/libhymir/libhymir.a ../hygen/build/libhyregalloc/libhyregalloc.a \
   ../hygen/build/libhyx64/libhyx64.a ../hygen/build/libhyobj/libhyobj.a \
@@ -126,44 +126,7 @@ fi
 
 success "Compiler built: ./hylian"
 
-# ── Build runtime ─────────────────────────────
-RUNTIME_COUNT=0
 
-if [[ $SKIP_RUNTIME -eq 1 ]]; then
-  warn "Skipping runtime build (--skip-runtime)"
-else
-  echo ""
-  echo -e "${BOLD}  Building runtime...${RESET}"
-
-  if [[ ! -f "build_runtime.py" ]]; then
-    fail "build_runtime.py not found"
-    echo ""
-    echo -e "${RED}${BOLD}╔══════════════════════════════════════╗${RESET}"
-    echo -e "${RED}${BOLD}║           Build  FAILED              ║${RESET}"
-    echo -e "${RED}${BOLD}╚══════════════════════════════════════╝${RESET}"
-    echo ""
-    exit 1
-  fi
-
-  RUNTIME_ARGS=""
-  if [[ $VERBOSE -eq 1 ]]; then
-    RUNTIME_ARGS="--verbose"
-  fi
-
-  run python3 build_runtime.py $RUNTIME_ARGS
-  if [[ $? -ne 0 ]]; then
-    fail "build_runtime.py failed"
-    echo ""
-    echo -e "${RED}${BOLD}╔══════════════════════════════════════╗${RESET}"
-    echo -e "${RED}${BOLD}║           Build  FAILED              ║${RESET}"
-    echo -e "${RED}${BOLD}╚══════════════════════════════════════╝${RESET}"
-    echo ""
-    exit 1
-  fi
-
-  RUNTIME_COUNT=$(find runtime/ -name "*.o" 2>/dev/null | wc -l | tr -d ' ')
-  success "Runtime built: ${RUNTIME_COUNT} modules"
-fi
 
 # ── Footer ────────────────────────────────────
 echo ""

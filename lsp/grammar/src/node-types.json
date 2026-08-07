@@ -711,10 +711,6 @@
           "named": true
         },
         {
-          "type": "tuple_expr",
-          "named": true
-        },
-        {
           "type": "unary_expr",
           "named": true
         },
@@ -1579,6 +1575,10 @@
           "named": true
         },
         {
+          "type": "struct_decl",
+          "named": true
+        },
+        {
           "type": "union_class_decl",
           "named": true
         }
@@ -1785,6 +1785,32 @@
     }
   },
   {
+    "type": "struct_decl",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "class_body",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "struct_literal_expr",
     "named": true,
     "fields": {
@@ -1899,36 +1925,6 @@
     }
   },
   {
-    "type": "tuple_expr",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "expression",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "tuple_type",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "type",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
     "type": "type",
     "named": true,
     "fields": {},
@@ -1966,10 +1962,6 @@
         },
         {
           "type": "ref_type",
-          "named": true
-        },
-        {
-          "type": "tuple_type",
           "named": true
         }
       ]
@@ -2583,6 +2575,10 @@
   {
     "type": "string_literal",
     "named": true
+  },
+  {
+    "type": "struct",
+    "named": false
   },
   {
     "type": "switch",

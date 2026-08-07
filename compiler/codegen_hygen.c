@@ -46,6 +46,8 @@ int codegen_hygen(IRModule *mod, const char *outfile,
     RegAllocTarget ratarget = {
         .num_int_regs = X64_NUM_ALLOCATABLE_INT_REGS,
         .num_float_regs = 4,
+        .num_callee_saved_int_regs = X64_NUM_CALLEE_SAVED_INT_REGS,
+        .num_callee_saved_float_regs = X64_NUM_CALLEE_SAVED_FLOAT_REGS,
     };
 
     int ok = 1;

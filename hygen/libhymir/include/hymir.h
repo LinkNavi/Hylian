@@ -132,8 +132,17 @@ typedef struct {
     int       arg_count;
     const char *callee; /* NULL if indirect (src1 holds fn ptr) */
 
-    /* MIR_READ_CR / MIR_WRITE_CR / MIR_LOAD/STORE width overrides etc. */
+    /* MIR_READ_CR / MIR_WRITE_CR control-register number, MIR_ALLOCA_LOCAL
+       size, and the volatile flag on MIR_LOAD/MIR_STORE. */
     int       extra_int;
+
+    /* Constant byte displacement added to the address for MIR_LOAD/MIR_STORE
+       through a pointer — struct field offsets, array header fields, and the
+       multi tag/value words all use this.
+       It is deliberately NOT extra_int: that field already carried the
+       volatile flag for loads, and the x64 backend read the same field as a
+       displacement, so `*volatile p` compiled into a read from p+1. */
+    int       mem_offset;
 
     /* MIR_ASM_RAW: raw bytes to splice in directly, already-encoded machine code.
        No text, no reassembly - frontend is responsible for producing correct

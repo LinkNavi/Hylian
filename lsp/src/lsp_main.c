@@ -392,6 +392,57 @@ static void handle_hover(FILE *out, long id, const char *params) {
 }
 
 
+/* Byte offset of the start of 0-based `line` in `text`. Returns -1 if the
+   document has fewer lines than that. */
+static int line_start_offset(const char *text, int line) {
+    int off = 0, cur = 0;
+    if (line == 0) return 0;
+    for (const char *p = text; *p; p++, off++) {
+        if (*p != '\n') continue;
+        if (++cur == line) return off + 1;
+    }
+    return -1;
+}
+
+/*
+ * Work out how much of what the user already typed a completion item should
+ * replace, and return it as [*out_start_col, col).
+ *
+ * This is why include-path completion used to produce `std.std.os.exec`: the
+ * response carried only "label", and with no explicit range an editor falls
+ * back to its own idea of the current word — which, for essentially every
+ * editor, stops at the last '.'. So after typing `std.` the editor replaced
+ * only the empty string after the dot and inserted the full `std.os.exec`
+ * label, leaving the `std.` the user had already typed in front of it.
+ *
+ * Dotted labels (module/include paths) therefore need the whole dotted run
+ * treated as the prefix being replaced. Plain identifiers must NOT do that, or
+ * completing a field on `point.` would eat the `point.` too.
+ */
+static int completion_replace_start(const char *text, int line, int col,
+                                    int label_is_dotted) {
+    int ls = line_start_offset(text, line);
+    if (ls < 0) return col;
+
+    /* clamp col to the actual line length */
+    int line_len = 0;
+    while (text[ls + line_len] && text[ls + line_len] != '\n') line_len++;
+    if (col > line_len) col = line_len;
+
+    int i = col;
+    while (i > 0) {
+        char c = text[ls + i - 1];
+        int part_of_word = (c == '_') ||
+                           (c >= 'a' && c <= 'z') ||
+                           (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') ||
+                           (label_is_dotted && c == '.');
+        if (!part_of_word) break;
+        i--;
+    }
+    return i;
+}
+
 static void handle_completion(FILE *out, long id, const char *params) {
     int plen = (int)strlen(params);
 
@@ -435,6 +486,26 @@ static void handle_completion(FILE *out, long id, const char *params) {
             jb_arr_begin_obj(&b);
               jb_key_str(&b, "label",  items[i].label);
               jb_key_int(&b, "kind",   (long)items[i].kind);
+              /* Always send an explicit textEdit rather than relying on the
+                 editor's default word range — see completion_replace_start(). */
+              {
+                  int dotted = (strchr(items[i].label, '.') != NULL);
+                  int start_col = completion_replace_start(doc->text, (int)line,
+                                                           (int)col, dotted);
+                  jb_key_begin_obj(&b, "textEdit");
+                    jb_key_begin_obj(&b, "range");
+                      jb_key_begin_obj(&b, "start");
+                        jb_key_int(&b, "line",      line);
+                        jb_key_int(&b, "character", start_col);
+                      jb_obj_end(&b);
+                      jb_key_begin_obj(&b, "end");
+                        jb_key_int(&b, "line",      line);
+                        jb_key_int(&b, "character", col);
+                      jb_obj_end(&b);
+                    jb_obj_end(&b);
+                    jb_key_str(&b, "newText", items[i].label);
+                  jb_obj_end(&b);
+              }
               if (items[i].detail[0])
                   jb_key_str(&b, "detail", items[i].detail);
               if (items[i].documentation[0]) {
@@ -464,6 +535,11 @@ int main(void) {
 
     int initialized    = 0;
     int shutdown_recvd = 0;
+
+    /* The shared compiler frontend prints diagnostics to stderr by default,
+       which would corrupt nothing but would also lose every error. Redirect it
+       into the LSP diagnostic buffer for the life of the server. */
+    diag_set_sink(lsp_diag_sink, NULL);
 
     /* Bootstrap a minimal project so we can handle files before initialize
        (some clients are fast). */

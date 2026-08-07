@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ast.h"
+#include "diag.h"
 
 extern int yylex();
 extern int yylineno;
@@ -12,10 +13,6 @@ const char *current_parse_file = "<unknown>";
 const char *current_compile_target = "linux";
 
 void yyerror(const char *s) {
-    /* Bold red "error:" label */
-    fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;31merror:\033[0m %s\n",
-            current_parse_file, yylineno, s);
-
     /* Hint logic — inspect the Bison-generated message for common patterns */
     const char *hint = NULL;
 
@@ -53,10 +50,12 @@ void yyerror(const char *s) {
         hint = "double-check the statement for missing semicolons, mismatched brackets, or incorrect type syntax";
     }
 
-    if (hint) {
-        fprintf(stderr, "  \033[1;33mhint:\033[0m %s\n", hint);
-    }
+    /* Routed through the shared sink rather than printed here directly, so the
+       same parser can serve the CLI (colour on stderr) and the LSP (structured
+       diagnostics with positions) — see diag.h. */
+    diag_emit(DIAG_ERROR, current_parse_file, yylineno, -1, hint, "%s", s);
 }
+
 
 ProgramNode* root = NULL;
 
@@ -79,6 +78,46 @@ void list_add(NodeList* l, ASTNode* node) {
     }
     l->items[l->count++] = node;
 }
+
+/* Move a parsed class/struct body into the ClassNode.
+   Factored out because the class rules had six near-identical copies of this
+   loop and the struct rules would have added six more; a body-handling bug
+   fixed in one copy and not the others is exactly the kind of drift worth
+   designing out. */
+static void absorb_type_body(ClassNode *cls, void *body_ptr, int allow_ctor) {
+    NodeList *body = (NodeList *)body_ptr;
+    if (!body) return;
+    for (int i = 0; i < body->count; i++) {
+        ASTNode *m = body->items[i];
+        if (!m) continue;
+        if (m->type == NODE_FIELD) {
+            cls->fields = realloc(cls->fields, (cls->field_count + 1) * sizeof(FieldNode *));
+            cls->fields[cls->field_count++] = (FieldNode *)m;
+        } else if (m->type == NODE_METHOD) {
+            MethodNode *mn = (MethodNode *)m;
+            int is_ctor = mn->return_type.name &&
+                          strcmp(mn->return_type.name, "__ctor__") == 0;
+            if (is_ctor && allow_ctor) {
+                cls->ctor_params = mn->params; cls->ctor_param_count = mn->param_count;
+                cls->ctor_body = mn->body;     cls->ctor_body_count = mn->body_count;
+                cls->has_ctor = 1;
+            } else if (is_ctor) {
+                /* A struct is a value type: it is created by declaring it, not
+                   by `new`, so there is no moment at which a constructor could
+                   run. Say so rather than silently ignoring the body. */
+                diag_emit(DIAG_ERROR, current_parse_file, yylineno, -1,
+                          "structs are value types — use `class` if you need a constructor",
+                          "struct '%s' cannot have a constructor", cls->name);
+            } else {
+                cls->methods = realloc(cls->methods, (cls->method_count + 1) * sizeof(MethodNode *));
+                cls->methods[cls->method_count++] = mn;
+            }
+        }
+    }
+    free(body->items);
+    free(body);
+}
+
 
 /* TypeList: a growable array of Type values for union_types */
 typedef struct TypeList {
@@ -125,7 +164,7 @@ void typelist_add(TypeList* l, Type t) {
 %token WHILE FOR IN BREAK CONTINUE SWITCH CASE DEFAULT
 %token UNSAFE CONST STATIC AMP
 %token INT STRING ERROR BOOL
-%token VOLATILE PACKED NAKED USIZE ISIZE UNION_KW
+%token VOLATILE PACKED NAKED USIZE ISIZE UNION_KW STRUCT
 %token TILDE LSHIFT RSHIFT XOR CAST SIZE_OF AS
 %token MODULE
 %token <str> ASM_BLOCK
@@ -144,7 +183,7 @@ void typelist_add(TypeList* l, Type t) {
 
 %type <program> program
 %type <node> static_var_decl
-%type <class_node> class_decl
+%type <class_node> class_decl struct_decl
 %type <module_node> module_decl
 %type <node_list> module_body
 %type <node> module_member
@@ -184,6 +223,11 @@ program:
     /* empty */ { root = make_program(); $$ = root; }
     | program include_stmt      { $$ = $1; }
     | program ccpinclude_stmt   { $$ = $1; }
+    | program struct_decl {
+        $$ = $1;
+        $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
+        $$->declarations[$$->decl_count++] = (ASTNode*)$2;
+    }
     | program class_decl {
         $$ = $1;
         $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
@@ -358,6 +402,37 @@ static_var_decl:
     }
     ;
 
+
+
+/* ── struct: a by-value aggregate with methods ──────────────────────────────
+   C++-shaped, and deliberately NOT a class: a struct lives where it is
+   declared (stack slot, or inline inside another aggregate), is copied rather
+   than referenced, has public fields, and has no constructor. `class` remains
+   the heap/arena type created with `new`. That split is what lets kernel-ABI
+   layouts like Timespec and SockAddrIn be expressed directly.  */
+struct_decl:
+    STRUCT IDENTIFIER LBRACE class_body RBRACE {
+        $$ = make_class($2, 0);
+        absorb_type_body($$, $4, 0);
+    }
+    | PUBLIC STRUCT IDENTIFIER LBRACE class_body RBRACE {
+        $$ = make_class($3, 1);
+        absorb_type_body($$, $5, 0);
+    }
+    | STRUCT IDENTIFIER LBRACE RBRACE        { $$ = make_class($2, 0); }
+    | PUBLIC STRUCT IDENTIFIER LBRACE RBRACE { $$ = make_class($3, 1); }
+    /* packed: no tail padding — for layouts the kernel or a C library dictates */
+    | PACKED STRUCT IDENTIFIER LBRACE class_body RBRACE {
+        $$ = make_class($3, 0);
+        $$->is_packed = 1;
+        absorb_type_body($$, $5, 0);
+    }
+    | PUBLIC PACKED STRUCT IDENTIFIER LBRACE class_body RBRACE {
+        $$ = make_class($4, 1);
+        $$->is_packed = 1;
+        absorb_type_body($$, $6, 0);
+    }
+    ;
 
 class_decl:
     PUBLIC CLASS IDENTIFIER LBRACE class_body RBRACE {

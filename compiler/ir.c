@@ -11,8 +11,22 @@ IRModule *ir_module_new(void) {
     return m;
 }
 
+void ir_mark_weak_func(IRModule *mod, const char *name) {
+    if (!mod || !name) return;
+    for (int i = 0; i < mod->weak_func_count; i++)
+        if (strcmp(mod->weak_funcs[i], name) == 0) return;
+    if (mod->weak_func_count == mod->weak_func_cap) {
+        mod->weak_func_cap = mod->weak_func_cap ? mod->weak_func_cap * 2 : 32;
+        mod->weak_funcs = realloc(mod->weak_funcs,
+                                  mod->weak_func_cap * sizeof(char *));
+    }
+    mod->weak_funcs[mod->weak_func_count++] = strdup(name);
+}
+
 void ir_module_free(IRModule *mod) {
     if (!mod) return;
+    for (int i = 0; i < mod->weak_func_count; i++) free(mod->weak_funcs[i]);
+    free(mod->weak_funcs);
     free(mod->instrs);
     free(mod->classes);  /* pointer array; Class nodes owned by AST */
     free(mod->enums);
@@ -96,6 +110,8 @@ const char *ir_opcode_name(IROpcode op) {
     case IR_ARRAY_LOAD:  return "ARRAY_LOAD";
     case IR_ARRAY_STORE: return "ARRAY_STORE";
     case IR_MULTI_ALLOC: return "MULTI_ALLOC";
+    case IR_MULTI_TAG:   return "MULTI_TAG";
+    case IR_MULTI_VALUE: return "MULTI_VALUE";
     case IR_ENUM_VAL:    return "ENUM_VAL";
     case IR_INTERP_STR:  return "INTERP_STR";
     case IR_ASM_BLOCK:   return "ASM_BLOCK";

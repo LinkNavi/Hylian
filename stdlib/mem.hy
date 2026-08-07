@@ -36,6 +36,11 @@
 static int ARENA_HEADER_SIZE = 24;
 static int ARENA_BLOCK_SIZE  = 65536;
 
+// Backing arena for `multi` values (see hylian_multi_alloc at the bottom of
+// this file). It lives here rather than in its own always-linked module so it
+// can reuse the block machinery above instead of duplicating it.
+static usize MULTI_ARENA = 0;
+
 naked usize _mem_raw_alloc(int size) {
     return cast<usize>(syscall(9, 0, size, 3, 34, -1, 0));
 }
@@ -100,6 +105,78 @@ naked usize arena_alloc(usize slot, usize size) {
         *cast<*usize>(block + cast<usize>(8)) = new_used;
     }
     return ptr;
+}
+
+// hylian_multi_alloc: box one `multi<A | B | ...>` value.
+//
+// Called directly by the compiler, never by user code: a `multi` variable
+// declaration lowers to IR_MULTI_ALLOC, which becomes a call to exactly this
+// name (see compiler/ir_to_mir.c). Until this existed there was no definition
+// of it anywhere in the tree, so every program that declared a multi failed at
+// link time with "undefined reference to hylian_multi_alloc" — the feature
+// parsed, typechecked and generated code, and then couldn't be linked.
+//
+// The layout is two 8-byte words and is fixed by the compiler side:
+//   [0..8)   tag   — index into the multi's declared type list
+//   [8..16)  value — the payload, or a pointer to it for non-scalars
+// IR_MULTI_TAG and IR_MULTI_VALUE load from exactly those two offsets, so this
+// layout can't be changed on one side alone.
+//
+// Storage comes from a private, process-lifetime arena rather than the
+// caller's per-function one: a multi routinely outlives the function that
+// created it (that's the point of returning one), and the caller's arena is
+// freed on return. Nothing frees MULTI_ARENA — multis leak by design for now,
+// which is a real limitation but a predictable one, and far better than the
+// use-after-free that arena-allocating them would produce.
+naked usize hylian_multi_alloc(usize tag, usize value) {
+    usize slot = cast<usize>(&MULTI_ARENA);
+    if (MULTI_ARENA == cast<usize>(0)) {
+        arena_init(slot);
+    }
+
+    usize p = arena_alloc(slot, cast<usize>(16));
+    unsafe {
+        *cast<*usize>(p) = tag;
+        *cast<*usize>(p + cast<usize>(8)) = value;
+    }
+    return p;
+}
+
+// ── Error values ─────────────────────────────────────────────────────────────
+//
+// `Err("boom")` lowers to a call to hylian_make_err, and `e.message()` to a
+// call to Error_message. Neither had a definition anywhere, so ANY program
+// using the Error type failed to link — which made the language's whole error
+// story unusable despite `Error?` return types parsing and typechecking fine.
+//
+// An Error is deliberately just one word: a pointer to its NUL-terminated
+// message. `nil` (a null pointer) is the no-error value, which is why
+// `if (e != nil)` is the idiomatic check and why no tag byte is needed.
+//
+// Allocated from the same process-lifetime arena as multi values: an Error is
+// routinely returned upwards out of the function that created it, so it cannot
+// live in that function's own arena, which is freed on return.
+naked usize hylian_make_err(usize msg_ptr) {
+    usize slot = cast<usize>(&MULTI_ARENA);
+    if (MULTI_ARENA == cast<usize>(0)) {
+        arena_init(slot);
+    }
+    usize e = arena_alloc(slot, cast<usize>(8));
+    unsafe {
+        *cast<*usize>(e) = msg_ptr;
+    }
+    return e;
+}
+
+// Error_message: the message an Error carries. Returns nil for a nil Error
+// rather than dereferencing it, so `e.message()` on a success value is safe.
+naked usize Error_message(usize err) {
+    if (err == cast<usize>(0)) { return cast<usize>(0); }
+    usize msg;
+    unsafe {
+        msg = *cast<*usize>(err);
+    }
+    return msg;
 }
 
 naked void arena_free(usize slot) {

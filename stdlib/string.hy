@@ -10,8 +10,13 @@ include {
     platform.linux_x86_64,
 }
 
-// length: number of bytes before the terminating nul.
+// length: number of bytes before the terminating nul. nil counts as 0 —
+// is_empty() below already relied on that being true, by checking `s == nil`
+// itself before ever calling length(); this makes it true unconditionally so
+// any other nil `str` (e.g. read_all()'s failure return) is safe to measure
+// too, instead of dereferencing a null pointer.
 int length(str s) {
+    if (s == nil) { return 0; }
     int n = 0;
     while (true) {
         usize p = cast<usize>(s) + cast<usize>(n);

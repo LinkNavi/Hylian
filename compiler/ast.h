@@ -63,7 +63,19 @@ typedef struct Type {
     int fixed_size;           /* 0 = flexible, >0 = fixed */
 } Type;
 
-typedef struct ASTNode { NodeType type; Type resolved_type; } ASTNode;
+/* from_include: this declaration arrived through an `include`, rather than
+   from the file the user actually asked to compile. Only meaningful on
+   top-level declarations. It's what tells unused-code elimination which
+   functions it is allowed to throw away — see opt_strip_unreachable(). */
+typedef struct ASTNode {
+    NodeType type;
+    Type     resolved_type;
+    int      from_include;
+    /* 1-based source line, stamped at construction (see zero_resolved_type in
+       ast.c). 0 means unknown. Needed by the LSP to place diagnostics, and by
+       the CLI so errors stop reporting themselves as "file:0:". */
+    int      line;
+} ASTNode;
 
 typedef struct {
     ASTNode base;
@@ -190,6 +202,11 @@ typedef struct {
     char *method;
     ASTNode **args;
     int arg_count;
+    int is_ufcs; /* set by typecheck when `obj.method(args)` resolves to a free
+                    function `method(obj, args)` rather than a real ClassName
+                    method (UFCS sugar) — tells lower.c to emit a plain call
+                    with the object prepended, instead of a ClassName_method
+                    mangled call. */
 } MethodCallNode;
 
 typedef struct {
@@ -380,4 +397,50 @@ typedef struct {
     ASTNode **field_values;
     int       field_count;
 } StructLiteralNode;
+
+/* ── struct layout ────────────────────────────────────────────────────────────
+ *
+ * ONE definition of how a class is laid out in memory, shared by every pass
+ * that needs it. It used to be duplicated (lower.c had its own copy) and any
+ * pass that computed an offset slightly differently from another would read or
+ * write the wrong bytes — silently, since nothing checks.
+ *
+ * Rules, matching what the codegen has always assumed:
+ *   - int8/uint8 = 1 byte, int16/uint16 = 2, int32/uint32/float32 = 4,
+ *     everything else (int, int64, usize, ptr, str, float, class refs) = 8.
+ *   - a fixed-size array field occupies elem_size * count bytes.
+ *   - a field whose type is itself a class occupies that class's full size.
+ *   - union classes put every field at offset 0 and take the widest field,
+ *     rounded up to 8.
+ *   - non-packed structs round their total size up to a multiple of 16.
+ */
+
+/* Byte width of one field, including fixed-size arrays and nested classes. */
+int ast_field_byte_width(ClassNode **classes, int class_count, FieldNode *f);
+
+/* Total byte size of a class, or 8 if it isn't found. */
+int ast_class_byte_size(ClassNode **classes, int class_count, const char *name);
+
+/* Byte offset of `field` within `cls`, or -1 if either is unknown.
+ * out_width receives the field's own width (so callers can emit a correctly
+ * sized load/store), and out_type_name its declared type name. Either may be
+ * NULL if not wanted. */
+int ast_field_offset(ClassNode **classes, int class_count,
+                     const char *cls, const char *field,
+                     int *out_width, const char **out_type_name);
+
+/* Is `name` a known class? Distinguishes "a struct laid out inline" from a
+   plain scalar, which callers need before treating a size as a slot count. */
+int ast_is_class(ClassNode **classes, int class_count, const char *name);
+
+/* A by-value aggregate: a declared class with fields and no constructor, whose
+   bytes live inline. Distinguishes `struct Point { int x; int y; }` from both
+   `class Foo { Foo() {...} }` (heap, made with `new`) and an interface-only
+   declaration like `class Error { fn message() -> str }` (an opaque handle
+   whose values are pointers). Callers use this to decide address-vs-load. */
+int ast_is_value_aggregate(ClassNode **classes, int class_count, const char *name);
+
+/* Does `name` declare a constructor? `new` needs this to know whether to
+   emit a call to <name>__ctor after allocating. */
+int ast_class_has_ctor(ClassNode **classes, int class_count, const char *name);
 #endif

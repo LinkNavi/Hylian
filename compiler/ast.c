@@ -248,6 +248,7 @@ MethodCallNode *make_method_call(ASTNode *obj, char *method) {
     zero_resolved_type(&n->base);
     n->object = obj; n->method = strdup(method);
     n->args = NULL; n->arg_count = 0;
+    n->is_ufcs = 0;
     return n;
 }
 
@@ -304,6 +305,15 @@ Type make_simple_type(char *name, int nullable) {
     return t;
 }
 
+/* Every make_* constructor funnels through here, which makes it the one place
+   to stamp source position onto a node. Reading the lexer's yylineno at
+   construction time is approximate (a node is built when its rule reduces, so
+   a multi-line construct reports its LAST line) but it is vastly better than
+   what the frontend had before: no line info at all, which is why compiler
+   diagnostics all came out as "file:0:" and why the LSP had to maintain a
+   whole separate AST just to carry positions. */
+extern int yylineno;
+
 static void zero_resolved_type(ASTNode *n) {
     n->resolved_type.kind = TYPE_SIMPLE;
     n->resolved_type.nullable = 0;
@@ -312,6 +322,8 @@ static void zero_resolved_type(ASTNode *n) {
     n->resolved_type.elem_type_count = 0;
     n->resolved_type.is_any = 0;
     n->resolved_type.fixed_size = 0;
+    n->line = yylineno;
+    n->from_include = 0;
 }
 
 Type make_array_type(Type elem, int fixed_size) {
@@ -427,4 +439,142 @@ ModuleNode *make_module(char *name) {
     n->statics = NULL;
     n->static_count = 0;
     return n;
+}
+
+/* ── struct layout ──────────────────────────────────────────────────────────
+ * See the contract in ast.h. This is the single source of truth for offsets;
+ * lower.c and ir_to_mir.c both call in here rather than each doing their own
+ * arithmetic, because two passes disagreeing about a field offset produces
+ * silent memory corruption rather than any kind of error.
+ */
+
+static ClassNode *ast_find_class(ClassNode **classes, int class_count,
+                                 const char *name) {
+    if (!classes || !name) return NULL;
+    for (int i = 0; i < class_count; i++)
+        if (classes[i] && classes[i]->name && strcmp(classes[i]->name, name) == 0)
+            return classes[i];
+    return NULL;
+}
+
+/* Width of a primitive type name. Anything unrecognized is pointer-width. */
+static int ast_prim_width(const char *name) {
+    if (!name) return 8;
+    /* NOTE: `bool` is deliberately NOT 1 byte here. Hylian stores bools as 0/1
+       in a full 8-byte slot (type_name_to_mir() in ir_to_mir.c maps bool ->
+       MIR_I64), so a bool field is written with an 8-byte store. If the layout
+       handed it 1 byte, that store would run over the following 7 bytes and
+       silently corrupt whichever field came next. The two must agree. */
+    if (strcmp(name, "int8")  == 0 || strcmp(name, "uint8")  == 0) return 1;
+    if (strcmp(name, "int16") == 0 || strcmp(name, "uint16") == 0) return 2;
+    if (strcmp(name, "int32") == 0 || strcmp(name, "uint32") == 0 ||
+        strcmp(name, "float32") == 0) return 4;
+    return 8;
+}
+
+int ast_field_byte_width(ClassNode **classes, int class_count, FieldNode *f) {
+    if (!f) return 8;
+
+    const char *elem_name;
+    int is_fixed_array = (f->field_type.kind == TYPE_ARRAY &&
+                          f->field_type.fixed_size > 0);
+
+    if (is_fixed_array && f->field_type.elem_type_count > 0 && f->field_type.elem_types)
+        elem_name = f->field_type.elem_types[0].name;
+    else
+        elem_name = f->field_type.name ? f->field_type.name : "int";
+
+    int width = ast_prim_width(elem_name);
+
+    /* A field whose type is another class contributes that class's full size,
+       not a pointer — stack structs are stored inline. */
+    ClassNode *nested = ast_find_class(classes, class_count, elem_name);
+    if (nested) width = ast_class_byte_size(classes, class_count, elem_name);
+
+    if (is_fixed_array) return width * f->field_type.fixed_size;
+    return width;
+}
+
+int ast_class_byte_size(ClassNode **classes, int class_count, const char *name) {
+    ClassNode *cn = ast_find_class(classes, class_count, name);
+    if (!cn) return 8;
+
+    if (cn->is_union) {
+        int max_w = 0;
+        for (int i = 0; i < cn->field_count; i++) {
+            int w = ast_field_byte_width(classes, class_count, cn->fields[i]);
+            if (w > max_w) max_w = w;
+        }
+        int sz = max_w ? max_w : 8;
+        if (sz % 8 != 0) sz += 8 - sz % 8;
+        return sz;
+    }
+
+    int sz = 0;
+    for (int i = 0; i < cn->field_count; i++)
+        sz += ast_field_byte_width(classes, class_count, cn->fields[i]);
+    if (sz == 0) sz = 8;
+    if (!cn->is_packed && sz % 16 != 0) sz += 16 - sz % 16;
+    return sz;
+}
+
+int ast_field_offset(ClassNode **classes, int class_count,
+                     const char *cls, const char *field,
+                     int *out_width, const char **out_type_name) {
+    if (out_width)     *out_width = 8;
+    if (out_type_name) *out_type_name = NULL;
+
+    ClassNode *cn = ast_find_class(classes, class_count, cls);
+    if (!cn || !field) return -1;
+
+    int running = 0;
+    for (int i = 0; i < cn->field_count; i++) {
+        FieldNode *f = cn->fields[i];
+        if (!f) continue;
+        int w = ast_field_byte_width(classes, class_count, f);
+        if (f->name && strcmp(f->name, field) == 0) {
+            if (out_width) {
+                /* A fixed-size array field is addressed as a whole block, so
+                   report pointer width rather than the block's total size —
+                   callers load its base address, not its contents. */
+                if (f->field_type.kind == TYPE_ARRAY && f->field_type.fixed_size > 0)
+                    *out_width = 8;
+                else
+                    *out_width = w;
+            }
+            if (out_type_name)
+                *out_type_name = f->field_type.name;
+            return cn->is_union ? 0 : running;
+        }
+        if (!cn->is_union) running += w;
+    }
+    return -1;
+}
+
+int ast_is_class(ClassNode **classes, int class_count, const char *name) {
+    return ast_find_class(classes, class_count, name) != NULL;
+}
+
+/* Is `name` a BY-VALUE aggregate — something whose bytes live inline in a
+   stack slot, so a variable of that type is addressed rather than loaded?
+ *
+ * Three things disqualify a class:
+ *   - it has a constructor: it's made with `new`, so the local holds a pointer;
+ *   - it has no fields: an interface-only declaration (`class Error { fn
+ *     message() -> str }` in a .hyi) is an opaque HANDLE, and its values are
+ *     pointers into the runtime. Treating it as by-value made `e.message()`
+ *     pass the address of the slot holding the pointer instead of the pointer;
+ *   - it isn't a declared class at all (str, ptr, int, an unknown name).
+ */
+int ast_is_value_aggregate(ClassNode **classes, int class_count, const char *name) {
+    ClassNode *cn = ast_find_class(classes, class_count, name);
+    if (!cn) return 0;
+    if (cn->has_ctor) return 0;
+    if (cn->field_count == 0) return 0;
+    return 1;
+}
+
+int ast_class_has_ctor(ClassNode **classes, int class_count, const char *name) {
+    ClassNode *cn = ast_find_class(classes, class_count, name);
+    return cn ? cn->has_ctor : 0;
 }

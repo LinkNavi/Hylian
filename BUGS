@@ -1,0 +1,180 @@
+undefined variable 'STDERR_FD'
+
+no method 'arg' on type 'Cmd'
+all in the lsp it compiles fine.
+
+no method 'starts_with' on type 'str'{
+println(aString.starts_with("bl"));
+}
+
+eh does not increment {
+
+int eh = 0;
+
+    while (eh != alsoNums){
+        println(eh);
+        eh++;
+    }
+
+}
+
+
+eh = eh++; gives
+1
+0
+1
+0
+1
+0
+1 {
+   int eh = 0;
+
+    while (eh != alsoNums){
+        println(eh);
+        eh = eh++;
+    }
+
+}
+
+// println(nums[1]);
+   // the line below would just freeze the program, no crashing or anything (aware that fd isnt defined yet)
+   // println("printing socket: {{fd}}");
+println("printing socket: ");
+    int fd = tcp_socket();
+    // the line below would just freeze the program, no crashing or anything
+    // println("printing socket: {{fd}}");
+     println(fd);
+    if (connect(fd, "93.184.21609.34", 80) != 0) { //also freezes
+        eprintln("connect failed");
+
+    }
+    close(fd);
+
+idk why this is broken but it just is:
+
+1
+2
+3
+printing socket:
+3
+Running echo test
+test
+0
+making path in tmp.
+nah
+[1]    167840 segmentation fault (core dumped)  ./Init/zora-build/bin/Init
+
+include {
+    std.io,
+    std.os.exec,
+    std.string,
+    std.net,
+    std.os.fs,
+}
+
+int return5() {
+    return 5;
+}
+
+
+void main() {
+str TMP_DIR = "/tmp/hylianTest";
+    println("Hello from Init!");
+
+    int five = return5();
+    if (five < 5) {
+        println("what?");
+    } else if (five == 5) {
+        println("yeah");
+    } else {
+        println("no?");
+    }
+
+    array<int> nums = [1, 2, 3];
+
+    int alsoNums = nums.len;
+    int eh = 0;
+
+    while (eh != alsoNums){
+        println(eh);
+        eh = eh + 1;
+    }
+
+    str aString = "Blah";
+
+    println(aString);
+
+    println(starts_with(aString, "bl"));
+    println(starts_with(aString, "lb"));
+    // for-in gives you the ELEMENT, not the index
+    for (v in nums) {
+        println(v);
+    }
+
+   // println(nums[1]);
+   // the line below would just freeze the program, no crashing or anything (aware that fd isnt defined yet)
+   // println("printing socket: {{fd}}");
+    println("printing socket: ");
+    int fd = tcp_socket();
+    // the line below would just freeze the program, no crashing or anything
+    // println("printing socket: {{fd}}");
+    println(fd);
+    if (connect(fd, "1.1.1.1", 80) != 0) {
+        eprintln("connect failed");
+
+    }
+
+    close(fd);
+    println("Running echo test");
+    // run `echo test`, letting it write straight to our stdout
+    Cmd c = new Cmd("echo");
+    c.arg("test");
+    c.stdout_fd = STDOUT_FD;
+    c.stderr_fd = STDERR_FD;
+    int rc = c.run();
+    println(rc);
+    println("making path in tmp.");
+
+    if (mkdir(TMP_DIR, 77) != 0){
+    println("nah");
+      Cmd bad = new Cmd("mkdir /tmp/hylianTest");
+      bad.arg(TMP_DIR);
+      bad.run();
+    //return 0;
+    }
+
+    Cmd ls = new Cmd("ls " + TMP_DIR);
+    ls.arg(TMP_DIR);
+    ls.stdout_fd = STDOUT_FD;
+    ls.stderr_fd = STDERR_FD;
+    int lsRun = ls.run();
+    println(lsRun);
+    println("checking exists");
+
+    println(exists(TMP_DIR));
+
+    println("writing to previous tmp path");
+
+    write_all(TMP_DIR+"/tmp.txt", "yeah that shit worked twin");
+println("reading from previous tmp path");
+
+
+      println(read_all(TMP_DIR+"/tmp.txt"));
+    println("Cleaning");
+    remove(TMP_DIR+"/tmp.txt");
+    rmdir(TMP_DIR);
+
+
+
+}
+
+
+also can you make variable with methods (arrays strings etc)
+
+accept nums.len() instead of only taking len(nums) in both the lsp and the compiler
+
+should should probablly also add structs to be an actual type in the compiler and in the lsp and in the tree-sitter-hylian grammer, just have it steal cpp's struct syntax (with funcs and all) , change the std lib if you need to. same thing with enums
+
+Bonus:
+
+Err()/Error (hylian_make_err has no definition), enum values (Status_Ok etc. are emitted as symbols nobody defines), string interpolation, and asm blocks. should now be fixable if we add structs and enums

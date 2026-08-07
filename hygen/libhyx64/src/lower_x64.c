@@ -47,8 +47,36 @@ static int32_t float_spill_offset(const MIRFunc *fn, const RegAllocResult *ra, i
     return -8 * (fn->local_count + ra->num_int_spill_slots + spill_slot + 1);
 }
 
+/* One 8-byte home per callee-saved register this function actually used, below
+   every spill slot. Saving to a fixed frame slot rather than push/pop keeps rsp
+   constant through the body, which matters because MIR_CALL/MIR_SYSCALL do
+   their own temporary pushes and the 16-byte call alignment has to hold. */
+static int32_t callee_save_offset(const MIRFunc *fn, const RegAllocResult *ra, int idx) {
+    return -8 * (fn->local_count + ra->num_int_spill_slots
+                 + ra->num_float_spill_slots + idx + 1);
+}
+
+/* Scratch space handed out by MIR_ALLOCA_LOCAL, below everything else. */
+static int32_t alloca_region_base(const MIRFunc *fn, const RegAllocResult *ra) {
+    return 8 * (fn->local_count + ra->num_int_spill_slots
+                + ra->num_float_spill_slots + ra->callee_saved_int_used);
+}
+
+static int alloca_total_bytes(const MIRFunc *fn) {
+    int total = 0;
+    for (int i = 0; i < fn->count; i++) {
+        if (fn->instrs[i].op != MIR_ALLOCA_LOCAL) continue;
+        int n = fn->instrs[i].extra_int;
+        if (n <= 0) n = 8;
+        total += (n + 7) & ~7; /* keep every allocation 8-byte aligned */
+    }
+    return total;
+}
+
 static int32_t total_frame_bytes(const MIRFunc *fn, const RegAllocResult *ra) {
-    int raw = 8 * (fn->local_count + ra->num_int_spill_slots + ra->num_float_spill_slots);
+    int raw = 8 * (fn->local_count + ra->num_int_spill_slots + ra->num_float_spill_slots
+                   + ra->callee_saved_int_used)
+              + alloca_total_bytes(fn);
     return ((raw + 15) / 16) * 16;
 }
 
@@ -217,7 +245,19 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
         if (fn->param_count > X64_SYSV_ARG_REG_COUNT)
             fprintf(stderr, "[lower_x64] function '%s' has >6 params, stack-passed params "
                     "not supported yet\n", fn->name);
+
+        /* Save the callee-saved registers regalloc handed out. Without this,
+           a callee scribbling on rbx/r12-r15 would silently destroy a value
+           its *caller* was keeping there across the call - and since regalloc
+           now deliberately parks call-crossing values in exactly these
+           registers, that would break every one of them. Params are copied to
+           their slots first (above) so this can't clobber an incoming arg. */
+        for (int i = 0; i < ra->callee_saved_int_used; i++)
+            enc_mov_store(out_code, X64_RBP, callee_save_offset(fn, ra, i),
+                          x64_int_reg_pool[i]);
     }
+
+    int alloca_cursor = 0; /* bytes handed out by MIR_ALLOCA_LOCAL so far */
 
     for (int i = 0; i < fn->count; i++) {
         const MIRInstr *ins = &fn->instrs[i];
@@ -397,6 +437,26 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
             break;
         }
 
+        case MIR_SEXT: case MIR_ZEXT: case MIR_TRUNC: {
+            /* All three are "reinterpret the low N bytes into a full 64-bit
+               register", differing only in N and in which extension to use.
+               Widening (SEXT/ZEXT) takes N from the source; narrowing (TRUNC)
+               takes it from the destination. Until this existed, all three fell
+               through to warn_unhandled and emitted NOTHING - the destination
+               kept whatever stale value happened to be in its register, which
+               is why `cast<uint8>(48 + digit)` produced the digit rather than
+               its ASCII character. */
+            X64Reg a = load_operand(&ctx, ins->src1, X64_RAX);
+            int size = (ins->op == MIR_TRUNC) ? mir_type_size(ins->dest.type)
+                                              : mir_type_size(ins->src1.type);
+            int is_signed = (ins->op == MIR_SEXT) ? 1
+                          : (ins->op == MIR_ZEXT) ? 0
+                          : !mir_type_is_unsigned(ins->dest.type);
+            enc_ext_rr(out_code, a, a, size, is_signed);
+            store_result(&ctx, ins->dest, a);
+            break;
+        }
+
         case MIR_BITCAST: {
             int src_f = mir_type_is_float(ins->src1.type);
             int dst_f = mir_type_is_float(ins->dest.type);
@@ -431,6 +491,26 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
             break;
         }
 
+        case MIR_ALLOCA_LOCAL: {
+            /* extra_int bytes of frame scratch, address into dest. The space
+               is reserved statically by total_frame_bytes(), and each
+               ALLOCA_LOCAL gets its own non-overlapping chunk assigned in
+               instruction order via the running cursor - so this is really
+               "carve out a fixed buffer", not a dynamic alloca. That's exactly
+               what the only current user needs (print/println's int->string
+               conversion buffer), and it means rsp never moves.
+               Until this existed the opcode fell through to warn_unhandled and
+               emitted nothing at all, leaving dest holding garbage - printing
+               any integer wrote through a wild pointer. */
+            int size = ins->extra_int > 0 ? ins->extra_int : 8;
+            size = (size + 7) & ~7;
+            alloca_cursor += size;
+            int32_t off = -(alloca_region_base(fn, ra) + alloca_cursor);
+            enc_lea_mem(out_code, X64_RAX, X64_RBP, off);
+            store_result(&ctx, ins->dest, X64_RAX);
+            break;
+        }
+
         case MIR_LOAD: {
             if (ins->src1.kind == MIRV_GLOBAL) {
                 size_t off = enc_mov_load_rip(out_code, X64_RAX);
@@ -438,8 +518,14 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
             } else if (ins->src1.kind == MIRV_LOCAL) {
                 enc_mov_load(out_code, X64_RAX, X64_RBP, local_offset(ins->src1.local_id));
             } else {
+                /* Real pointer dereference: width comes from the loaded type,
+                   not the register width. An 8-byte load of a `*uint8` reads 7
+                   bytes past the target and returns them as part of the value. */
                 X64Reg base = load_operand(&ctx, ins->src1, X64_RAX);
-                enc_mov_load(out_code, X64_RAX, base, ins->extra_int /* e.g. array .cap offset */);
+                enc_mov_load_sz(out_code, X64_RAX, base,
+                                ins->mem_offset /* struct field / array header */,
+                                mir_type_size(ins->dest.type),
+                                !mir_type_is_unsigned(ins->dest.type));
             }
             store_result(&ctx, ins->dest, X64_RAX);
             break;
@@ -453,8 +539,13 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
             } else if (ins->dest.kind == MIRV_LOCAL) {
                 enc_mov_store(out_code, X64_RBP, local_offset(ins->dest.local_id), val);
             } else {
+                /* Real pointer store: width comes from the stored value's type.
+                   Writing 8 bytes for a `*uint8` store clobbers the following 7
+                   bytes - in a loop filling a byte buffer, every iteration then
+                   erases the bytes the previous ones wrote. */
                 X64Reg addr = load_operand(&ctx, ins->dest, X64_R11);
-                enc_mov_store(out_code, addr, 0, val);
+                enc_mov_store_sz(out_code, addr, ins->mem_offset, val,
+                                 mir_type_size(ins->src1.type));
             }
             break;
         }
@@ -503,8 +594,16 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
         }
 
         case MIR_RET: {
+            /* Return value into rax BEFORE restoring, since a restored
+               register could otherwise overwrite it... and restore before
+               `leave`, since leave drops the frame the saves live in. */
             load_operand(&ctx, ins->src1, X64_RAX);
-            if (!fn->is_naked) enc_leave(out_code);
+            if (!fn->is_naked) {
+                for (int cs = 0; cs < ra->callee_saved_int_used; cs++)
+                    enc_mov_load(out_code, x64_int_reg_pool[cs], X64_RBP,
+                                 callee_save_offset(fn, ra, cs));
+                enc_leave(out_code);
+            }
             enc_ret(out_code);
             break;
         }

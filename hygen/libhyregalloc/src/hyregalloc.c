@@ -252,7 +252,16 @@ typedef struct {
     int vreg;
     int start, end;
     int is_float;
+    int crosses_call;   /* live range spans a call -> caller-saved regs are unsafe */
 } Interval;
+
+/* Any instruction that executes a `call`-like transfer and therefore destroys
+   the caller-saved registers. MIR_SYSCALL counts too: the `syscall`
+   instruction itself clobbers rcx and r11, and the kernel is free to touch
+   the caller-saved set. */
+static int op_clobbers_caller_saved(MIROp op) {
+    return op == MIR_CALL || op == MIR_SYSCALL;
+}
 
 static void extend(int *start, int *end, int pos) {
     if (*start < 0 || pos < *start) *start = pos;
@@ -302,6 +311,15 @@ static Interval *compute_intervals(const MIRFunc *fn, const CFG *cfg, const Live
         }
     }
 
+    /* Prefix count of call-like instructions, so "is there a call strictly
+       between start and end" is an O(1) subtraction per interval instead of a
+       rescan. A call AT `start` (the interval is that call's result) or AT
+       `end` (the interval is one of that call's arguments, read before the
+       call executes) does NOT count - only a call the value has to survive. */
+    int *calls_before = calloc(fn->count + 1, sizeof(int));
+    for (int i = 0; i < fn->count; i++)
+        calls_before[i + 1] = calls_before[i] + (op_clobbers_caller_saved(fn->instrs[i].op) ? 1 : 0);
+
     Interval *intervals = malloc(nvregs * sizeof(Interval));
     int count = 0;
     for (int v = 0; v < nvregs; v++) {
@@ -310,8 +328,12 @@ static Interval *compute_intervals(const MIRFunc *fn, const CFG *cfg, const Live
         intervals[count].start = start[v];
         intervals[count].end = end[v];
         intervals[count].is_float = is_float[v];
+        /* calls in the open interval (start, end) */
+        intervals[count].crosses_call =
+            (end[v] > start[v]) && (calls_before[end[v]] - calls_before[start[v] + 1] > 0);
         count++;
     }
+    free(calls_before);
     free(start); free(end); free(is_float);
     *out_count = count;
     return intervals;
@@ -329,7 +351,8 @@ typedef struct {
 } Active;
 
 static void linear_scan_class(Interval *intervals, int n, int num_regs,
-                               MCLoc *out_locs, int is_float_class, int *spill_count) {
+                               MCLoc *out_locs, int is_float_class, int *spill_count,
+                               int num_callee_saved, int *callee_saved_used) {
     if (n == 0) return;
     qsort(intervals, n, sizeof(Interval), cmp_by_start);
 
@@ -337,7 +360,12 @@ static void linear_scan_class(Interval *intervals, int n, int num_regs,
     int active_count = 0;
     int *free_regs = malloc(num_regs * sizeof(int));
     int free_count = num_regs;
-    for (int i = 0; i < num_regs; i++) free_regs[i] = i;
+    /* Hand out the *caller-saved* ids first (they're the tail of the pool) so
+       the scarce callee-saved ones stay available for the values that actually
+       need them, and so functions that never carry anything across a call
+       don't pay for saving/restoring registers they didn't need. free_regs is
+       popped from the top, so push callee-saved at the bottom. */
+    for (int i = 0; i < num_regs; i++) free_regs[i] = num_regs - 1 - i;
     int next_spill = 0;
 
     for (int i = 0; i < n; i++) {
@@ -353,11 +381,40 @@ static void linear_scan_class(Interval *intervals, int n, int num_regs,
             }
         }
 
+        /* A value live across a call can only sit in a callee-saved register.
+           Look for a free one specifically; if the class has none (SysV has no
+           callee-saved xmm) or they're all taken, fall through to spilling -
+           the stack is the only other place a value can survive a call. */
+        if (cur.crosses_call) {
+            int pick = -1;
+            for (int f = free_count - 1; f >= 0; f--) {
+                if (free_regs[f] < num_callee_saved) { pick = f; break; }
+            }
+            if (pick >= 0 && active_count < num_regs) {
+                int reg = free_regs[pick];
+                free_regs[pick] = free_regs[--free_count];
+                out_locs[cur.vreg].kind = MCLOC_REG;
+                out_locs[cur.vreg].is_float = is_float_class;
+                out_locs[cur.vreg].reg_id = reg;
+                if (reg + 1 > *callee_saved_used) *callee_saved_used = reg + 1;
+                active[active_count].iv = cur;
+                active[active_count].reg = reg;
+                active_count++;
+            } else {
+                out_locs[cur.vreg].kind = MCLOC_SPILL;
+                out_locs[cur.vreg].is_float = is_float_class;
+                out_locs[cur.vreg].spill_slot = next_spill++;
+            }
+            continue;
+        }
+
         if (active_count < num_regs && free_count > 0) {
             int reg = free_regs[--free_count];
             out_locs[cur.vreg].kind = MCLOC_REG;
             out_locs[cur.vreg].is_float = is_float_class;
             out_locs[cur.vreg].reg_id = reg;
+            if (reg < num_callee_saved && reg + 1 > *callee_saved_used)
+                *callee_saved_used = reg + 1;
             active[active_count].iv = cur;
             active[active_count].reg = reg;
             active_count++;
@@ -381,6 +438,8 @@ static void linear_scan_class(Interval *intervals, int n, int num_regs,
                 out_locs[cur.vreg].kind = MCLOC_REG;
                 out_locs[cur.vreg].is_float = is_float_class;
                 out_locs[cur.vreg].reg_id = reg;
+                if (reg < num_callee_saved && reg + 1 > *callee_saved_used)
+                    *callee_saved_used = reg + 1;
                 active[spill_idx].iv = cur;
                 active[spill_idx].reg = reg;
             } else {
@@ -421,8 +480,12 @@ RegAllocResult regalloc_run(const MIRFunc *fn, const RegAllocTarget *target) {
         else ints[int_n++] = all[i];
     }
 
-    linear_scan_class(ints, int_n, target->num_int_regs, res.vreg_locs, 0, &res.num_int_spill_slots);
-    linear_scan_class(floats, float_n, target->num_float_regs, res.vreg_locs, 1, &res.num_float_spill_slots);
+    linear_scan_class(ints, int_n, target->num_int_regs, res.vreg_locs, 0,
+                      &res.num_int_spill_slots,
+                      target->num_callee_saved_int_regs, &res.callee_saved_int_used);
+    linear_scan_class(floats, float_n, target->num_float_regs, res.vreg_locs, 1,
+                      &res.num_float_spill_slots,
+                      target->num_callee_saved_float_regs, &res.callee_saved_float_used);
 
     free(ints); free(floats); free(all);
     liveness_free(&lv);

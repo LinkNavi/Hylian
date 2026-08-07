@@ -26,6 +26,67 @@ void enc_mov_store(X64Buf *b, X64Reg base, int32_t disp, X64Reg src) {
     x64_buf_write32(b, (uint32_t)disp);
 }
 
+void enc_mov_store_sz(X64Buf *b, X64Reg base, int32_t disp, X64Reg src, int size) {
+    switch (size) {
+    case 1:
+        /* mov r/m8, r8. The REX prefix is emitted unconditionally even when
+           no bit in it is set: without one, encodings 4-7 mean ah/ch/dh/bh
+           rather than spl/bpl/sil/dil, so a store from rsi would silently
+           become a store from dh. A bare 0x40 REX forces the modern reading. */
+        x64_buf_push(b, x64_rex(0, src, base));
+        x64_buf_push(b, 0x88);
+        break;
+    case 2:
+        x64_buf_push(b, 0x66); /* operand-size override: 16-bit */
+        x64_buf_push(b, x64_rex(0, src, base));
+        x64_buf_push(b, 0x89);
+        break;
+    case 4:
+        x64_buf_push(b, x64_rex(0, src, base));
+        x64_buf_push(b, 0x89);
+        break;
+    default:
+        x64_buf_push(b, x64_rex(1, src, base));
+        x64_buf_push(b, 0x89);
+        break;
+    }
+    x64_buf_push(b, x64_modrm(2, src, base));
+    x64_buf_write32(b, (uint32_t)disp);
+}
+
+void enc_mov_load_sz(X64Buf *b, X64Reg dst, X64Reg base, int32_t disp, int size, int is_signed) {
+    switch (size) {
+    case 1:
+        /* movzx/movsx r64, r/m8 */
+        x64_buf_push(b, x64_rex(1, dst, base));
+        x64_buf_push(b, 0x0F);
+        x64_buf_push(b, is_signed ? 0xBE : 0xB6);
+        break;
+    case 2:
+        x64_buf_push(b, x64_rex(1, dst, base));
+        x64_buf_push(b, 0x0F);
+        x64_buf_push(b, is_signed ? 0xBF : 0xB7);
+        break;
+    case 4:
+        if (is_signed) {
+            x64_buf_push(b, x64_rex(1, dst, base)); /* movsxd r64, r/m32 */
+            x64_buf_push(b, 0x63);
+        } else {
+            /* a 32-bit mov zero-extends into the full 64-bit register, so the
+               plain 32-bit load is already the correct zero-extending form */
+            x64_buf_push(b, x64_rex(0, dst, base));
+            x64_buf_push(b, 0x8B);
+        }
+        break;
+    default:
+        x64_buf_push(b, x64_rex(1, dst, base));
+        x64_buf_push(b, 0x8B);
+        break;
+    }
+    x64_buf_push(b, x64_modrm(2, dst, base));
+    x64_buf_write32(b, (uint32_t)disp);
+}
+
 size_t enc_lea_rip(X64Buf *b, X64Reg dst) {
     x64_buf_push(b, x64_rex(1, dst, 0));
     x64_buf_push(b, 0x8D);
@@ -133,6 +194,42 @@ void enc_movzx_r64_r8(X64Buf *b, X64Reg dst, X64Reg src) {
     x64_buf_push(b, 0x0F);
     x64_buf_push(b, 0xB6);
     x64_buf_push(b, x64_modrm(3, dst, src));
+}
+
+/* dst = the low `src_size` bytes of src, widened to a full 64-bit register
+   either sign- or zero-extended. This one primitive covers MIR_SEXT, MIR_ZEXT
+   and MIR_TRUNC: truncation in a register-based backend IS "keep the low N
+   bytes and re-widen", the only question being which extension to re-widen
+   with, and that's exactly what `is_signed` selects. */
+void enc_ext_rr(X64Buf *b, X64Reg dst, X64Reg src, int src_size, int is_signed) {
+    switch (src_size) {
+    case 1:
+        x64_buf_push(b, x64_rex(1, dst, src));
+        x64_buf_push(b, 0x0F);
+        x64_buf_push(b, is_signed ? 0xBE : 0xB6);
+        x64_buf_push(b, x64_modrm(3, dst, src));
+        break;
+    case 2:
+        x64_buf_push(b, x64_rex(1, dst, src));
+        x64_buf_push(b, 0x0F);
+        x64_buf_push(b, is_signed ? 0xBF : 0xB7);
+        x64_buf_push(b, x64_modrm(3, dst, src));
+        break;
+    case 4:
+        if (is_signed) {
+            x64_buf_push(b, x64_rex(1, dst, src)); /* movsxd r64, r/m32 */
+            x64_buf_push(b, 0x63);
+        } else {
+            /* 32-bit mov already zero-extends into the upper 32 bits */
+            x64_buf_push(b, x64_rex(0, dst, src));
+            x64_buf_push(b, 0x8B);
+        }
+        x64_buf_push(b, x64_modrm(3, dst, src));
+        break;
+    default:
+        if (dst != src) enc_mov_rr(b, dst, src);
+        break;
+    }
 }
 
 void enc_push(X64Buf *b, X64Reg reg) {

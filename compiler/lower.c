@@ -65,6 +65,16 @@ typedef struct {
     /* Arena / unsafe tracking */
     int         in_unsafe;          /* 1 when inside an unsafe { } block    */
     int         has_arena;          /* 1 when current function owns an arena */
+    /* Names ALLOCA'd in the function currently being lowered (params and
+       locals). A bare identifier inside a method resolves to a field of the
+       enclosing class only if no local of that name shadows it. */
+    const char *local_names[256];
+    int         local_name_count;
+    /* Parameters whose type is a by-value struct. They arrive as a POINTER to
+       the caller's copy, so a field access on them must load that pointer,
+       not take the address of the slot holding it. */
+    const char *struct_param_names[32];
+    int         struct_param_count;
 } LowerState;
 
 
@@ -143,6 +153,9 @@ static int  loop_cont(LowerState *s)  { return s->loop_top > 0 ? s->loop_stack[s
 
 /* Helper: emit a ALLOCA + optional STORE_VAR 0 for a local variable */
 static void emit_alloca(LowerState *s, const char *name, const char *type_name, int type_kind) {
+    /* Record the name so lower_is_self_field() can let locals shadow fields. */
+    if (name && s->local_name_count < 256)
+        s->local_names[s->local_name_count++] = name;
     IRInstr *a      = ir_emit(s->mod, IR_ALLOCA);
     a->str_extra    = strdup(name);
     a->str_extra2   = type_name ? strdup(type_name) : NULL;
@@ -173,6 +186,9 @@ static int classify_print_arg(ASTNode *arg) {
 }
 
 
+static int  lower_is_self_field(LowerState *s, const char *name);
+static int  lower_is_value_struct(LowerState *s, const Type *t);
+static int  lower_is_struct_param(LowerState *s, const char *name);
 static int  lower_expr(ASTNode *node, LowerState *s);
 static void lower_stmt(ASTNode *node, LowerState *s);
 static void lower_stmts(ASTNode **stmts, int count, LowerState *s);
@@ -335,6 +351,229 @@ static int lower_stack_struct_addrof(ASTNode *node, LowerState *s,
 }
 
 
+
+/*
+ * Return a temp holding the BASE ADDRESS of the object `obj` refers to, for a
+ * field read or write. This is the one place that decision is made, because
+ * getting it wrong in only one of the two paths is exactly the bug that made
+ * `self.n = x` write through the wrong pointer while `return self.n` read
+ * through the right one.
+ *
+ * The cases that differ:
+ *   - obj == NULL, or the identifier `self`: `self` is ALWAYS a pointer to the
+ *     object (it arrives in rdi), so its base address is the value stored in
+ *     the slot — a load, never an addrof. Taking the address of the slot yields
+ *     a pointer to the pointer, and every field access through it lands in the
+ *     caller's frame instead of the object.
+ *   - a heap object (class with a constructor, made with `new`): the local
+ *     holds the pointer, so again a load.
+ *   - a bare stack struct: the local IS the struct data, so its address is what
+ *     is wanted — an addrof.
+ *   - a chained access like `ev.key.keysym`: walk the chain accumulating byte
+ *     offsets rather than dereferencing each intermediate field as a pointer.
+ */
+static int lower_object_base_ptr(ASTNode *obj, LowerState *s) {
+    /* implicit self (`n = 1` inside a method) */
+    if (!obj) {
+        int t = alloc_temp(s);
+        IRInstr *lv   = ir_emit(s->mod, IR_LOAD_VAR);
+        lv->dest      = irop_temp(t);
+        lv->str_extra = strdup("self");
+        return t;
+    }
+
+    if (obj->type == NODE_IDENTIFIER) {
+        const char *vname = ((IdentifierNode *)obj)->name;
+
+        /* explicit `self.field` — same pointer-valued local as above */
+        if (strcmp(vname, "self") == 0) {
+            int t = alloc_temp(s);
+            IRInstr *lv   = ir_emit(s->mod, IR_LOAD_VAR);
+            lv->dest      = irop_temp(t);
+            lv->str_extra = strdup("self");
+            return t;
+        }
+
+        /* A bare field name used as an OBJECT, e.g. `b.x` inside a method where
+           `b` is a nested struct field. The base address is self + offset(b).
+           Without this, `b` resolved as a global variable named b and failed to
+           link — the implicit receiver worked for `b` alone but not for `b.x`. */
+        if (lower_is_self_field(s, vname)) {
+            int width = 0;
+            const char *ftype = NULL;
+            int off = ast_field_offset(s->mod->classes, s->mod->class_count,
+                                       s->class_name, vname, &width, &ftype);
+            int tself = alloc_temp(s);
+            IRInstr *lv   = ir_emit(s->mod, IR_LOAD_VAR);
+            lv->dest      = irop_temp(tself);
+            lv->str_extra = strdup("self");
+            if (off <= 0) return tself;
+            int tadj = alloc_temp(s);
+            IRInstr *add = ir_emit(s->mod, IR_ADD);
+            add->dest = irop_temp(tadj);
+            add->src1 = irop_temp(tself);
+            add->src2 = irop_const_int((long)off);
+            return tadj;
+        }
+
+        /* A by-value struct PARAMETER holds a pointer to the caller's copy. */
+        if (lower_is_struct_param(s, vname)) {
+            int t = alloc_temp(s);
+            IRInstr *lv   = ir_emit(s->mod, IR_LOAD_VAR);
+            lv->dest      = irop_temp(t);
+            lv->str_extra = strdup(vname);
+            return t;
+        }
+
+        /* ADDROF is correct ONLY for a by-value aggregate, where the local IS
+           the data. For anything else — a heap class made with `new`, or a
+           non-class type like Error/str/ptr — the local holds a pointer (or the
+           value itself) and must be LOADED.
+           Defaulting to ADDROF for unknown types is what briefly broke
+           `e.message()` on an Error: Error isn't a declared class, so it took
+           the by-value path and passed the address of the slot holding the
+           pointer instead of the pointer. */
+        int use_addrof = 0;
+        if (obj->resolved_type.kind == TYPE_SIMPLE && obj->resolved_type.name) {
+            const char *tn = obj->resolved_type.name;
+            use_addrof = ast_is_value_aggregate(s->mod->classes, s->mod->class_count, tn);
+        }
+
+        int t = alloc_temp(s);
+        IRInstr *ins  = ir_emit(s->mod, use_addrof ? IR_ADDROF : IR_LOAD_VAR);
+        ins->dest      = irop_temp(t);
+        ins->str_extra = strdup(vname);
+        return t;
+    }
+
+    if (obj->type == NODE_MEMBER_ACCESS) {
+        int cum_offset = 0;
+        const char *chain_type = NULL;
+        int tbase = lower_stack_struct_addrof(obj, s, &cum_offset, &chain_type);
+        if (tbase >= 0 && cum_offset > 0) {
+            int tadj = alloc_temp(s);
+            IRInstr *add = ir_emit(s->mod, IR_ADD);
+            add->dest = irop_temp(tadj);
+            add->src1 = irop_temp(tbase);
+            add->src2 = irop_const_int((long)cum_offset);
+            return tadj;
+        }
+        if (tbase >= 0) return tbase;
+    }
+
+    return lower_expr(obj, s);
+}
+
+
+/* Is `name` a field of the class we're currently lowering a method of?
+   Inside a method, a bare `x` means `self.x` if the class has a field called
+   x — that's the whole point of the implicit receiver. Without this check the
+   identifier fell through to an ordinary variable load, which resolved to a
+   GLOBAL symbol named `x` and failed at link time with "undefined reference to
+   x". Writes through the implicit receiver already worked (NODE_MEMBER_ASSIGN
+   handles a NULL object), so only reads were broken — meaning `x = v;` in a
+   constructor compiled while `return x;` in a method did not. */
+static int lower_is_self_field(LowerState *s, const char *name) {
+    if (!s || !s->class_name || !name || !s->mod) return 0;
+    /* A local or parameter of the same name shadows the field. */
+    for (int i = 0; i < s->local_name_count; i++)
+        if (s->local_names[i] && strcmp(s->local_names[i], name) == 0) return 0;
+    int width = 0;
+    const char *tname = NULL;
+    return ast_field_offset(s->mod->classes, s->mod->class_count,
+                            s->class_name, name, &width, &tname) >= 0;
+}
+
+/* Emit a store of temp `tval` into the implicit-receiver field `name`. */
+static void lower_store_self_field(LowerState *s, const char *name, int tval) {
+    int tself = alloc_temp(s);
+    IRInstr *lv   = ir_emit(s->mod, IR_LOAD_VAR);
+    lv->dest      = irop_temp(tself);
+    lv->str_extra = strdup("self");
+
+    IRInstr *sf    = ir_emit(s->mod, IR_SET_FIELD);
+    sf->src1       = irop_temp(tself);
+    sf->src2       = irop_temp(tval);
+    sf->str_extra  = strdup(s->class_name);
+    sf->str_extra2 = strdup(name);
+}
+
+/* Emit a load of the implicit-receiver field `name`; returns its temp. */
+static int lower_load_self_field(LowerState *s, const char *name) {
+    int tself = alloc_temp(s);
+    IRInstr *lv   = ir_emit(s->mod, IR_LOAD_VAR);
+    lv->dest      = irop_temp(tself);
+    lv->str_extra = strdup("self");
+
+    int tf = alloc_temp(s);
+    IRInstr *gf    = ir_emit(s->mod, IR_GET_FIELD);
+    gf->dest       = irop_temp(tf);
+    gf->src1       = irop_temp(tself);
+    gf->str_extra  = strdup(s->class_name);
+    gf->str_extra2 = strdup(name);
+    return tf;
+}
+
+
+/* A by-value aggregate: a class/struct with no constructor. These live inline
+   (in a stack slot or inside another aggregate) rather than behind a pointer,
+   which is what makes them different from `class` for argument passing. */
+static int lower_is_value_struct(LowerState *s, const Type *t) {
+    if (!s || !s->mod || !t) return 0;
+    if (t->kind != TYPE_SIMPLE || !t->name) return 0;
+    return ast_is_value_aggregate(s->mod->classes, s->mod->class_count, t->name);
+}
+
+static int lower_is_struct_param(LowerState *s, const char *name) {
+    if (!s || !name) return 0;
+    for (int i = 0; i < s->struct_param_count; i++)
+        if (s->struct_param_names[i] && strcmp(s->struct_param_names[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+/*
+ * Lower one call argument. A by-value struct is COPIED into a hidden local and
+ * its address passed, which is what gives struct arguments value semantics:
+ * the callee can mutate its parameter freely without the caller seeing it.
+ *
+ * Passing the struct through lower_expr() instead (the old behaviour) loaded
+ * only its first 8 bytes and handed that over as if it were the whole thing,
+ * so `p.dot(q)` read q.x as the entire struct and computed nonsense.
+ */
+static int lower_call_arg(ASTNode *arg, LowerState *s) {
+    if (!arg || !lower_is_value_struct(s, &arg->resolved_type))
+        return lower_expr(arg, s);
+
+    const char *tname = arg->resolved_type.name;
+    int size = ast_class_byte_size(s->mod->classes, s->mod->class_count, tname);
+
+    int uid = alloc_label(s);
+    char copy_name[64];
+    snprintf(copy_name, sizeof(copy_name), "__argcopy_%d", uid);
+    emit_alloca(s, copy_name, tname, TYPE_SIMPLE);
+
+    int tsrc = lower_object_base_ptr(arg, s);
+
+    int tdst = alloc_temp(s);
+    IRInstr *af   = ir_emit(s->mod, IR_ADDROF);
+    af->dest      = irop_temp(tdst);
+    af->str_extra = strdup(copy_name);
+
+    int tcount = alloc_temp(s);
+    IRInstr *cn = ir_emit(s->mod, IR_CONST_INT);
+    cn->dest = irop_temp(tcount);
+    cn->src1 = irop_const_int(size);
+
+    IRInstr *cp    = ir_emit(s->mod, IR_MEMCPY);
+    cp->dest       = irop_temp(alloc_temp(s));
+    cp->src1       = irop_temp(tdst);
+    cp->src2       = irop_temp(tsrc);
+    cp->extra_src  = irop_temp(tcount);
+
+    return tdst;
+}
+
 /* Emit code for `node`; return the temp ID that holds the result. */
 static int lower_expr(ASTNode *node, LowerState *s) {
     if (!node) {
@@ -389,6 +628,15 @@ static int lower_expr(ASTNode *node, LowerState *s) {
 
     case NODE_IDENTIFIER: {
         IdentifierNode *id = (IdentifierNode *)node;
+
+        /* Bare field reference inside a method: `x` means `self.x`.
+           Checked before the local-static and plain-variable paths, but only
+           when nothing closer shadows it — a real local or parameter of the
+           same name wins, which is why this runs after ALLOCA registration
+           has already happened for those. */
+        if (lower_is_self_field(s, id->name))
+            return lower_load_self_field(s, id->name);
+
         int t = alloc_temp(s);
         /* If this identifier is a function-local static, emit LOAD_VAR for
          * the mangled .data label so codegen uses [rel __static_N__name]. */
@@ -514,6 +762,72 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             return t;
         }
 
+        /* String concatenation: `+` between (at least one) string operand is
+           not numeric addition — route to the runtime `concat(str,str)`
+           helper (stdlib/string.hy). Previously this fell straight into the
+           generic numeric path below and emitted IR_ADD directly on the raw
+           string pointers, i.e. it added two pointer *addresses* together
+           and called the (garbage) result a string — which then crashed the
+           moment anything tried to read it (e.g. `println("a" + b)`). */
+        if (strcmp(op, "+") == 0) {
+            int left_is_str  = bin->left  && bin->left->resolved_type.name  &&
+                                strcmp(bin->left->resolved_type.name, "str") == 0;
+            int right_is_str = bin->right && bin->right->resolved_type.name &&
+                                strcmp(bin->right->resolved_type.name, "str") == 0;
+            /* Require BOTH sides to be str: `concat(str,str)` isn't safe to
+               call with a mismatched (e.g. int) operand, so a str+non-str
+               `+` falls through to the numeric path below unchanged rather
+               than risk passing the wrong type into concat's argument slot. */
+            if (left_is_str && right_is_str) {
+                int tl2 = lower_expr(bin->left, s);
+                int tr2 = lower_expr(bin->right, s);
+                int t2  = alloc_temp(s);
+                IROperand *arg_ops = malloc(2 * sizeof(IROperand));
+                arg_ops[0] = irop_temp(tl2);
+                arg_ops[1] = irop_temp(tr2);
+                IRInstr *ins = ir_emit(s->mod, IR_CALL);
+                ins->dest      = irop_temp(t2);
+                ins->str_extra = strdup("concat");
+                ins->args      = arg_ops;
+                ins->arg_count = 2;
+                return t2;
+            }
+        }
+
+        /* String equality: `==`/`!=` between two str operands is NOT a
+           pointer compare — two distinct heap allocations holding the same
+           bytes (e.g. a runtime `args[1]` next to a `"cat"` literal) are
+           never the same pointer, so `args[1] == "cat"` was always false no
+           matter what args[1] actually held. Route through stdlib/string.hy's
+           `equals(str,str)` (byte-for-byte compare), mirroring the `+`
+           concat special case above. `!=` reuses the same call and negates
+           the result with IR_NOT. */
+        if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
+            int left_is_str  = bin->left  && bin->left->resolved_type.name  &&
+                                strcmp(bin->left->resolved_type.name, "str") == 0;
+            int right_is_str = bin->right && bin->right->resolved_type.name &&
+                                strcmp(bin->right->resolved_type.name, "str") == 0;
+            if (left_is_str && right_is_str) {
+                int tl2 = lower_expr(bin->left, s);
+                int tr2 = lower_expr(bin->right, s);
+                int t2  = alloc_temp(s);
+                IROperand *arg_ops = malloc(2 * sizeof(IROperand));
+                arg_ops[0] = irop_temp(tl2);
+                arg_ops[1] = irop_temp(tr2);
+                IRInstr *ins = ir_emit(s->mod, IR_CALL);
+                ins->dest      = irop_temp(t2);
+                ins->str_extra = strdup("equals");
+                ins->args      = arg_ops;
+                ins->arg_count = 2;
+                if (strcmp(op, "==") == 0) return t2;
+                int t3 = alloc_temp(s);
+                IRInstr *notins = ir_emit(s->mod, IR_NOT);
+                notins->dest = irop_temp(t3);
+                notins->src1 = irop_temp(t2);
+                return t3;
+            }
+        }
+
         int tl = lower_expr(bin->left, s);
         int tr = lower_expr(bin->right, s);
         int t  = alloc_temp(s);
@@ -558,6 +872,12 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         IRInstr *ins = ir_emit(s->mod, irop);
         ins->dest = irop_temp(t);
         ins->src1 = irop_temp(te);
+        /* Record the pointee type so codegen loads the right NUMBER OF BYTES.
+           typecheck resolves `*p` to the pointer's element type, so this is
+           already available; without passing it down, every deref became an
+           8-byte load regardless of the pointer's actual element type. */
+        const char *pointee = node->resolved_type.name;
+        ins->str_extra = strdup((pointee && pointee[0]) ? pointee : "int");
         return t;
     }
     if (strcmp(un->op, "~") == 0) {
@@ -567,6 +887,52 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         ins->dest = irop_temp(t);
         ins->src1 = irop_temp(te);
         return t;
+    }
+    if (strcmp(un->op, "++") == 0 || strcmp(un->op, "--") == 0) {
+        /* `x++`/`x--`/`++x`/`--x`: load, add/sub 1, store back. Postfix
+           returns the OLD value; prefix returns the NEW value. Previously
+           this fell into the generic unary-op default below, which mapped
+           "++"/"--" to IR_NOT (bitwise/logical-not is the only non-NEG
+           fallback) — i.e. it computed `x == 0` into a throwaway temp and
+           never stored anything back, so `x++` silently never mutated `x`. */
+        IROpcode deltaop = strcmp(un->op, "++") == 0 ? IR_ADD : IR_SUB;
+        if (un->operand->type == NODE_IDENTIFIER) {
+            IdentifierNode *id = (IdentifierNode *)un->operand;
+            if (lower_is_self_field(s, id->name)) {
+                int told = lower_load_self_field(s, id->name);
+                int tnew = alloc_temp(s);
+                IRInstr *op_ins = ir_emit(s->mod, deltaop);
+                op_ins->dest = irop_temp(tnew);
+                op_ins->src1 = irop_temp(told);
+                op_ins->src2 = irop_const_int(1);
+                lower_store_self_field(s, id->name, tnew);
+                return un->postfix ? told : tnew;
+            }
+            const LocalStaticAlias *_un_lsa = lower_find_local_static(s, id->name);
+            const char *_un_name = _un_lsa ? _un_lsa->mangled_name : id->name;
+            int told = alloc_temp(s);
+            { IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR); lv->dest = irop_temp(told); lv->str_extra = strdup(_un_name); }
+            int tnew = alloc_temp(s);
+            IRInstr *op_ins = ir_emit(s->mod, deltaop);
+            op_ins->dest = irop_temp(tnew);
+            op_ins->src1 = irop_temp(told);
+            op_ins->src2 = irop_const_int(1);
+            IRInstr *sv = ir_emit(s->mod, IR_STORE_VAR);
+            sv->str_extra = strdup(_un_name);
+            sv->src1      = irop_temp(tnew);
+            return un->postfix ? told : tnew;
+        }
+        /* Non-identifier operand (e.g. a field/array-index expression): no
+           lvalue to store back into with the tools available here. Evaluate
+           and produce the incremented value so this at least behaves like a
+           read-only `x + 1` instead of silently miscompiling to IR_NOT. */
+        int te2 = lower_expr(un->operand, s);
+        int t2  = alloc_temp(s);
+        IRInstr *ins2 = ir_emit(s->mod, deltaop);
+        ins2->dest = irop_temp(t2);
+        ins2->src1 = irop_temp(te2);
+        ins2->src2 = irop_const_int(1);
+        return t2;
     }
     {
         int te2 = lower_expr(un->operand, s);
@@ -793,9 +1159,15 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                 else if (strcmp(tname, "uint64") == 0 || strcmp(tname, "int64") == 0) sz = 8;
                 else if (strcmp(tname, "usize")  == 0 || strcmp(tname, "isize") == 0) sz = 8;
                 else if (strcmp(tname, "int")    == 0) sz = 8;
-                else if (strcmp(tname, "bool")   == 0) sz = 1;
+                else if (strcmp(tname, "bool")   == 0) sz = 8; /* stored in a full slot */
                 else if (strcmp(tname, "void")   == 0) sz = 0;
-                /* for classes: look up in the lowerer state; default 8 */
+                else if (s->mod && ast_is_class(s->mod->classes, s->mod->class_count, tname)) {
+                    /* Classes used to fall through to the default of 8, so
+                       __size_of__ of any struct reported one machine word
+                       regardless of how many fields it had — useless for the
+                       one thing it exists for (sizing a buffer for a struct). */
+                    sz = ast_class_byte_size(s->mod->classes, s->mod->class_count, tname);
+                }
             }
             int t = alloc_temp(s);
             IRInstr *ins = ir_emit(s->mod, IR_CONST_INT);
@@ -874,7 +1246,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             if (nargs > 0) {
                 arg_ops = malloc(nargs * sizeof(IROperand));
                 for (int i = 0; i < nargs; i++)
-                    arg_ops[i] = irop_temp(lower_expr(call->args[i], s));
+                    arg_ops[i] = irop_temp(lower_call_arg(call->args[i], s));
             }
             /* If we're inside a module and the callee is a sibling function,
                mangle it to ModuleName__funcname so it resolves correctly. */
@@ -927,6 +1299,20 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->src1 = irop_temp(tobj);
             return t;
         }
+        /* array.len()/array.cap() as a method call — typecheck.c already
+           accepts these (mirroring the `arr.len` field-access form below),
+           but codegen had no case for them, so they fell into the generic
+           IR_CALL path and tried to call a function literally named "len"
+           that doesn't exist. Route to the same array intrinsics as the
+           field-access form. */
+        if (is_arr && (strcmp(mc->method, "len") == 0 || strcmp(mc->method, "cap") == 0)) {
+            IROpcode irop = strcmp(mc->method, "cap") == 0 ? IR_ARRAY_CAP : IR_ARRAY_LEN;
+            int tobj = lower_expr(mc->object, s);
+            IRInstr *ins = ir_emit(s->mod, irop);
+            ins->dest = irop_temp(t);
+            ins->src1 = irop_temp(tobj);
+            return t;
+        }
 
         /* Generic method call — evaluate self and args before emitting IR_CALL */
         {
@@ -941,7 +1327,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     if (nargs2 > 0) {
                         arg_ops2 = malloc(nargs2 * sizeof(IROperand));
                         for (int i = 0; i < nargs2; i++)
-                            arg_ops2[i] = irop_temp(lower_expr(mc->args[i], s));
+                            arg_ops2[i] = irop_temp(lower_call_arg(mc->args[i], s));
                     }
                     size_t msz = strlen(obj_name) + 2 + strlen(mc->method) + 1;
                     char *mname2 = malloc(msz);
@@ -956,23 +1342,36 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                 }
             }
 
-            const char *cname = NULL;
-            if (mc->object && mc->object->resolved_type.kind == TYPE_SIMPLE &&
-                mc->object->resolved_type.name)
-                cname = mc->object->resolved_type.name;
             char *mname;
-            if (cname) {
-                size_t sz = strlen(cname) + 1 + strlen(mc->method) + 1;
-                mname = malloc(sz);
-                snprintf(mname, sz, "%s_%s", cname, mc->method);
-            } else {
+            if (mc->is_ufcs) {
+                /* UFCS: typecheck already verified a free function named
+                   exactly `mc->method` exists with the right arity — call
+                   it directly rather than mangling to ClassName_method. */
                 mname = strdup(mc->method);
+            } else {
+                const char *cname = NULL;
+                if (mc->object && mc->object->resolved_type.kind == TYPE_SIMPLE &&
+                    mc->object->resolved_type.name)
+                    cname = mc->object->resolved_type.name;
+                if (cname) {
+                    size_t sz = strlen(cname) + 1 + strlen(mc->method) + 1;
+                    mname = malloc(sz);
+                    snprintf(mname, sz, "%s_%s", cname, mc->method);
+                } else {
+                    mname = strdup(mc->method);
+                }
             }
             int total = 1 + mc->arg_count;
             IROperand *arg_ops = malloc(total * sizeof(IROperand));
-            arg_ops[0] = irop_temp(lower_expr(mc->object, s));
+            /* `self` must be the object's ADDRESS. lower_expr() on a by-value
+               struct variable loads its first 8 bytes instead, so a method on a
+               struct received garbage as its receiver — the same address-vs-value
+               distinction that field access gets from lower_object_base_ptr, so
+               use exactly that. Heap classes still resolve to the stored
+               pointer, as before. */
+            arg_ops[0] = irop_temp(lower_object_base_ptr(mc->object, s));
             for (int i = 0; i < total - 1; i++)
-                arg_ops[i + 1] = irop_temp(lower_expr(mc->args[i], s));
+                arg_ops[i + 1] = irop_temp(lower_call_arg(mc->args[i], s));
             IRInstr *ins = ir_emit(s->mod, IR_CALL);
             ins->dest      = irop_temp(t);
             ins->str_extra = mname;
@@ -998,8 +1397,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
 
         /* multi.tag / multi.value */
         if (ma->object && ma->object->resolved_type.kind == TYPE_MULTI) {
-            IROpcode irop = strcmp(ma->member, "value") == 0 ? IR_ARRAY_CAP : IR_ARRAY_LEN;
-            /* reuse ARRAY_LEN/CAP for tag(0)/value(8) layout — same offset pattern */
+            IROpcode irop = strcmp(ma->member, "value") == 0 ? IR_MULTI_VALUE : IR_MULTI_TAG;
             int tobj = lower_expr(ma->object, s);
             IRInstr *ins = ir_emit(s->mod, irop);
             ins->dest = irop_temp(t); ins->src1 = irop_temp(tobj);
@@ -1021,54 +1419,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                pointers, which caused the SIGSEGV. */
         if (ma->object && ma->object->resolved_type.kind == TYPE_SIMPLE &&
                     ma->object->resolved_type.name) {
-                    int tobj;
-                    if (ma->object->type == NODE_IDENTIFIER) {
-                        const char *vname = ((IdentifierNode *)ma->object)->name;
-                        int is_heap = 0;
-                        for (int _ci = 0; _ci < s->mod->class_count; _ci++) {
-                            ClassNode *_cn = s->mod->classes[_ci];
-                            if (_cn && _cn->name &&
-                                strcmp(_cn->name, ma->object->resolved_type.name) == 0) {
-                                is_heap = _cn->has_ctor;
-                                break;
-                            }
-                        }
-                        tobj = alloc_temp(s);
-                        if (is_heap) {
-                            IRInstr *lv   = ir_emit(s->mod, IR_LOAD_VAR);
-                            lv->dest      = irop_temp(tobj);
-                            lv->str_extra = strdup(vname);
-                        } else {
-                            IRInstr *av   = ir_emit(s->mod, IR_ADDROF);
-                            av->dest      = irop_temp(tobj);
-                            av->str_extra = strdup(vname);
-                        }
-                    } else if (ma->object->type == NODE_MEMBER_ACCESS) {
-                        /* Chained stack-struct access: compute root address +
-                         * accumulated byte offset to avoid double-dereference. */
-                        int cum_offset = 0;
-                        const char *chain_type = NULL;
-                        int tbase = lower_stack_struct_addrof(
-                            ma->object, s, &cum_offset, &chain_type);
-                        if (tbase >= 0 && cum_offset > 0) {
-                            /* Adjust the base pointer by the accumulated offset
-                             * so IR_GET_FIELD sees a pointer to the nested struct. */
-                            int tadj = alloc_temp(s);
-                            IRInstr *add   = ir_emit(s->mod, IR_ADD);
-                            add->dest      = irop_temp(tadj);
-                            add->src1      = irop_temp(tbase);
-                            add->src2      = irop_const_int((long)cum_offset);
-                            tobj = tadj;
-                        } else if (tbase >= 0) {
-                            /* Zero offset — base pointer is already correct */
-                            tobj = tbase;
-                        } else {
-                            /* Fallback: not a pure stack-struct chain */
-                            tobj = lower_expr(ma->object, s);
-                        }
-                    } else {
-                        tobj = lower_expr(ma->object, s);
-                    }
+                    int tobj = lower_object_base_ptr(ma->object, s);
                     IRInstr *ins    = ir_emit(s->mod, IR_GET_FIELD);
                     ins->dest       = irop_temp(t);
                     ins->src1       = irop_temp(tobj);
@@ -1089,11 +1440,35 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                 ins->str_extra = strdup(mangled);
                 return t;
             }
-            /* EnumName.Variant */
-            IRInstr *ins    = ir_emit(s->mod, IR_ENUM_VAL);
-            ins->dest       = irop_temp(t);
-            ins->str_extra  = strdup(id->name);
-            ins->str_extra2 = strdup(ma->member);
+            /* EnumName.Variant — resolve to its integer value right here.
+               This used to emit IR_ENUM_VAL, which lowered to taking the
+               ADDRESS of a symbol named `Enum_Variant` that nothing anywhere
+               ever defined, so any program mentioning an enum value failed to
+               link with "undefined reference to Status_Ok". A variant is a
+               compile-time integer constant; emitting it as one also lets
+               constant folding and branch folding see through it. */
+            int found = 0;
+            long enum_val = 0;
+            for (int ei = 0; ei < s->mod->enum_count && !found; ei++) {
+                EnumNode *en = s->mod->enums[ei];
+                if (!en || !en->name || strcmp(en->name, id->name) != 0) continue;
+                for (int vi = 0; vi < en->variant_count; vi++) {
+                    if (en->variants[vi].name &&
+                        strcmp(en->variants[vi].name, ma->member) == 0) {
+                        enum_val = en->variants[vi].value;
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                fprintf(stderr,
+                        "hylian: unknown enum value '%s.%s' — emitting 0\n",
+                        id->name, ma->member);
+            }
+            IRInstr *ins = ir_emit(s->mod, IR_CONST_INT);
+            ins->dest    = irop_temp(t);
+            ins->src1    = irop_const_int(enum_val);
             return t;
         }
 
@@ -1335,6 +1710,13 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
     case NODE_ASSIGN: {
         AssignNode *as = (AssignNode *)node;
         int tv = lower_expr(as->value, s);
+        /* `x = v;` inside a method, where x is a field: this means `self.x = v`.
+           Without it the store went to a GLOBAL named x — the write half of the
+           same implicit-receiver gap that broke bare field reads. */
+        if (lower_is_self_field(s, as->var_name)) {
+            lower_store_self_field(s, as->var_name, tv);
+            break;
+        }
         /* Rewrite to mangled label if this is a function-local static */
         const LocalStaticAlias *_as_lsa = lower_find_local_static(s, as->var_name);
         const char *_as_name = _as_lsa ? _as_lsa->mangled_name : as->var_name;
@@ -1346,6 +1728,23 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 
     case NODE_COMPOUND_ASSIGN: {
         CompoundAssignNode *ca = (CompoundAssignNode *)node;
+        /* `x += n;` on an implicit field: load the field, combine, store back. */
+        if (lower_is_self_field(s, ca->var_name)) {
+            int tcur = lower_load_self_field(s, ca->var_name);
+            int trhs = lower_expr(ca->value, s);
+            int tres = alloc_temp(s);
+            IROpcode cop =
+                strcmp(ca->op, "+=") == 0 ? IR_ADD :
+                strcmp(ca->op, "-=") == 0 ? IR_SUB :
+                strcmp(ca->op, "*=") == 0 ? IR_MUL :
+                strcmp(ca->op, "/=") == 0 ? IR_DIV : IR_ADD;
+            IRInstr *op_ins = ir_emit(s->mod, cop);
+            op_ins->dest = irop_temp(tres);
+            op_ins->src1 = irop_temp(tcur);
+            op_ins->src2 = irop_temp(trhs);
+            lower_store_self_field(s, ca->var_name, tres);
+            break;
+        }
         /* Rewrite to mangled label if this is a function-local static */
         const LocalStaticAlias *_ca_lsa = lower_find_local_static(s, ca->var_name);
         const char *_ca_name = _ca_lsa ? _ca_lsa->mangled_name : ca->var_name;
@@ -1373,28 +1772,20 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         MemberAssignNode *ma = (MemberAssignNode *)node;
         /* Evaluate value and object BEFORE emitting IR_SET_FIELD */
         int tval = lower_expr(ma->value, s);
-        int tobj_or_self;
+        /* Same base-address rule as the read path — see lower_object_base_ptr.
+           This used to unconditionally IR_ADDROF an identifier object, which
+           made `self.field = x` write through a pointer to the self SLOT
+           rather than to the object. */
+        int tobj_or_self = lower_object_base_ptr(ma->object, s);
         char *obj_class;
         if (ma->object == NULL) {
-            tobj_or_self = alloc_temp(s);
-            IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR);
-            lv->dest = irop_temp(tobj_or_self);
-            lv->str_extra = strdup("self");
             obj_class = s->class_name ? strdup(s->class_name) : strdup("?");
         } else {
-                    if (ma->object && ma->object->type == NODE_IDENTIFIER) {
-                        tobj_or_self = alloc_temp(s);
-                        IRInstr *av = ir_emit(s->mod, IR_ADDROF);
-                        av->dest = irop_temp(tobj_or_self);
-                        av->str_extra = strdup(((IdentifierNode *)ma->object)->name);
-                    } else {
-                        tobj_or_self = lower_expr(ma->object, s);
-                    }
-                    obj_class =
-                        (ma->object->resolved_type.kind == TYPE_SIMPLE && ma->object->resolved_type.name)
-                        ? strdup(ma->object->resolved_type.name)
-                        : (s->class_name ? strdup(s->class_name) : strdup("?"));
-                }
+            obj_class =
+                (ma->object->resolved_type.kind == TYPE_SIMPLE && ma->object->resolved_type.name)
+                ? strdup(ma->object->resolved_type.name)
+                : (s->class_name ? strdup(s->class_name) : strdup("?"));
+        }
         IRInstr *ins = ir_emit(s->mod, IR_SET_FIELD);
         ins->src1       = irop_temp(tobj_or_self);
         ins->src2       = irop_temp(tval);
@@ -1523,6 +1914,7 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
     case NODE_FOR_IN: {
         ForInNode *fi = (ForInNode *)node;
         int lbl_loop = alloc_label(s);
+        int lbl_post = alloc_label(s);
         int lbl_end  = alloc_label(s);
         int uid      = alloc_label(s); /* unique id for hidden names */
 
@@ -1554,7 +1946,16 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         /* idx = 0 */
         { IRInstr *sv = ir_emit(s->mod, IR_STORE_VAR); sv->str_extra = strdup(idx_nm); sv->src1 = irop_const_int(0); }
 
-        loop_push(s, lbl_end, lbl_loop);
+        /* `continue` must land on lbl_post (the idx++ step below), NOT
+           lbl_loop (the top, before the bounds check / element load) — the
+           same continue-target-is-the-increment-not-the-condition-top
+           pattern NODE_FOR already uses. Pointing it at lbl_loop instead
+           (copy-pasted from NODE_WHILE, which has no separate increment
+           step so that's correct there) meant `continue` skipped idx++
+           entirely: it jumped straight back to re-loading arr[idx] at the
+           SAME idx forever, hanging on the first `continue` any for-in body
+           ever hit. */
+        loop_push(s, lbl_end, lbl_post);
         { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_loop); }
 
         /* if idx >= len: break */
@@ -1577,6 +1978,7 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 
         lower_stmts(fi->body, fi->body_count, s);
 
+        { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_post); }
         /* idx++ */
         int tidx3 = alloc_temp(s);
         { IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR); lv->dest = irop_temp(tidx3); lv->str_extra = strdup(idx_nm); }
@@ -1746,11 +2148,19 @@ static void lower_func_body(
 {
     s->next_temp   = 0;
     s->class_name  = class_name;
+    s->local_name_count = 0;          /* fresh local-name table per function */
+    s->struct_param_count = 0;
     s->local_static_alias_count = 0;  /* fresh alias table per function */
     s->in_unsafe   = 0;
     s->has_arena   = !is_naked;       /* naked functions skip arena entirely */
 
-    /* IR_FUNC_BEGIN */
+    /* IR_FUNC_BEGIN.
+       ir_emit() may realloc() mod->instrs, which invalidates every IRInstr*
+       previously handed out.  Remember this instruction's INDEX and re-derive
+       the pointer after any emitting call rather than holding `begin` across
+       one — the parameter-ALLOCA loop below emits, and reading `begin->params`
+       afterwards was a use-after-free that crashed the compiler outright. */
+    int begin_idx = s->mod->instr_count;
     IRInstr *begin = ir_emit(s->mod, IR_FUNC_BEGIN);
     begin->str_extra = strdup(name);
     begin->extra_int = is_main | (is_naked << 1);
@@ -1782,12 +2192,26 @@ static void lower_func_body(
         }
     }
 
-    /* Emit ALLOCA for each parameter (so the codegen can assign stack slots) */
+    /* Emit ALLOCA for each parameter (so the codegen can assign stack slots).
+       `begin` is stale after the first emit_alloca(), so snapshot the param
+       array pointer first — the IRParam array itself is a separate heap
+       allocation and is NOT moved by ir_emit()'s realloc, only the IRInstr
+       that points at it is. */
+    IRParam *param_list = s->mod->instrs[begin_idx].params;
     for (int i = 0; i < total_params; i++) {
-        if (!begin->params[i].name) continue;
-        emit_alloca(s, begin->params[i].name,
-                    begin->params[i].type_name,
-                    begin->params[i].type_kind);
+        if (!param_list[i].name) continue;
+        /* Note by-value struct params: they carry a pointer to the caller's
+           copy, so field access on them loads rather than addrofs. */
+        if (param_list[i].type_kind == TYPE_SIMPLE && param_list[i].type_name &&
+            ast_is_value_aggregate(s->mod->classes, s->mod->class_count,
+                                   param_list[i].type_name) &&
+            !(has_self && i == 0) &&
+            s->struct_param_count < 32) {
+            s->struct_param_names[s->struct_param_count++] = param_list[i].name;
+        }
+        emit_alloca(s, param_list[i].name,
+                    param_list[i].type_name,
+                    param_list[i].type_kind);
     }
 
     /* Inject hidden arena local + arena_init call for non-naked functions */
@@ -1986,6 +2410,8 @@ IRModule *lower_program(ProgramNode *prog) {
             FuncNode *fn = (FuncNode *)decl;
             /* body_count == 0 means a vendor .hyi stub — no IR to emit */
             if (fn->body_count == 0) continue;
+            /* Included functions are droppable if nothing reaches them. */
+            if (decl->from_include) ir_mark_weak_func(mod, fn->name);
             lower_func_body(fn->name,
                             fn->params, fn->param_count,
                             fn->body,   fn->body_count,
@@ -2000,6 +2426,7 @@ IRModule *lower_program(ProgramNode *prog) {
             if (cls->has_ctor && cls->ctor_body_count > 0) {
                 char ctor_name[256];
                 snprintf(ctor_name, sizeof(ctor_name), "%s__ctor", cls->name);
+                if (decl->from_include) ir_mark_weak_func(mod, ctor_name);
                 lower_func_body(ctor_name,
                                 cls->ctor_params, cls->ctor_param_count,
                                 cls->ctor_body,   cls->ctor_body_count,
@@ -2012,6 +2439,7 @@ IRModule *lower_program(ProgramNode *prog) {
                 if (m->body_count == 0) continue;
                 char mname[256];
                 snprintf(mname, sizeof(mname), "%s_%s", cls->name, m->name);
+                if (decl->from_include) ir_mark_weak_func(mod, mname);
                 lower_func_body(mname,
                                 m->params, m->param_count,
                                 m->body,   m->body_count,
@@ -2033,6 +2461,7 @@ IRModule *lower_program(ProgramNode *prog) {
                 /* Mangle: ModuleName__funcname */
                 char mangled[256];
                 snprintf(mangled, sizeof(mangled), "%s__%s", mn->name, fn->name);
+                if (decl->from_include) ir_mark_weak_func(mod, mangled);
                 lower_func_body(mangled,
                                 fn->params, fn->param_count,
                                 fn->body,   fn->body_count,

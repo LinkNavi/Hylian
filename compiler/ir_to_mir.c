@@ -48,6 +48,18 @@ static void tenv_clear_locals(TypeEnv *e) {
     e->var_count = kept;
 }
 
+/* lower.c restarts its temp counter at 0 for every function, so temp ids are
+   only unique WITHIN a function. The temp table is one flat map for the whole
+   module, so without clearing it here, function B's temp 3 inherits whatever
+   type function A's temp 3 had. That's not a cosmetic mislabel: tenv_get_temp
+   feeds the int-vs-float dispatch below, so a stale MIR_F64 turns an ordinary
+   integer compare into MIR_FCMP_* on a GPR value - the comparison then reads
+   an integer bit pattern as a double and the branch goes whichever way the
+   garbage says. Cleared at every IR_FUNC_BEGIN, alongside tenv_clear_locals. */
+static void tenv_clear_temps(TypeEnv *e) {
+    e->temp_count = 0;
+}
+
 static void tenv_set_temp(TypeEnv *e, int temp_id, MIRType t) {
     for (int i = 0; i < e->temp_count; i++)
         if (e->temps[i].temp_id == temp_id) { e->temps[i].type = t; return; }
@@ -134,18 +146,34 @@ static void tenv_update_type(TypeEnv *e, const char *name, MIRType t) {
     tenv_set_var(e, name, t); /* not previously declared - fall back to global, safe default */
 }
 
-/* Hylian's surface type names -> MIRType. Only int/float/bool exist as
-   arithmetic types right now; no sized ints yet, so "int" is I64. */
+/* Hylian's surface type names -> MIRType. */
 static MIRType type_name_to_mir(const char *name) {
     if (!name) return MIR_I64;
     if (strcmp(name, "float") == 0) return MIR_F64;
+    if (strcmp(name, "float32") == 0) return MIR_F32;
     if (strcmp(name, "bool") == 0)  return MIR_I64; /* bools stored as 0/1 in I64 for now */
     if (strcmp(name, "rawptr") == 0 || strcmp(name, "ptr") == 0) return MIR_PTR;
-    return MIR_I64; /* int, str (as ptr-ish), classes, enums default */
+    /* Sized integers. These matter for pointer dereference width - see
+       MIR_LOAD/MIR_STORE in lower_x64.c. Getting them wrong doesn't just
+       widen a value, it reads or writes neighbouring bytes. */
+    if (strcmp(name, "int8")   == 0) return MIR_I8;
+    if (strcmp(name, "uint8")  == 0) return MIR_U8;
+    if (strcmp(name, "int16")  == 0) return MIR_I16;
+    if (strcmp(name, "uint16") == 0) return MIR_U16;
+    if (strcmp(name, "int32")  == 0) return MIR_I32;
+    if (strcmp(name, "uint32") == 0) return MIR_U32;
+    if (strcmp(name, "uint64") == 0 || strcmp(name, "usize") == 0) return MIR_U64;
+    return MIR_I64; /* int, int64, isize, str (as ptr-ish), classes, enums */
 }
 
 /* lower_operand can emit (e.g. a bare CONST_STR operand needs a LEA_GLOBAL
-   to actually get its address), so it needs the module + current function. */
+   to actually get its address), so it needs the module + current function.
+   IMPORTANT: because it can emit, every caller must resolve ALL of its
+   operands into locals BEFORE calling mir_emit() for the instruction being
+   built. Writing `m = mir_emit(...); m->src1 = lower_operand(...)` is wrong
+   twice over: the LEA_GLOBAL lands *after* m in the stream (so m reads a vreg
+   that isn't defined yet - mir_verify catches this as "uses vN before it's
+   defined"), and mir_emit()'s realloc of fn->instrs can leave `m` dangling. */
 static MIRValue lower_operand(const IROperand *op, TypeEnv *env, MIRModule *mod, MIRFunc *fn) {
     switch (op->kind) {
     case IROP_NONE:
@@ -187,14 +215,105 @@ static char *fmt_sym(const char *a, const char *b, const char *sep) {
     return s;
 }
 
+/* ir_to_mir uses IR temp ids DIRECTLY as MIR vreg ids (mir_vreg(temp_id, ..))
+   for everything that came from lower.c, but a few lowerings also need extra
+   scratch values of their own (print's int buffer, a bare CONST_STR operand's
+   address, asm-block operand loads) and get those from mir_new_vreg(), which
+   hands out fn->vreg_count++ starting at 0. Those two id spaces overlap: the
+   first mir_new_vreg() returns 0, which is already IR temp 0 - two unrelated
+   values sharing one vreg, so regalloc gives them one register and each
+   silently overwrites the other.
+   Fix: at IR_FUNC_BEGIN, scan this function's IR range for the highest temp id
+   it uses and start fn->vreg_count above it, so the two id spaces are disjoint. */
+static void mark_max_temp(const IROperand *op, int *max_id) {
+    if (op->kind == IROP_TEMP && op->temp_id > *max_id) *max_id = op->temp_id;
+}
+
+/* Same idea, for label ids: the null-guard synthesized for PRINT_ARG_STR_PTR
+   below (see IR_PRINT/IR_PRINTLN) needs a couple of fresh label ids of its
+   own. Labels are used as direct array indices for fixup resolution in
+   hygen/libhyx64/lower_x64.c (`label_offset = malloc((max_label+1) * ...)`),
+   so picking an arbitrarily large synthetic id would try to allocate a
+   multi-gigabyte array. Scanning this function's IR range for its highest
+   already-used label id and counting up from there keeps ids small and
+   collision-free. */
+static void mark_max_label(const IROperand *op, int *max_id) {
+    if (op->kind == IROP_LABEL_ID && op->label_id > *max_id) *max_id = op->label_id;
+}
+
+static int scan_func_max_label(const IRModule *ir, int begin_idx) {
+    int max_id = -1;
+    for (int i = begin_idx; i < ir->instr_count; i++) {
+        const IRInstr *ins = &ir->instrs[i];
+        if (i > begin_idx && ins->op == IR_FUNC_BEGIN) break;
+        if (ins->op == IR_FUNC_END) break;
+        mark_max_label(&ins->dest, &max_id);
+        mark_max_label(&ins->src1, &max_id);
+        mark_max_label(&ins->src2, &max_id);
+        mark_max_label(&ins->extra_src, &max_id);
+    }
+    return max_id + 1;
+}
+
+static int scan_func_max_temp(const IRModule *ir, int begin_idx) {
+    int max_id = -1;
+    for (int i = begin_idx; i < ir->instr_count; i++) {
+        const IRInstr *ins = &ir->instrs[i];
+        if (i > begin_idx && ins->op == IR_FUNC_BEGIN) break;
+        if (ins->op == IR_FUNC_END) break;
+        mark_max_temp(&ins->dest, &max_id);
+        mark_max_temp(&ins->src1, &max_id);
+        mark_max_temp(&ins->src2, &max_id);
+        mark_max_temp(&ins->extra_src, &max_id);
+        for (int a = 0; a < ins->arg_count; a++)
+            mark_max_temp(&ins->args[a], &max_id);
+    }
+    return max_id + 1;
+}
+
+static int mir_ends_in_terminator(const MIRFunc *fn) {
+    if (!fn || fn->count == 0) return 0;
+    switch (fn->instrs[fn->count - 1].op) {
+    case MIR_RET: case MIR_JMP: case MIR_JMP_IF: case MIR_JMP_UNLESS: case MIR_IRET:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static void warn_unhandled(const IRInstr *ins) {
     fprintf(stderr, "[ir_to_mir] not lowered yet: %s (left as nop, not silently correct)\n",
             ir_opcode_name(ins->op));
 }
 
+
+/* Emit the constructor call for a freshly allocated object, if the class has
+   one. `new Foo(a, b)` previously lowered to an allocation and NOTHING ELSE —
+   the constructor body was compiled into `Foo__ctor` and then never called, so
+   every field of every heap object stayed at whatever the allocator left
+   there. The ctor takes the object as its hidden first parameter (`self`),
+   matching how lower_func_body lays out methods. */
+static void emit_ctor_call(MIRFunc *fn, const IRModule *ir, const IRInstr *ins,
+                           TypeEnv *env, MIRModule *mod, int obj_vreg) {
+    if (!ins->str_extra) return;
+    if (!ast_class_has_ctor(ir->classes, ir->class_count, ins->str_extra)) return;
+
+    int n = ins->arg_count + 1;
+    MIRValue *cargs = malloc(n * sizeof(MIRValue));
+    cargs[0] = mir_vreg(obj_vreg, MIR_PTR);
+    for (int a = 0; a < ins->arg_count; a++)
+        cargs[a + 1] = lower_operand(&ins->args[a], env, mod, fn);
+
+    size_t len = strlen(ins->str_extra) + 8;
+    char *ctor = malloc(len);
+    snprintf(ctor, len, "%s__ctor", ins->str_extra);
+    mir_build_call(fn, ctor, cargs, n, mir_none());
+}
+
 MIRModule *lower_ir_to_mir(const IRModule *ir) {
     MIRModule *mod = mir_module_new();
     MIRFunc *fn = NULL;
+    int next_synth_label = 0; /* see scan_func_max_label()'s comment */
     TypeEnv env;
     tenv_init(&env);
 
@@ -205,8 +324,12 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
 
         case IR_FUNC_BEGIN: {
             tenv_clear_locals(&env);
+            tenv_clear_temps(&env);
             fn = mir_func_new(mod, ins->str_extra ? ins->str_extra : "?");
             fn->param_count = ins->param_count;
+            /* keep mir_new_vreg()'s ids clear of the IR temp ids we reuse verbatim */
+            fn->vreg_count = scan_func_max_temp(ir, i);
+            next_synth_label = scan_func_max_label(ir, i);
             for (int p = 0; p < ins->param_count; p++) {
                 MIRType t = type_name_to_mir(ins->params[p].type_name);
                 if (ins->params[p].name) {
@@ -218,6 +341,18 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         case IR_FUNC_END:
+            /* Guarantee the function ends in a terminator, whatever the IR
+               looked like. opt_branch_fold's unreachable-code sweep legally
+               NOPs out everything between an early `return` and the next
+               label - and for a function whose last statement is unreachable,
+               that includes the trailing arena_free + return that lower.c
+               appended, leaving the function ending in NOPs. That's correct as
+               an optimization but violates mir_verify's "must end in a
+               terminator" rule and would leave x64_lower_func emitting a
+               function that falls off its own end. Re-adding a ret here keeps
+               the invariant an invariant no matter what the optimizer did. */
+            if (fn && (fn->count == 0 || !mir_ends_in_terminator(fn)))
+                mir_emit(fn, MIR_RET);
             fn = NULL;
             break;
 
@@ -238,7 +373,31 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
                 if (existing >= 0) {
                     tenv_update_type(&env, ins->str_extra, t);
                 } else {
+                    /* A local slot is 8 bytes, but a BY-VALUE struct local is
+                       as big as the struct. With only one slot reserved, a
+                       `Point p;` has p.y (offset 8) landing on whatever local
+                       sits next in the frame — in practice the hidden
+                       __arena__ pointer, which then gets silently overwritten
+                       and the next `new` crashes.
+
+                       Slot ids grow DOWNWARD in memory (local_offset() is
+                       -8*(id+1)) while a struct's fields grow UPWARD from its
+                       base. So the base must be the HIGHEST id of the span,
+                       not the lowest: reserve all the slots first, then bind
+                       the variable to the last one. Binding it to the first
+                       would put the struct's fields on top of the slots that
+                       came before it. Heap classes only ever store a pointer
+                       in the local, so they need exactly one slot. */
+                    int slots = 1;
+                    if (ast_is_value_aggregate(ir->classes, ir->class_count,
+                                               ins->str_extra2)) {
+                        int struct_size = ast_class_byte_size(ir->classes, ir->class_count,
+                                                              ins->str_extra2);
+                        slots = (struct_size + 7) / 8;
+                        if (slots < 1) slots = 1;
+                    }
                     int lid = mir_new_local(fn);
+                    for (int e = 1; e < slots; e++) lid = mir_new_local(fn);
                     tenv_set_local(&env, ins->str_extra, t, lid);
                 }
             }
@@ -299,9 +458,10 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         case IR_STORE_VAR: {
             MIRType t = tenv_get_temp(&env, ins->src1.temp_id);
             tenv_update_type(&env, ins->str_extra, t);
+            MIRValue val = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_STORE);
             m->dest = var_location(&env, ins->str_extra, t);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            m->src1 = val;
             break;
         }
 
@@ -448,16 +608,18 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         case IR_JUMP_IF: case IR_JUMP_UNLESS: {
+            MIRValue cond = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, ins->op == IR_JUMP_IF ? MIR_JMP_IF : MIR_JMP_UNLESS);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            m->src1 = cond;
             m->dest = mir_label(ins->src2.label_id);
             break;
         }
 
         case IR_RETURN: {
+            int has_val = (ins->src1.kind != IROP_NONE);
+            MIRValue rv = has_val ? lower_operand(&ins->src1, &env, mod, fn) : mir_none();
             MIRInstr *m = mir_emit(fn, MIR_RET);
-            if (ins->src1.kind != IROP_NONE)
-                m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            if (has_val) m->src1 = rv;
             break;
         }
 
@@ -494,32 +656,82 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
 
         /* ---- OOP: mirrors codegen_elf.c's <cls>_new / <cls>_get_<f> / <cls>_set_<f> convention ---- */
         case IR_NEW: {
-            char *ctor = fmt_sym(ins->str_extra ? ins->str_extra : "_obj", "_new", "");
-            MIRValue *args = lower_args(ins->args, ins->arg_count, &env, mod, fn);
-            mir_build_call(fn, ctor, args, ins->arg_count, mir_vreg(ins->dest.temp_id, MIR_PTR));
+            /* `new` inside an unsafe block: raw malloc, caller frees. This used
+               to call `<Class>_new`, a function nothing ever generated, so it
+               was an undefined symbol at link time. */
+            int size = ast_class_byte_size(ir->classes, ir->class_count, ins->str_extra);
+            MIRValue *args = malloc(sizeof(MIRValue));
+            args[0] = mir_imm_int(size, MIR_I64);
+            mir_build_call(fn, "malloc", args, 1, mir_vreg(ins->dest.temp_id, MIR_PTR));
             tenv_set_temp(&env, ins->dest.temp_id, MIR_PTR);
+            emit_ctor_call(fn, ir, ins, &env, mod, ins->dest.temp_id);
             break;
         }
 
+        /* ---- struct fields: a real load/store at a known offset ----
+
+           These used to lower to calls to `<Class>_get_<field>` and
+           `<Class>_set_<field>`. Nothing anywhere generated those functions, so
+           every single field access in the language was an undefined symbol at
+           link time — classes were effectively unusable, which is why the whole
+           stdlib is written with raw pointers instead.
+
+           Doing it as a call would also have been the wrong shape even if the
+           accessors existed: a function call per field read, for what is one
+           `mov` once the offset is known. The offset IS known — ast_field_offset()
+           computes it from the class table the IR already carries — so the field
+           access becomes a single load/store at base+offset, correctly sized for
+           the field's own type. */
         case IR_GET_FIELD: {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s_get_%s", ins->str_extra ? ins->str_extra : "",
-                     ins->str_extra2 ? ins->str_extra2 : "");
-            MIRValue *args = malloc(sizeof(MIRValue));
-            args[0] = lower_operand(&ins->src1, &env, mod, fn);
-            mir_build_call(fn, strdup(tmp), args, 1, mir_vreg(ins->dest.temp_id, MIR_I64));
-            tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
+            int width = 8;
+            const char *ftype = NULL;
+            int off = ast_field_offset(ir->classes, ir->class_count,
+                                       ins->str_extra, ins->str_extra2,
+                                       &width, &ftype);
+            if (off < 0) {
+                fprintf(stderr,
+                    "[ir_to_mir] unknown field '%s.%s' — no layout for it, "
+                    "emitting a zero rather than a wrong address\n",
+                    ins->str_extra ? ins->str_extra : "?",
+                    ins->str_extra2 ? ins->str_extra2 : "?");
+                MIRInstr *z = mir_emit(fn, MIR_MOV);
+                z->dest = mir_vreg(ins->dest.temp_id, MIR_I64);
+                z->src1 = mir_imm_int(0, MIR_I64);
+                tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
+                break;
+            }
+            MIRType ft = type_name_to_mir(ftype);
+            MIRValue base = lower_operand(&ins->src1, &env, mod, fn);
+            MIRInstr *m = mir_emit(fn, MIR_LOAD);
+            m->dest = mir_vreg(ins->dest.temp_id, ft);
+            m->src1 = base;
+            m->mem_offset = off;
+            tenv_set_temp(&env, ins->dest.temp_id, ft);
             break;
         }
 
         case IR_SET_FIELD: {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s_set_%s", ins->str_extra ? ins->str_extra : "",
-                     ins->str_extra2 ? ins->str_extra2 : "");
-            MIRValue *args = malloc(2 * sizeof(MIRValue));
-            args[0] = lower_operand(&ins->src1, &env, mod, fn);
-            args[1] = lower_operand(&ins->src2, &env, mod, fn);
-            mir_build_call(fn, strdup(tmp), args, 2, mir_none());
+            int width = 8;
+            const char *ftype = NULL;
+            int off = ast_field_offset(ir->classes, ir->class_count,
+                                       ins->str_extra, ins->str_extra2,
+                                       &width, &ftype);
+            if (off < 0) {
+                fprintf(stderr,
+                    "[ir_to_mir] unknown field '%s.%s' — no layout for it, "
+                    "dropping the store rather than writing to a wrong address\n",
+                    ins->str_extra ? ins->str_extra : "?",
+                    ins->str_extra2 ? ins->str_extra2 : "?");
+                break;
+            }
+            MIRType ft = type_name_to_mir(ftype);
+            MIRValue base = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue val  = lower_operand(&ins->src2, &env, mod, fn);
+            val.type = ft; /* decides the store width */
+            MIRInstr *m = mir_emit(fn, MIR_STORE);
+            m->dest = base;
+            m->src1 = val;
+            m->mem_offset = off;
             break;
         }
 
@@ -529,6 +741,18 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
             args[1] = lower_operand(&ins->src2, &env, mod, fn);
             mir_build_call(fn, "hylian_multi_alloc", args, 2, mir_vreg(ins->dest.temp_id, MIR_PTR));
             tenv_set_temp(&env, ins->dest.temp_id, MIR_PTR);
+            break;
+        }
+
+        /* A multi is two 8-byte words: tag at offset 0, value at offset 8.
+           Both are plain loads through the multi's pointer. */
+        case IR_MULTI_TAG: case IR_MULTI_VALUE: {
+            MIRValue base = lower_operand(&ins->src1, &env, mod, fn);
+            MIRInstr *m = mir_emit(fn, MIR_LOAD);
+            m->dest = mir_vreg(ins->dest.temp_id, MIR_I64);
+            m->src1 = base;
+            m->mem_offset = (ins->op == IR_MULTI_VALUE) ? 8 : 0;
+            tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
             break;
         }
 
@@ -551,9 +775,14 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
                the size in the pointer slot and garbage in the size slot. */
             MIRValue *args = malloc(2 * sizeof(MIRValue));
             args[0] = lower_operand(&ins->src1, &env, mod, fn);
-            args[1] = mir_imm_int(ins->extra_int, MIR_I64);
+            /* Size comes from the class layout, not from extra_int: lower.c
+               never filled that in, so every `new` asked the arena for 0 bytes
+               and then the constructor wrote fields past the end of it. */
+            args[1] = mir_imm_int(ast_class_byte_size(ir->classes, ir->class_count,
+                                                     ins->str_extra), MIR_I64);
             mir_build_call(fn, "arena_alloc", args, 2, mir_vreg(ins->dest.temp_id, MIR_PTR));
             tenv_set_temp(&env, ins->dest.temp_id, MIR_PTR);
+            emit_ctor_call(fn, ir, ins, &env, mod, ins->dest.temp_id);
             break;
         }
 
@@ -615,9 +844,10 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         case IR_ARRAY_LEN: {
+            MIRValue base = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_LOAD);
             m->dest = mir_vreg(ins->dest.temp_id, MIR_I64);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            m->src1 = base;
             tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
             break;
         }
@@ -625,29 +855,41 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         case IR_ARRAY_CAP: {
             /* cap is the 8-byte field right after len; encoder can special-case
                a nonzero extra_int as a byte offset added to the load address */
+            MIRValue base = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_LOAD);
             m->dest = mir_vreg(ins->dest.temp_id, MIR_I64);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
-            m->extra_int = 8;
+            m->src1 = base;
+            m->mem_offset = 8;
             tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
             break;
         }
 
         /* ---- raw pointers / volatile ---- */
         case IR_LOAD_PTR: case IR_LOAD_VOLATILE: {
+            /* str_extra carries the pointee type name (set by lower.c from the
+               deref's resolved type). The load width is decided by it: reading
+               8 bytes through a `*uint8` both returns garbage in the upper
+               bytes and can run off the end of the object. */
+            MIRType lt = type_name_to_mir(ins->str_extra);
             MIRValue src = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_LOAD);
-            m->dest = mir_vreg(ins->dest.temp_id, MIR_I64);
+            m->dest = mir_vreg(ins->dest.temp_id, lt);
             m->src1 = src;
             m->extra_int = (ins->op == IR_LOAD_VOLATILE) ? 1 : 0;
-            tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
+            tenv_set_temp(&env, ins->dest.temp_id, lt);
             break;
         }
 
         case IR_STORE_PTR: case IR_STORE_VOLATILE: {
+            MIRValue addr = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue val  = lower_operand(&ins->src2, &env, mod, fn);
+            /* str_extra is the stored value's type name (lower.c fills it from
+               the RHS, falling back to the LHS). It, not the register width,
+               decides how many bytes actually get written. */
+            if (ins->str_extra) val.type = type_name_to_mir(ins->str_extra);
             MIRInstr *m = mir_emit(fn, MIR_STORE);
-            m->dest = lower_operand(&ins->src1, &env, mod, fn);
-            m->src1 = lower_operand(&ins->src2, &env, mod, fn);
+            m->dest = addr;
+            m->src1 = val;
             m->extra_int = (ins->op == IR_STORE_VOLATILE) ? 1 : 0;
             break;
         }
@@ -680,18 +922,20 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
 
         /* ---- memory ---- */
         case IR_MEMSET: {
+            MIRValue p = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue v = lower_operand(&ins->src2, &env, mod, fn);
+            MIRValue n = lower_operand(&ins->extra_src, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_MEMSET);
-            m->dest = lower_operand(&ins->src1, &env, mod, fn);
-            m->src1 = lower_operand(&ins->src2, &env, mod, fn);
-            m->src2 = lower_operand(&ins->extra_src, &env, mod, fn);
+            m->dest = p; m->src1 = v; m->src2 = n;
             break;
         }
 
         case IR_MEMCPY: {
+            MIRValue d = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue s2 = lower_operand(&ins->src2, &env, mod, fn);
+            MIRValue n = lower_operand(&ins->extra_src, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_MEMCPY);
-            m->dest = lower_operand(&ins->src1, &env, mod, fn);
-            m->src1 = lower_operand(&ins->src2, &env, mod, fn);
-            m->src2 = lower_operand(&ins->extra_src, &env, mod, fn);
+            m->dest = d; m->src1 = s2; m->src2 = n;
             break;
         }
 
@@ -701,29 +945,33 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         case IR_IRET: mir_emit(fn, MIR_IRET); break;
 
         case IR_LGDT: case IR_LIDT: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue b = lower_operand(&ins->src2, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, ins->op == IR_LGDT ? MIR_LGDT : MIR_LIDT);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
-            m->src2 = lower_operand(&ins->src2, &env, mod, fn);
+            m->src1 = a; m->src2 = b;
             break;
         }
 
         case IR_LTR: case IR_INVLPG: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, ins->op == IR_LTR ? MIR_LTR : MIR_INVLPG);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            m->src1 = a;
             break;
         }
 
         case IR_WRMSR: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue b = lower_operand(&ins->src2, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_WRMSR);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
-            m->src2 = lower_operand(&ins->src2, &env, mod, fn);
+            m->src1 = a; m->src2 = b;
             break;
         }
 
         case IR_RDMSR: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_RDMSR);
             m->dest = mir_vreg(ins->dest.temp_id, MIR_U64);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            m->src1 = a;
             tenv_set_temp(&env, ins->dest.temp_id, MIR_U64);
             break;
         }
@@ -737,23 +985,26 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         }
 
         case IR_WRITE_CR: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_WRITE_CR);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            m->src1 = a;
             m->extra_int = ins->extra_int;
             break;
         }
 
         case IR_OUTB: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue b = lower_operand(&ins->src2, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_OUTB);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
-            m->src2 = lower_operand(&ins->src2, &env, mod, fn);
+            m->src1 = a; m->src2 = b;
             break;
         }
 
         case IR_INB: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_INB);
             m->dest = mir_vreg(ins->dest.temp_id, MIR_U64);
-            m->src1 = lower_operand(&ins->src1, &env, mod, fn);
+            m->src1 = a;
             tenv_set_temp(&env, ins->dest.temp_id, MIR_U64);
             break;
         }
@@ -818,11 +1069,42 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
                 print_args[1] = mir_vreg(lenv, MIR_I64);
                 mir_build_call(fn, fn_name, print_args, 2, mir_none());
             } else if (arg_type == PRINT_ARG_STR_PTR) {
+                /* A `str` local can legitimately be nil (e.g. read_all()
+                   returns nil on failure) — calling libc strlen() on it
+                   unconditionally segfaulted the moment any such value
+                   reached print/println. Guard it: skip the strlen call
+                   and print zero bytes when the pointer is null. */
                 MIRValue ptrv = lower_operand(&ins->src1, &env, mod, fn);
+                int lenv = mir_new_vreg(fn);
+                int condv = mir_new_vreg(fn);
+                int lbl_null = next_synth_label++;
+                int lbl_done = next_synth_label++;
+
+                MIRInstr *cmp = mir_emit(fn, MIR_CMP_EQ);
+                cmp->dest = mir_vreg(condv, MIR_I64);
+                cmp->src1 = ptrv;
+                cmp->src2 = mir_imm_int(0, ptrv.type);
+
+                MIRInstr *jif = mir_emit(fn, MIR_JMP_IF);
+                jif->src1 = mir_vreg(condv, MIR_I64);
+                jif->dest = mir_label(lbl_null);
+
                 MIRValue *len_args = malloc(sizeof(MIRValue));
                 len_args[0] = ptrv;
-                int lenv = mir_new_vreg(fn);
                 mir_build_call(fn, "strlen", len_args, 1, mir_vreg(lenv, MIR_I64));
+
+                MIRInstr *jdone = mir_emit(fn, MIR_JMP);
+                jdone->dest = mir_label(lbl_done);
+
+                MIRInstr *lbl1 = mir_emit(fn, MIR_LABEL);
+                lbl1->dest = mir_label(lbl_null);
+                MIRInstr *movz = mir_emit(fn, MIR_MOV);
+                movz->dest = mir_vreg(lenv, MIR_I64);
+                movz->src1 = mir_imm_int(0, MIR_I64);
+
+                MIRInstr *lbl2 = mir_emit(fn, MIR_LABEL);
+                lbl2->dest = mir_label(lbl_done);
+
                 MIRValue *print_args = malloc(2 * sizeof(MIRValue));
                 print_args[0] = ptrv;
                 print_args[1] = mir_vreg(lenv, MIR_I64);

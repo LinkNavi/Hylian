@@ -59,8 +59,15 @@ typedef enum {
     IR_ARRAY_LOAD,    /* dest = src1[src2]                           */
     IR_ARRAY_STORE,   /* src1[src2] = extra_src                      */
 
-    /* Tagged union */
+    /* Tagged union. Layout is two 8-byte words: [0]=tag, [8]=value.
+       MULTI_TAG/MULTI_VALUE used to be lowered as ARRAY_LEN/ARRAY_CAP because
+       an array header happens to have its len/cap at the same two offsets.
+       That coincidence made `multi` invisible in an IR dump (it read as array
+       code) and meant any future change to the array header layout would
+       silently corrupt every multi. They get their own opcodes now. */
     IR_MULTI_ALLOC,   /* dest = multi(tag=src1, val=src2)            */
+    IR_MULTI_TAG,     /* dest = src1.tag   (word at offset 0)        */
+    IR_MULTI_VALUE,   /* dest = src1.value (word at offset 8)        */
 
     /* Enum constant */
     IR_ENUM_VAL,      /* dest = Enum.Var: str_extra=enum str_extra2=var */
@@ -211,7 +218,20 @@ typedef struct {
     /* Std-include list needed by the codegen to select runtime modules */
     char      **includes;
     int         include_count;
+
+    /* Names of emitted functions that came in through an `include` rather than
+       from the file being compiled. These are the only ones unused-code
+       elimination may delete: a function the user wrote themselves has to
+       survive even if nothing in this translation unit calls it, because it
+       may well be the point of the file (a library, an exported entry point).
+       See opt_strip_unreachable(). */
+    char      **weak_funcs;
+    int         weak_func_count;
+    int         weak_func_cap;
 } IRModule;
+
+/* Record `name` as an includes-provided (therefore droppable) function. */
+void ir_mark_weak_func(IRModule *mod, const char *name);
 
 
 IRModule  *ir_module_new(void);

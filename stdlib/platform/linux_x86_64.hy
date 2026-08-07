@@ -88,6 +88,19 @@ static int O_CREAT  = 0x40;
 static int O_TRUNC  = 0x200;
 static int O_APPEND = 0x400;
 
+// ── access() mode bits ───────────────────────────────────────────────────────
+
+static int F_OK = 0;
+static int X_OK = 1;
+static int W_OK = 2;
+static int R_OK = 4;
+
+// ── standard file descriptors ────────────────────────────────────────────────
+
+static int STDIN_FD  = 0;
+static int STDOUT_FD = 1;
+static int STDERR_FD = 2;
+
 // ── mount() flags ────────────────────────────────────────────────────────────
 
 static int MS_RDONLY = 1;

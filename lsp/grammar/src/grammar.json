@@ -30,6 +30,10 @@
           },
           {
             "type": "SYMBOL",
+            "name": "struct_decl"
+          },
+          {
+            "type": "SYMBOL",
             "name": "union_class_decl"
           },
           {
@@ -346,10 +350,6 @@
               },
               {
                 "type": "SYMBOL",
-                "name": "tuple_type"
-              },
-              {
-                "type": "SYMBOL",
                 "name": "rawptr_type"
               },
               {
@@ -417,68 +417,6 @@
         {
           "type": "STRING",
           "value": "&"
-        }
-      ]
-    },
-    "tuple_type": {
-      "type": "SEQ",
-      "members": [
-        {
-          "type": "STRING",
-          "value": "("
-        },
-        {
-          "type": "SEQ",
-          "members": [
-            {
-              "type": "SYMBOL",
-              "name": "type"
-            },
-            {
-              "type": "CHOICE",
-              "members": [
-                {
-                  "type": "STRING",
-                  "value": "?"
-                },
-                {
-                  "type": "BLANK"
-                }
-              ]
-            },
-            {
-              "type": "REPEAT1",
-              "content": {
-                "type": "SEQ",
-                "members": [
-                  {
-                    "type": "STRING",
-                    "value": ","
-                  },
-                  {
-                    "type": "SYMBOL",
-                    "name": "type"
-                  },
-                  {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "STRING",
-                        "value": "?"
-                      },
-                      {
-                        "type": "BLANK"
-                      }
-                    ]
-                  }
-                ]
-              }
-            }
-          ]
-        },
-        {
-          "type": "STRING",
-          "value": ")"
         }
       ]
     },
@@ -746,6 +684,67 @@
         {
           "type": "STRING",
           "value": "class"
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "class_body"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "struct_decl": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "packed"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "public"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "STRING",
+          "value": "struct"
         },
         {
           "type": "FIELD",
@@ -2530,10 +2529,6 @@
         },
         {
           "type": "SYMBOL",
-          "name": "tuple_expr"
-        },
-        {
-          "type": "SYMBOL",
           "name": "volatile_read_expr"
         },
         {
@@ -2623,39 +2618,6 @@
           }
         ]
       }
-    },
-    "tuple_expr": {
-      "type": "SEQ",
-      "members": [
-        {
-          "type": "STRING",
-          "value": "("
-        },
-        {
-          "type": "SYMBOL",
-          "name": "expression"
-        },
-        {
-          "type": "REPEAT1",
-          "content": {
-            "type": "SEQ",
-            "members": [
-              {
-                "type": "STRING",
-                "value": ","
-              },
-              {
-                "type": "SYMBOL",
-                "name": "expression"
-              }
-            ]
-          }
-        },
-        {
-          "type": "STRING",
-          "value": ")"
-        }
-      ]
     },
     "binary_expr": {
       "type": "CHOICE",
@@ -3889,14 +3851,6 @@
     [
       "type",
       "identifier_expr"
-    ],
-    [
-      "tuple_type",
-      "paren_expr"
-    ],
-    [
-      "tuple_expr",
-      "paren_expr"
     ],
     [
       "module_decl",

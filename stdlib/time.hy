@@ -4,32 +4,35 @@ include {
     platform.linux_x86_64,
 }
 
-// struct timespec { int64 tv_sec; int64 tv_nsec; } - 16 bytes, laid out
-// manually since there's no real struct type wired up yet. Every function
-// here that needs one allocates a fresh 16-byte buffer and reads/writes
-// the two int64 fields directly via pointer arithmetic.
+// struct timespec, exactly as the kernel expects it: two 64-bit words.
+//
+// This used to be a raw_alloc(16) with the two fields poked in and read back
+// through hand-written pointer arithmetic, because struct field access didn't
+// work — every `obj.field` compiled to a call to a `<Class>_get_<field>`
+// function that nothing generated, so it failed at link time. Now that fields
+// lower to a direct load/store at a computed offset, the struct can just be a
+// struct, and the layout is checked by the compiler instead of by counting
+// bytes in a comment.
+//
+// `packed` so the two words stay exactly 16 bytes with nothing inserted —
+// this is handed straight to the kernel, so its layout is not ours to change.
+packed class Timespec {
+    int64 sec;
+    int64 nsec;
+}
 
 // now: current wall-clock time in whole seconds since the Unix epoch.
 int now() {
-    usize ts = raw_alloc(16);
-    syscall(NR_CLOCK_GETTIME, 0, cast<int>(ts));
-    int sec;
-    unsafe { *int p = cast<*int>(ts); sec = *p; }
-    raw_free(ts, 16);
-    return sec;
+    Timespec ts;
+    syscall(NR_CLOCK_GETTIME, 0, cast<int>(&ts));
+    return cast<int>(ts.sec);
 }
 
 // nanos: current wall-clock time in nanoseconds since the Unix epoch.
 int nanos() {
-    usize ts = raw_alloc(16);
-    syscall(NR_CLOCK_GETTIME, 0, cast<int>(ts));
-    int sec; int nsec;
-    unsafe {
-        *int ps = cast<*int>(ts); sec = *ps;
-        *int pn = cast<*int>(ts + cast<usize>(8)); nsec = *pn;
-    }
-    raw_free(ts, 16);
-    return sec * 1000000000 + nsec;
+    Timespec ts;
+    syscall(NR_CLOCK_GETTIME, 0, cast<int>(&ts));
+    return cast<int>(ts.sec) * 1000000000 + cast<int>(ts.nsec);
 }
 
 // millis: current wall-clock time in milliseconds since the Unix epoch -
@@ -40,11 +43,17 @@ int millis() {
 
 // sleep: pause the calling thread for the given number of milliseconds.
 void sleep(int ms) {
-    usize req = raw_alloc(16);
-    unsafe {
-        *int ps = cast<*int>(req); *ps = ms / 1000;
-        *int pn = cast<*int>(req + cast<usize>(8)); *pn = (ms % 1000) * 1000000;
-    }
-    syscall(NR_NANOSLEEP, cast<int>(req), 0);
-    raw_free(req, 16);
+    Timespec req;
+    req.sec = cast<int64>(ms / 1000);
+    req.nsec = cast<int64>((ms % 1000) * 1000000);
+    syscall(NR_NANOSLEEP, cast<int>(&req), 0);
+}
+
+// sleep_ns: pause for a number of nanoseconds, for callers that need finer
+// granularity than sleep()'s milliseconds.
+void sleep_ns(int seconds, int nanoseconds) {
+    Timespec req;
+    req.sec = cast<int64>(seconds);
+    req.nsec = cast<int64>(nanoseconds);
+    syscall(NR_NANOSLEEP, cast<int>(&req), 0);
 }

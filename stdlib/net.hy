@@ -21,25 +21,26 @@ static int _htons(int port) {
 // int the same way struct in_addr expects them (byte order matches memory
 // order here, so no additional swap is needed once the bytes are placed).
 static int _parse_ipv4(str addr) {
-    usize vals = raw_alloc(32); // 4 ints, 8 bytes each is plenty of slack
-    int parts = 0;
+    // The four octets used to be collected into a raw_alloc(32) block and read
+    // back out with hand-written pointer arithmetic, because array<T> had no
+    // runtime behind it and every use failed to link. It has one now.
+    array<int> octets = [];
     int cur = 0;
     int i = 0;
     int n = length(addr);
 
     while (i <= n) {
-        usize p = cast<usize>(addr) + cast<usize>(i);
         uint8 c;
-        if (i < n) { unsafe { *uint8 bp = cast<*uint8>(p); c = *bp; } }
-        else { c = cast<uint8>(46); } // treat end-of-string like a trailing '.'
+        if (i < n) {
+            usize p = cast<usize>(addr) + cast<usize>(i);
+            unsafe { *uint8 bp = cast<*uint8>(p); c = *bp; }
+        } else {
+            c = cast<uint8>(46); // treat end-of-string like a trailing '.'
+        }
 
         int ci = cast<int>(c);
         if (ci == 46) { // '.'
-            if (parts < 4) {
-                usize vp = vals + cast<usize>(parts * 8);
-                unsafe { *int vip = cast<*int>(vp); *vip = cur; }
-            }
-            parts += 1;
+            octets.push(cur);
             cur = 0;
         } else {
             cur = cur * 10 + (ci - 48);
@@ -47,43 +48,93 @@ static int _parse_ipv4(str addr) {
         i += 1;
     }
 
-    int v0; int v1; int v2; int v3;
-    unsafe {
-        *int p0 = cast<*int>(vals); v0 = *p0;
-        *int p1 = cast<*int>(vals + cast<usize>(8)); v1 = *p1;
-        *int p2 = cast<*int>(vals + cast<usize>(16)); v2 = *p2;
-        *int p3 = cast<*int>(vals + cast<usize>(24)); v3 = *p3;
-    }
-    raw_free(vals, 32);
-    return v0 + v1 * 256 + v2 * 65536 + v3 * 16777216;
+    if (octets.len < 4) { return 0; }
+    return octets[0] + octets[1] * 256 + octets[2] * 65536 + octets[3] * 16777216;
 }
 
-// _build_sockaddr_in: packs a struct sockaddr_in (16 bytes on Linux x86-64):
-//   offset 0: sa_family (2 bytes, AF_INET)
-//   offset 2: port      (2 bytes, network byte order)
-//   offset 4: addr      (4 bytes)
-//   offset 8..16: padding, zeroed
-static usize _build_sockaddr_in(str ip, int port) {
-    usize buf = raw_alloc(16);
-    int family = AF_INET;
-    int nport = _htons(port);
-    int addr = _parse_ipv4(ip);
+// _parse_ipv4_valid: true if addr is a well-formed dotted-quad IPv4 address
+// (exactly 4 segments, each 1-3 decimal digits, each octet 0-255).
+//
+// _parse_ipv4 above never checked this — a malformed address (out-of-range
+// octet, non-digit characters, wrong segment count) silently produced SOME
+// 32-bit value from whatever garbage it parsed, and connect()/bind() would
+// try it anyway. E.g. "93.184.21609.34" has an octet (21609) way outside
+// 0-255; the old code truncated it into a normal-looking-but-wrong address
+// and connect() then blocked until the OS's connect timeout (Linux's default
+// is ~127s) trying to reach a host that was never the intended one — which
+// looked exactly like an unconditional freeze rather than the fast,
+// obvious "bad address" error it should have been.
+bool _parse_ipv4_valid(str addr) {
+    int cur = 0;
+    int cur_digits = 0;
+    int octet_count = 0;
+    int i = 0;
+    int n = length(addr);
 
-    unsafe {
-        *uint8 f0 = cast<*uint8>(buf); *f0 = cast<uint8>(family % 256);
-        *uint8 f1 = cast<*uint8>(buf + cast<usize>(1)); *f1 = cast<uint8>(family / 256);
-        *uint8 p0 = cast<*uint8>(buf + cast<usize>(2)); *p0 = cast<uint8>(nport / 256);
-        *uint8 p1 = cast<*uint8>(buf + cast<usize>(3)); *p1 = cast<uint8>(nport % 256);
-        *int   a  = cast<*int>(buf + cast<usize>(4));
-        // only the low 4 bytes of this int write matter for the address
-        // field; the remaining padding bytes are already zero from raw_alloc
+    while (i <= n) {
+        uint8 c;
+        if (i < n) {
+            usize p = cast<usize>(addr) + cast<usize>(i);
+            unsafe { *uint8 bp = cast<*uint8>(p); c = *bp; }
+        } else {
+            c = cast<uint8>(46); // treat end-of-string like a trailing '.'
+        }
+
+        int ci = cast<int>(c);
+        if (ci == 46) { // '.'
+            if (cur_digits == 0 || cur_digits > 3 || cur > 255) { return false; }
+            octet_count += 1;
+            cur = 0;
+            cur_digits = 0;
+        } else if (ci >= 48 && ci <= 57) { // '0'-'9'
+            cur = cur * 10 + (ci - 48);
+            cur_digits += 1;
+        } else {
+            return false; // non-digit, non-dot byte
+        }
+        i += 1;
     }
-    // addr write done separately since *int would write 8 bytes and stomp
-    // into the padding region if done as part of the block above
-    usize ap = buf + cast<usize>(4);
-    unsafe { *int ip4 = cast<*int>(ap); *ip4 = addr; }
 
-    return buf;
+    return octet_count == 4;
+}
+
+// struct sockaddr_in, exactly as the kernel expects it on Linux/x86-64:
+//   offset 0: sin_family (2 bytes)
+//   offset 2: sin_port   (2 bytes, network byte order)
+//   offset 4: sin_addr   (4 bytes)
+//   offset 8: 8 bytes of padding, must be zero
+// 16 bytes total. `packed` because this goes straight to the kernel — its
+// layout is not ours to pad or reorder.
+//
+// This replaces a hand-packed raw_alloc(16) that wrote the family and port a
+// byte at a time. That code carried a comment explaining that the address had
+// to be written in a separate unsafe block because "*int would write 8 bytes
+// and stomp into the padding region" — which was a real compiler bug (every
+// pointer store was 8 bytes wide regardless of the pointee type) rather than
+// anything inherent. With sized stores fixed, a `uint32` field writes 4 bytes,
+// so the struct can simply be declared and assigned.
+packed class SockAddrIn {
+    uint16 family;
+    uint16 port;
+    uint32 addr;
+    uint32 pad_lo;
+    uint32 pad_hi;
+}
+
+// _fill_sockaddr_in: populate a caller-provided SockAddrIn for ip:port.
+static void _fill_sockaddr_in(usize sa_ptr, str ip, int port) {
+    unsafe {
+        *uint16 fam = cast<*uint16>(sa_ptr);
+        *fam = cast<uint16>(AF_INET);
+        *uint16 prt = cast<*uint16>(sa_ptr + cast<usize>(2));
+        *prt = cast<uint16>(_htons(port));
+        *uint32 adr = cast<*uint32>(sa_ptr + cast<usize>(4));
+        *adr = cast<uint32>(_parse_ipv4(ip));
+        *uint32 p0 = cast<*uint32>(sa_ptr + cast<usize>(8));
+        *p0 = cast<uint32>(0);
+        *uint32 p1 = cast<*uint32>(sa_ptr + cast<usize>(12));
+        *p1 = cast<uint32>(0);
+    }
 }
 
 // socket: create a TCP/IPv4 socket. Returns a file descriptor or -1.
@@ -92,20 +143,22 @@ int tcp_socket() {
 }
 
 // connect: connect a socket to ip:port. Returns 0 on success, -1 on error.
+// Fails fast (no syscall at all) on a malformed `ip` instead of handing the
+// kernel a garbage address — see _parse_ipv4_valid's comment.
 int connect(int fd, str ip, int port) {
-    usize addr = _build_sockaddr_in(ip, port);
-    int rc = syscall(NR_CONNECT, fd, cast<int>(addr), 16);
-    raw_free(addr, 16);
-    return rc;
+    if (!_parse_ipv4_valid(ip)) { return -1; }
+    SockAddrIn sa;
+    _fill_sockaddr_in(cast<usize>(&sa), ip, port);
+    return syscall(NR_CONNECT, fd, cast<int>(&sa), 16);
 }
 
 // bind: bind a socket to ip:port ("0.0.0.0" for all interfaces).
 // Returns 0 on success, -1 on error.
 int bind(int fd, str ip, int port) {
-    usize addr = _build_sockaddr_in(ip, port);
-    int rc = syscall(NR_BIND, fd, cast<int>(addr), 16);
-    raw_free(addr, 16);
-    return rc;
+    if (!_parse_ipv4_valid(ip)) { return -1; }
+    SockAddrIn sa;
+    _fill_sockaddr_in(cast<usize>(&sa), ip, port);
+    return syscall(NR_BIND, fd, cast<int>(&sa), 16);
 }
 
 // listen: mark a bound socket as accepting connections.

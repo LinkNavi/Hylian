@@ -66,6 +66,37 @@ static char *module_to_filepath(const char *src_dir, const char *module) {
     return full;
 }
 
+/* Resolve a dotted local include like "modules.cat.Cat" to a real .hy file
+   under `dir`. Tries the full dotted path first (module_to_filepath's
+   normal every-dot-is-a-slash behaviour, for a genuinely nested file
+   layout), then progressively drops trailing components and retries -
+   "modules/cat/Cat.hy" (doesn't exist), then "modules/cat.hy" (does).
+   This is what lets `include { modules.cat.Cat }` work: callers now have to
+   qualify calls into a module block as `Cat.catFunc(...)` (see lower.c /
+   typecheck.c), so writing the include path the same way - naming the file
+   *and* the module you want out of it - is the natural thing to type, even
+   though the module name isn't actually part of the filesystem path.
+   Returns a heap path (caller frees) that fopen'd successfully, or NULL if
+   nothing along the chain exists. */
+static char *resolve_dotted_include(const char *dir, const char *module) {
+    char *dep_path = module_to_filepath(dir, module);
+    FILE *probe = fopen(dep_path, "r");
+    if (probe) { fclose(probe); return dep_path; }
+    free(dep_path);
+
+    char *trimmed = strdup(module);
+    char *last_dot;
+    while ((last_dot = strrchr(trimmed, '.')) != NULL) {
+        *last_dot = '\0';
+        dep_path = module_to_filepath(dir, trimmed);
+        probe = fopen(dep_path, "r");
+        if (probe) { fclose(probe); free(trimmed); return dep_path; }
+        free(dep_path);
+    }
+    free(trimmed);
+    return NULL;
+}
+
 
 static ProgramNode *compile_file(const char *filepath, const char *src_dir);
 
@@ -364,6 +395,12 @@ static void merge_programs(ProgramNode *dst, ProgramNode *src) {
             dst->declarations,
             (dst->decl_count + 1) * sizeof(ASTNode *)
         );
+        /* Everything arriving via merge came from an include, by definition —
+           this is the only path by which a declaration enters a program from
+           another file. Recording it here is what later lets the optimizer
+           drop stdlib functions the program never calls. */
+        if (src->declarations[i])
+            src->declarations[i]->from_include = 1;
         dst->declarations[dst->decl_count++] = src->declarations[i];
     }
     /* Merge include paths (preserved for codegen's std module resolver) */
@@ -670,15 +707,17 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
 
         /* Resolve to a file path — try src_dir first (absolute module paths
            like "boot.tss" or "mm.pmm"), then fall back to the file's own
-           directory (for legacy flat layouts). */
-        char *dep_path = module_to_filepath(src_dir, inc);
-        FILE *dep_probe = fopen(dep_path, "r");
-        if (!dep_probe) {
-            free(dep_path);
-            dep_path = module_to_filepath(file_dir, inc);
-        } else {
-            fclose(dep_probe);
-        }
+           directory (for legacy flat layouts). resolve_dotted_include also
+           handles a trailing module-name component that isn't part of the
+           filesystem path, e.g. "modules.cat.Cat" -> modules/cat.hy. */
+        char *dep_path = resolve_dotted_include(src_dir, inc);
+        if (!dep_path)
+            dep_path = resolve_dotted_include(file_dir, inc);
+        if (!dep_path)
+            /* Nothing matched even after stripping trailing components —
+               fall back to the original (longest, most literal) candidate
+               so the "cannot open" error below names a sensible path. */
+            dep_path = module_to_filepath(src_dir, inc);
 
         /* Recursively compile the dependency, always passing src_dir so
            transitive includes are resolved from the same root. */

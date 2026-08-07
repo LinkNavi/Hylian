@@ -24,7 +24,7 @@ TMPBINS=()
 cleanup() {
     for f in "${TMPFILES[@]}"; do rm -f "$f"; done
     for b in "${TMPBINS[@]}"; do rm -f "$b"; done
-    rm -f io_runtime.o errors_runtime.o strings_runtime.o platform_runtime.o
+    rm -f mem_runtime.o runtime_runtime.o array_runtime.o
 }
 trap cleanup EXIT
 
@@ -53,16 +53,16 @@ info_msg()  { echo -e "  ${DIM}  $1${NC}"; }
 
 header "Building Hylian Compiler"
 
-cd compiler
-bison -d parser.y   2>/dev/null
-flex lexer.l        2>/dev/null
-gcc lex.yy.c parser.tab.c ast.c ir.c lower.c opt.c codegen_asm.c codegen_elf.c typecheck.c compiler.c \
-    -o ../hylian 2>&1
+# Delegate to the real build script rather than keeping a second, divergent
+# copy of the compiler's source list here — that copy had rotted (it still
+# named codegen_asm.c/codegen_elf.c, deleted when the hygen backend landed)
+# and made the whole suite unrunnable.
+./build.sh >/tmp/hylian_build_log 2>&1
 if [ $? -ne 0 ]; then
     echo -e "${RED}✗ Compiler build failed — aborting.${NC}"
+    tail -20 /tmp/hylian_build_log
     exit 1
 fi
-cd ..
 echo -e "${GREEN}  ✓ Compiler built successfully${NC}"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,31 +71,33 @@ echo -e "${GREEN}  ✓ Compiler built successfully${NC}"
 
 header "Resolving Runtime Objects"
 
-resolve_runtime_obj() {
+# The runtime is pure Hylian now (stdlib/*.hy), compiled by the compiler under
+# test rather than by gcc from the old runtime/std/*.c files. mem and runtime
+# are the always-linked pair: every function gets an implicit arena (mem.hy)
+# and print/println lower to hylian_print/hylian_println/hylian_int_to_str
+# (runtime.hy), whether or not the program includes std.io.
+build_std_obj() {
     local stem="$1"
     local out="$2"
 
-    if [ -f "${stem}.o" ]; then
-        cp "${stem}.o" "${out}"
-        echo -e "  ${GREEN}✓${NC} ${stem}.o"
-    elif [ -f "${stem}.c" ]; then
-        gcc -O2 -c "${stem}.c" -o "${out}" 2>&1
-        if [ $? -ne 0 ]; then
-            echo -e "  ${RED}✗ failed to compile ${stem}.c${NC}"
-            exit 1
-        fi
-        echo -e "  ${GREEN}✓${NC} compiled ${stem}.c"
-    else
-        echo -e "  ${RED}✗ not found: ${stem}${NC}"
+    if [ ! -f "stdlib/${stem}.hy" ]; then
+        echo -e "  ${RED}✗ not found: stdlib/${stem}.hy${NC}"
         exit 1
     fi
+    ./hylian "stdlib/${stem}.hy" -o "$out" >/dev/null 2>/tmp/hylian_std_err
+    if [ $? -ne 0 ]; then
+        echo -e "  ${RED}✗ failed to compile stdlib/${stem}.hy${NC}"
+        cat /tmp/hylian_std_err
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} stdlib/${stem}.hy"
 }
 
-resolve_runtime_obj "runtime/std/io"      "io_runtime.o"
-resolve_runtime_obj "runtime/std/errors"  "errors_runtime.o"
-resolve_runtime_obj "runtime/std/strings" "strings_runtime.o"
-resolve_runtime_obj "runtime/platform/linux" "platform_runtime.o"
-resolve_runtime_obj "runtime/std/mem" "mem_runtime.o"
+build_std_obj "mem"     "mem_runtime.o"
+build_std_obj "runtime" "runtime_runtime.o"
+build_std_obj "array"   "array_runtime.o"
+
+STD_OBJS=(mem_runtime.o runtime_runtime.o array_runtime.o)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IR dump test runner (checks stderr output from --dump-ir, no linking needed)
@@ -168,8 +170,9 @@ run_test() {
 
     printf '%s' "$src" > "$hy_file"
 
-    # Compile .hy → .asm
-    ./hylian "$hy_file" -o "$asm_file" 2>/tmp/hylian_err
+    # Compile .hy → .o directly (hygen emits a linkable ELF object; there is
+    # no separate .asm text stage or nasm invocation any more)
+    ./hylian "$hy_file" -o "$obj_file" 2>/tmp/hylian_err
     if [ $? -ne 0 ]; then
         fail_msg "$desc"
         info_msg "compiler error: $(cat /tmp/hylian_err)"
@@ -177,17 +180,8 @@ run_test() {
         return
     fi
 
-    # Assemble .asm → .o
-    nasm -felf64 "$asm_file" -o "$obj_file" 2>/tmp/nasm_err
-    if [ $? -ne 0 ]; then
-        fail_msg "$desc"
-        info_msg "nasm error: $(cat /tmp/nasm_err)"
-        FAIL=$((FAIL + 1))
-        return
-    fi
-
     # Link
-    gcc "$obj_file" io_runtime.o errors_runtime.o strings_runtime.o platform_runtime.o mem_runtime.o \
+    gcc "$obj_file" "${STD_OBJS[@]}" \
         "${extra_objs[@]}" -o "$bin_file" -no-pie 2>/tmp/link_err
     if [ $? -ne 0 ]; then
         fail_msg "$desc"
@@ -229,7 +223,7 @@ run_test_exit() {
 
     printf '%s' "$src" > "$hy_file"
 
-    ./hylian "$hy_file" -o "$asm_file" 2>/tmp/hylian_err
+    ./hylian "$hy_file" -o "$obj_file" 2>/tmp/hylian_err
     if [ $? -ne 0 ]; then
         fail_msg "$desc"
         info_msg "compiler error: $(cat /tmp/hylian_err)"
@@ -237,9 +231,7 @@ run_test_exit() {
         return
     fi
 
-    nasm -felf64 "$asm_file" -o "$obj_file" 2>/dev/null
-    gcc "$obj_file" io_runtime.o errors_runtime.o strings_runtime.o platform_runtime.o mem_runtime.o \
-        -o "$bin_file" -no-pie 2>/dev/null
+    gcc "$obj_file" "${STD_OBJS[@]}" -o "$bin_file" -no-pie 2>/dev/null
 
     "./$bin_file" >/dev/null 2>&1
     local actual_exit=$?

@@ -479,10 +479,139 @@ int opt_branch_fold(IRModule *mod) {
     return changes;
 }
 
+/* ---- whole-function unused-code elimination ---- */
+
+typedef struct {
+    const char *name;   /* points into the IR_FUNC_BEGIN's str_extra */
+    int  begin;         /* index of IR_FUNC_BEGIN                    */
+    int  end;           /* index of IR_FUNC_END                      */
+    int  weak;          /* came from an include -> droppable         */
+    int  reachable;
+} FuncSpan;
+
+static int span_find(const FuncSpan *spans, int n, const char *name) {
+    if (!name) return -1;
+    for (int i = 0; i < n; i++)
+        if (spans[i].name && strcmp(spans[i].name, name) == 0) return i;
+    return -1;
+}
+
+static int func_is_weak(const IRModule *mod, const char *name) {
+    if (!name) return 0;
+    for (int i = 0; i < mod->weak_func_count; i++)
+        if (strcmp(mod->weak_funcs[i], name) == 0) return 1;
+    return 0;
+}
+
+int opt_strip_unreachable(IRModule *mod) {
+    if (mod->weak_func_count == 0) return 0;
+
+    /* 1. index every function's instruction range */
+    int span_cap = 64, span_n = 0;
+    FuncSpan *spans = malloc(span_cap * sizeof(FuncSpan));
+    for (int i = 0; i < mod->instr_count; i++) {
+        if (mod->instrs[i].op != IR_FUNC_BEGIN) continue;
+        if (span_n == span_cap) {
+            span_cap *= 2;
+            spans = realloc(spans, span_cap * sizeof(FuncSpan));
+        }
+        int end = i;
+        while (end < mod->instr_count && mod->instrs[end].op != IR_FUNC_END) end++;
+        spans[span_n].name      = mod->instrs[i].str_extra;
+        spans[span_n].begin     = i;
+        spans[span_n].end       = end < mod->instr_count ? end : mod->instr_count - 1;
+        spans[span_n].weak      = func_is_weak(mod, mod->instrs[i].str_extra);
+        spans[span_n].reachable = 0;
+        span_n++;
+        i = end;
+    }
+    if (span_n == 0) { free(spans); return 0; }
+
+    /* 2. roots: everything the user wrote themselves. Anything not marked weak
+          is a root, which conveniently also covers the case where the entry
+          point isn't called `main` (freestanding targets, naked entry stubs)
+          and the case where the whole translation unit IS a library. */
+    int *work = malloc(span_n * sizeof(int));
+    int work_n = 0;
+    for (int i = 0; i < span_n; i++) {
+        if (spans[i].weak) continue;
+        spans[i].reachable = 1;
+        work[work_n++] = i;
+    }
+
+    /* 3. transitive closure over calls and function-address references */
+    while (work_n > 0) {
+        int fi = work[--work_n];
+        for (int i = spans[fi].begin; i <= spans[fi].end; i++) {
+            const IRInstr *ins = &mod->instrs[i];
+
+            const char *target = NULL;
+            char ctor_name[256];
+
+            if (ins->op == IR_CALL || ins->op == IR_ADDROF_FN) {
+                target = ins->str_extra;
+            } else if (ins->op == IR_ARENA_ALLOC || ins->op == IR_NEW) {
+                /* `new Foo(...)` doesn't reference Foo__ctor anywhere in the
+                   IR — ir_to_mir.c synthesises that call later, after this
+                   pass has already run. Without treating the allocation itself
+                   as a reference, the constructor of any class defined in an
+                   included file gets stripped and the program fails to link
+                   with "undefined reference to Foo__ctor". */
+                if (ins->str_extra) {
+                    snprintf(ctor_name, sizeof(ctor_name), "%s__ctor", ins->str_extra);
+                    target = ctor_name;
+                }
+            } else {
+                continue;
+            }
+
+            int callee = span_find(spans, span_n, target);
+            if (callee < 0 || spans[callee].reachable) continue;
+            spans[callee].reachable = 1;
+            work[work_n++] = callee;
+        }
+    }
+    free(work);
+
+    /* 4. compact the instruction stream, dropping unreachable weak functions.
+          Removing the range outright (rather than NOP-ing it) matters: the
+          IR_FUNC_BEGIN/IR_FUNC_END pair is what ir_to_mir.c keys on to start
+          and finish a MIR function, so a NOP'd-out body would still produce a
+          real, empty, emitted function. */
+    int removed = 0;
+    int keep = 0;
+    int drop_until = -1;
+    for (int i = 0; i < mod->instr_count; i++) {
+        if (drop_until < 0) {
+            for (int f = 0; f < span_n; f++) {
+                if (spans[f].begin == i && spans[f].weak && !spans[f].reachable) {
+                    drop_until = spans[f].end;
+                    removed++;
+                    break;
+                }
+            }
+        }
+        if (drop_until >= 0) {
+            if (i >= drop_until) drop_until = -1;  /* this was IR_FUNC_END */
+            continue;
+        }
+        if (keep != i) mod->instrs[keep] = mod->instrs[i];
+        keep++;
+    }
+    mod->instr_count = keep;
+
+    free(spans);
+    return removed;
+}
+
 /* ---- driver ---- */
 
 int opt_run_all(IRModule *mod) {
-    int total = 0;
+    /* Prune whole unreachable functions FIRST, so the per-instruction passes
+       below never spend time on code that's about to be deleted — and, more
+       importantly, so a malformed unused stdlib function can't fail the build
+       of a program that never calls it. */
+    int total = opt_strip_unreachable(mod);
     int delta;
     for (int iter = 0; iter < 12; iter++) {
         delta  = opt_constant_fold(mod);

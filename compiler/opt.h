@@ -26,6 +26,24 @@ int opt_dce(IRModule *mod);
    Returns the number of changes made. */
 int opt_branch_fold(IRModule *mod);
 
+/* Whole-function unused-code elimination.
+
+   Deletes the IR of any function that (a) arrived through an `include` — see
+   IRModule.weak_funcs — and (b) is not reachable by any chain of calls from a
+   function the user actually wrote.
+
+   The point is not code size. Every function in an included stdlib module used
+   to be lowered and linked whether or not the program called it, so a bug in
+   an untouched stdlib function could break the build of a program that never
+   went near it. Pruning first means only code the program can actually reach
+   has to be compilable.
+
+   Deliberately conservative: it only removes functions from includes (a
+   function in the file being compiled may be the whole point of that file),
+   and it treats a function's address being taken as a call. Returns the number
+   of functions removed. */
+int opt_strip_unreachable(IRModule *mod);
+
 /* Convenience: run all passes in a fixed-point loop until no
    more changes occur.  Returns total changes made across all passes. */
 int opt_run_all(IRModule *mod);

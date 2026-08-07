@@ -58,12 +58,19 @@ void x64_reloc_add(X64RelocList *r, size_t offset, const char *symbol, X64RelocK
     r->count++;
 }
 
-/* ---- register pool: order matters (roughly caller-saved-first so regalloc's
-   "lowest free id wins" preference lines up with cheaper calling-convention
-   behavior; not load-bearing for correctness either way) ---- */
+/* ---- register pool: order IS load-bearing now. regalloc treats ids
+   0..num_callee_saved_int_regs-1 as "survives a call" and will only put a
+   value whose live range spans a call into one of them (spilling otherwise),
+   so the callee-saved registers MUST come first and the count in hyx64.h
+   (X64_NUM_CALLEE_SAVED_INT_REGS) MUST match how many of them there are.
+   SysV x86-64 callee-saved: rbx, rbp, rsp, r12-r15. rbp/rsp are the frame,
+   leaving rbx + r12-r15 = 5 allocatable ones. Everything after is
+   caller-saved and is destroyed by any call. ---- */
 const X64Reg x64_int_reg_pool[X64_NUM_ALLOCATABLE_INT_REGS] = {
-    X64_RBX, X64_RSI, X64_RDI,
-    X64_R8, X64_R9, X64_R10, X64_R12, X64_R13, X64_R14, X64_R15,
+    /* callee-saved (ids 0-4) */
+    X64_RBX, X64_R12, X64_R13, X64_R14, X64_R15,
+    /* caller-saved (ids 5-9) */
+    X64_RSI, X64_RDI, X64_R8, X64_R9, X64_R10,
 };
 
 const int x64_float_reg_pool[X64_NUM_ALLOCATABLE_FLOAT_REGS] = {

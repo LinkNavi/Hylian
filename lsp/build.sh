@@ -79,8 +79,8 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
   cd src || exit 1
 
   # ── Bison: parser_lsp.y → parser_lsp.tab.c / parser_lsp.tab.h ──
-  info "Running bison on parser_lsp.y..."
-  run bison -d -o parser_lsp.tab.c parser_lsp.y
+  info "Running bison on the shared compiler grammar..."
+  run bison -d -o parser_lsp.tab.c ../../compiler/parser.y
   if [[ $? -ne 0 ]]; then
     fail "bison failed on parser_lsp.y"
     exit 1
@@ -88,8 +88,8 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
   success "parser_lsp.tab.c generated"
 
   # ── Flex: lexer_lsp.l → lex_lsp.yy.c ───────────────────────────
-  info "Running flex on lexer_lsp.l..."
-  run flex -o lex_lsp.yy.c lexer_lsp.l
+  info "Running flex on the shared compiler lexer..."
+  run flex -o lex_lsp.yy.c ../../compiler/lexer.l
   if [[ $? -ne 0 ]]; then
     fail "flex failed on lexer_lsp.l"
     exit 1
@@ -101,14 +101,16 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
 
   run gcc \
       -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+      -I../../compiler \
       -O2 \
       lex_lsp.yy.c \
       parser_lsp.tab.c \
-      ast.c \
+      ../../compiler/ast.c \
+      ../../compiler/diag.c \
+      ../../compiler/typecheck.c \
       lsp_diag.c \
       lsp_analysis.c \
       lsp_proto.c \
-      typecheck.c \
       lsp_main.c \
       lsp_c_extractor.c \
       -ltree-sitter \
@@ -116,6 +118,25 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
       -o ../hylian-lsp
   if [[ $? -ne 0 ]]; then
     fail "gcc compilation failed"
+    exit 1
+  fi
+
+  # Standalone syntax checker built from the same generated parser, so the LSP
+  # grammar can be exercised by tests/grammar_drift.sh without an editor.
+  info "Compiling lsp_syntax_check..."
+  run gcc \
+      -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+      -I../../compiler \
+      -O2 \
+      lex_lsp.yy.c \
+      parser_lsp.tab.c \
+      ../../compiler/ast.c \
+      ../../compiler/diag.c \
+      lsp_diag.c \
+      ../tools/lsp_syntax_check.c \
+      -o ../lsp-syntax-check
+  if [[ $? -ne 0 ]]; then
+    fail "gcc compilation of lsp_syntax_check failed"
     exit 1
   fi
 )

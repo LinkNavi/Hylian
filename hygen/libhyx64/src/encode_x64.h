@@ -20,6 +20,14 @@ void enc_mov_ri64(X64Buf *b, X64Reg dst, int64_t imm);
 /* load/store to [base + disp32] */
 void enc_mov_load(X64Buf *b, X64Reg dst, X64Reg base, int32_t disp);
 void enc_mov_store(X64Buf *b, X64Reg base, int32_t disp, X64Reg src);
+/* Sized variants, for dereferencing a real typed pointer rather than touching
+   an 8-byte stack slot. `size` is 1/2/4/8 bytes; anything else is treated as 8.
+   Using the 8-byte forms for a `*uint8` write is not merely wasteful, it is
+   wrong: it scribbles over the 7 bytes that follow the target. Loads take
+   `is_signed` and widen to the full 64-bit register accordingly, so the value
+   the rest of the backend sees is always a correct full-width integer. */
+void enc_mov_store_sz(X64Buf *b, X64Reg base, int32_t disp, X64Reg src, int size);
+void enc_mov_load_sz(X64Buf *b, X64Reg dst, X64Reg base, int32_t disp, int size, int is_signed);
 /* rip-relative lea/load - disp32 left as 0, caller records a relocation */
 size_t enc_lea_rip(X64Buf *b, X64Reg dst);
 void enc_lea_mem(X64Buf *b, X64Reg dst, X64Reg base, int32_t disp); /* lea dst, [base+disp] */
@@ -49,6 +57,9 @@ typedef enum {
 } CondCode;
 void enc_setcc(X64Buf *b, CondCode cc, X64Reg dst8); /* dst8 = cc ? 1 : 0, full reg zero-extended by caller's movzx */
 void enc_movzx_r64_r8(X64Buf *b, X64Reg dst, X64Reg src);
+/* dst = low `src_size` bytes of src, widened to 64 bits (sign- or zero-extended).
+   Backs MIR_SEXT / MIR_ZEXT / MIR_TRUNC. */
+void enc_ext_rr(X64Buf *b, X64Reg dst, X64Reg src, int src_size, int is_signed);
 
 void enc_push(X64Buf *b, X64Reg reg);
 void enc_pop(X64Buf *b, X64Reg reg);

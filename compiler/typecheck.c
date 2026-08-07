@@ -1,4 +1,5 @@
 #include "typecheck.h"
+#include "diag.h"
 #include "ast.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -7,24 +8,24 @@
 
 static const char *current_tc_file = "<unknown>";
 static int in_unsafe = 0;
+/* Both route through the shared diagnostic sink (see diag.h) so this one
+   typechecker can serve the CLI and the LSP. */
 static void tc_error(int line, const char *fmt, ...) {
+  char buf[1024];
   va_list ap;
-  fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;31merror:\033[0m ",
-          current_tc_file, line);
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  fprintf(stderr, "\n");
+  diag_emit(DIAG_ERROR, current_tc_file, line, -1, NULL, "%s", buf);
 }
 
 static void tc_warn(int line, const char *fmt, ...) {
+  char buf[1024];
   va_list ap;
-  fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;33mwarning:\033[0m ",
-          current_tc_file, line);
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  fprintf(stderr, "\n");
+  diag_emit(DIAG_WARNING, current_tc_file, line, -1, NULL, "%s", buf);
 }
 
 
@@ -100,6 +101,32 @@ static int tc_is_module(const char *name) {
     return 0;
 }
 
+/* Which module (if any) owns a given bare function name, e.g. catFunc ->
+   "Cat". Populated while registering `module Foo { ... }` blocks (pass 1)
+   and consulted when a bare NODE_FUNC_CALL can't be found in the normal
+   function table, so a call to a module function from OUTSIDE that module
+   gets a clear "use Module.func(...)" error at typecheck time instead of a
+   linker "undefined reference" once codegen tries to call a symbol that was
+   only ever emitted as ModuleName__func. */
+static const char *mod_member_name[256];
+static const char *mod_member_module[256];
+static int mod_member_count = 0;
+
+static const char *mod_owner_of(const char *name) {
+    for (int i = 0; i < mod_member_count; i++)
+        if (mod_member_name[i] && strcmp(mod_member_name[i], name) == 0)
+            return mod_member_module[i];
+    return NULL;
+}
+
+/* Set to the enclosing module's name while typechecking the bodies of that
+   module's own functions (pass 2), NULL everywhere else. Lets a function
+   inside `module Cat { }` call a sibling function by its bare name — the
+   same unqualified-intra-module-call convention lower.c already implements
+   via LowerState.current_module — without opening that bare name up to the
+   rest of the program. */
+static const char *tc_current_module = NULL;
+
 static int is_enum_type(const char *name) {
   for (int i = 0; i < enum_type_count; i++)
     if (enum_type_names[i] && strcmp(enum_type_names[i], name) == 0)
@@ -164,6 +191,36 @@ static Type infer_expr(ASTNode *node);
 static void infer_stmt(ASTNode *node);
 
 
+
+/* ── externally-supplied symbols (see typecheck.h) ───────────────────────── */
+
+static const TCExternal *g_ext = NULL;
+static int               g_ext_count = 0;
+
+void tc_set_externals(const TCExternal *ext, int count) {
+  g_ext = ext;
+  g_ext_count = ext ? count : 0;
+}
+
+static const TCExternal *ext_find(const char *name, TCExternalKind kind) {
+  if (!g_ext || !name) return NULL;
+  for (int i = 0; i < g_ext_count; i++)
+    if (g_ext[i].kind == kind && g_ext[i].name &&
+        strcmp(g_ext[i].name, name) == 0)
+      return &g_ext[i];
+  return NULL;
+}
+
+/* Resolve an external's declared type name into a Type, defaulting to a
+   permissive "unknown"-ish int rather than erroring: the LSP's index carries
+   type names as free text, and being wrong about a type is much less harmful
+   here than falsely reporting the symbol as undefined. */
+static Type ext_type(const TCExternal *e) {
+  if (!e || !e->type_name || !e->type_name[0])
+    return make_simple_type("int", 0);
+  return make_simple_type((char *)e->type_name, 0);
+}
+
 static Type infer_expr(ASTNode *node) {
   if (!node)
     return unknown_type();
@@ -200,7 +257,16 @@ static Type infer_expr(ASTNode *node) {
     if (t) {
       result = *t;
     } else {
-      tc_error(0, "undefined variable '%s'", id->name);
+      const TCExternal *ev = ext_find(id->name, TC_EXT_VAR);
+      const TCExternal *em = ev ? NULL : ext_find(id->name, TC_EXT_MODULE);
+      if (ev) {
+        result = ext_type(ev);
+      } else if (em) {
+        /* a module name used as a namespace prefix, e.g. `Pmm.init()` */
+        result = make_simple_type((char *)em->name, 0);
+      } else {
+        tc_error(node->line, "undefined variable '%s'", id->name);
+      }
     }
     break;
   }
@@ -246,7 +312,7 @@ static Type infer_expr(ASTNode *node) {
           (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
            strcmp(op, "*") == 0 || strcmp(op, "/") == 0 ||
            strcmp(op, "%") == 0)) {
-        tc_warn(0, "arithmetic on boolean value with operator '%s'", op);
+        tc_warn(node->line, "arithmetic on boolean value with operator '%s'", op);
       }
       result = left;
     }
@@ -263,7 +329,7 @@ static Type infer_expr(ASTNode *node) {
       result = make_ref_type(infer_expr(un->operand));
     else if (un->op && strcmp(un->op, "deref") == 0) {
       if (operand.kind == TYPE_RAWPTR && !in_unsafe && !un->is_volatile)
-        tc_error(0, "cannot deref raw pointer outside unsafe block");
+        tc_error(node->line, "cannot deref raw pointer outside unsafe block");
       result = (operand.elem_type_count > 0) ? operand.elem_types[0]
                                              : unknown_type();
     } else
@@ -273,6 +339,15 @@ static Type infer_expr(ASTNode *node) {
 
   case NODE_NEW: {
     NewNode *nn = (NewNode *)node;
+    /* Constructor arguments were never type-checked here, so any non-trivial
+       expression passed to `new X(...)` (e.g. a string concat) never got its
+       resolved_type populated. lower.c's codegen relies on resolved_type to
+       decide things like "is this a string concat or numeric add" — without
+       it, `new Cmd("ls " + path)` silently miscompiled the concat to plain
+       pointer addition (see the str-concat fix in lower.c) and crashed at
+       runtime. */
+    for (int i = 0; i < nn->arg_count; i++)
+      infer_expr(nn->args[i]);
     result = make_simple_type(nn->class_name, 0);
     break;
   }
@@ -285,9 +360,13 @@ static Type infer_expr(ASTNode *node) {
       break;
     }
 
-    /* Infer all args first */
-    for (int i = 0; i < fc->arg_count; i++)
-      infer_expr(fc->args[i]);
+    /* Infer all args first — except __size_of__, whose sole argument is a TYPE
+       NAME rather than an expression. Treating it as one reported "undefined
+       variable 'Header'" for perfectly valid code. */
+    if (!(fc->name && strcmp(fc->name, "__size_of__") == 0)) {
+      for (int i = 0; i < fc->arg_count; i++)
+        infer_expr(fc->args[i]);
+    }
     /* Special built-ins that are not registered in the func table */
     if (fc->name && strcmp(fc->name, "Err") == 0) {
 
@@ -367,14 +446,36 @@ static Type infer_expr(ASTNode *node) {
       result = make_simple_type("usize", 0);
     } else if (fc->name && strcmp(fc->name, "size_of") == 0) {
       result = make_simple_type("usize", 0);
+    } else if (fc->name && strcmp(fc->name, "__size_of__") == 0) {
+      /* The argument is a TYPE NAME, not an expression. Inferring it as one
+         made `__size_of__(Header)` report "undefined variable 'Header'" while
+         still compiling to the right number. */
+      result = make_simple_type("int", 0);
     } else if (fc->name && strcmp(fc->name, "syscall") == 0) {
       result = make_simple_type("int", 0);
     } else if (fc->name) {
       FuncInfo *fi = func_lookup(fc->name);
+      const TCExternal *ef = fi ? NULL : ext_find(fc->name, TC_EXT_FUNC);
       if (fi) {
         result = fi->return_type;
+      } else if (ef) {
+        result = ext_type(ef);
       } else {
-        tc_error(0, "call to undefined function '%s'", fc->name);
+        const char *owner = mod_owner_of(fc->name);
+        if (owner && tc_current_module && strcmp(tc_current_module, owner) == 0) {
+          /* Bare call to a sibling function from inside the same module —
+             resolve via the mangled entry registered for the module. */
+          char mangled[256];
+          snprintf(mangled, sizeof(mangled), "%s__%s", owner, fc->name);
+          FuncInfo *mfi = func_lookup(mangled);
+          result = mfi ? mfi->return_type : unknown_type();
+        } else if (owner) {
+          tc_error(node->line,
+                    "call to undefined function '%s' - '%s' is defined inside module '%s'; call it as %s.%s(...)",
+                    fc->name, fc->name, owner, owner, fc->name);
+        } else {
+          tc_error(node->line, "call to undefined function '%s'", fc->name);
+        }
       }
     }
     break;
@@ -394,7 +495,7 @@ static Type infer_expr(ASTNode *node) {
         if (fi) {
           result = fi->return_type;
         } else {
-          tc_error(0, "no function '%s' in module '%s'", mc->method, obj_name);
+          tc_error(node->line, "no function '%s' in module '%s'", mc->method, obj_name);
         }
         node->resolved_type = result;
         return result;
@@ -416,19 +517,39 @@ static Type infer_expr(ASTNode *node) {
       if (fi) {
         result = fi->return_type;
       } else {
-        tc_error(0, "no method '%s' on type '%s'", mc->method,
-                 obj_type.name ? obj_type.name : "unknown");
+        /* UFCS fallback: `x.method(args)` where `method` isn't a real
+           ClassName method (e.g. builtin types like str have no class of
+           their own) — resolve it as sugar for the free function
+           `method(x, args)` if one exists with matching arity. This is what
+           makes `aString.starts_with("bl")` work the same as the free
+           function `starts_with(aString, "bl")`. */
+        FuncInfo *ufcs = func_lookup(mc->method);
+        const TCExternal *em = ext_find(mangled, TC_EXT_FUNC);
+        const TCExternal *eu = em ? NULL : ext_find(mc->method, TC_EXT_FUNC);
+        if (em) {
+          /* a method on a type the frontend didn't parse (stdlib class) */
+          result = ext_type(em);
+        } else if (ufcs && ufcs->param_count == mc->arg_count + 1) {
+          result = ufcs->return_type;
+          mc->is_ufcs = 1;
+        } else if (eu) {
+          result = ext_type(eu);
+          mc->is_ufcs = 1;
+        } else {
+          tc_error(node->line, "no method '%s' on type '%s'", mc->method,
+                   obj_type.name ? obj_type.name : "unknown");
+        }
       }
     } else if (mc->method && obj_type.kind == TYPE_ARRAY) {
       if (strcmp(mc->method, "push") == 0 || strcmp(mc->method, "pop") == 0 ||
           strcmp(mc->method, "len") == 0 || strcmp(mc->method, "cap") == 0) {
         result = make_simple_type("int", 0);
       } else {
-        tc_error(0, "no method '%s' on type '%s'", mc->method,
+        tc_error(node->line, "no method '%s' on type '%s'", mc->method,
                  type_name(obj_type));
       }
     } else if (mc->method && !obj_type.name) {
-      tc_error(0, "no method '%s' on type 'unknown'", mc->method);
+      tc_error(node->line, "no method '%s' on type 'unknown'", mc->method);
     }
     break;
   }
@@ -469,7 +590,7 @@ static Type infer_expr(ASTNode *node) {
         if (fe) {
           result = fe->field_type;
         } else {
-          tc_error(0, "no field '%s' on type '%s'", ma->member, obj_type.name);
+          tc_error(node->line, "no field '%s' on type '%s'", ma->member, obj_type.name);
         }
       }
     }
@@ -559,7 +680,7 @@ static void infer_stmt(ASTNode *node) {
     if (decl_type.name && strcmp(decl_type.name, "auto") == 0 &&
         (!init_type.name || strcmp(init_type.name, "unknown") == 0) &&
         init_type.kind == TYPE_SIMPLE && !init_type.name) {
-      tc_warn(0, "cannot infer type for '%s' from initializer", vd->var_name);
+      tc_warn(node->line, "cannot infer type for '%s' from initializer", vd->var_name);
     }
     scope_define(vd->var_name, decl_type);
     node->resolved_type = decl_type;
@@ -718,8 +839,20 @@ static void infer_function(ASTNode **params, int param_count, ASTNode **body,
                            const char *class_name) {
   (void)return_type;
   scope_push();
-  if (class_name)
+  if (class_name) {
     scope_define("self", make_simple_type((char *)class_name, 0));
+    /* Inside a method, the class's own fields are in scope under their bare
+       names — `x` means `self.x`. Without defining them here the typechecker
+       reported "undefined variable 'x'" for perfectly valid implicit-receiver
+       code, printing an error for a program that then compiled and ran fine.
+       Parameters and locals are defined after / later and shadow these, which
+       matches how lower.c resolves the same names. */
+    for (int i = 0; i < field_count; i++) {
+      if (!fields[i].class_name || !fields[i].field_name) continue;
+      if (strcmp(fields[i].class_name, class_name) != 0) continue;
+      scope_define(fields[i].field_name, fields[i].field_type);
+    }
+  }
   for (int i = 0; i < param_count; i++) {
     if (!params[i])
       continue;
@@ -829,9 +962,18 @@ void typecheck(ProgramNode *program, const char *filename) {
           snprintf(mangled, sizeof(mangled), "%s__%s", mn->name, fn->name);
           char *mangled_copy = strdup(mangled);
           register_func(mangled_copy, fn->return_type, fn->params, fn->param_count);
-          /* Also register under the plain name so intra-module calls (which
-             use the unqualified name) pass the typecheck pass without errors. */
-          register_func(fn->name, fn->return_type, fn->params, fn->param_count);
+          /* Deliberately NOT registered under the plain name here anymore —
+             that used to make e.g. `catFunc(...)` pass typecheck from
+             *anywhere* in the program, even though lower.c only ever emits
+             a callable symbol named `Cat__catFunc`. Bare calls from outside
+             the module now get a real error (see mod_owner_of below); bare
+             calls from a sibling function inside the same module still
+             resolve, via tc_current_module + the mangled entry above. */
+          if (mod_member_count < 256) {
+              mod_member_name[mod_member_count]   = fn->name;
+              mod_member_module[mod_member_count] = mn->name;
+              mod_member_count++;
+          }
       }
     }
 
@@ -901,12 +1043,14 @@ void typecheck(ProgramNode *program, const char *filename) {
 
     if (d->type == NODE_MODULE) {
       ModuleNode *mn = (ModuleNode *)d;
+      tc_current_module = mn->name;
       for (int fi = 0; fi < mn->func_count; fi++) {
         FuncNode *fn = mn->funcs[fi];
         if (!fn) continue;
         infer_function(fn->params, fn->param_count, fn->body, fn->body_count,
                        fn->return_type, NULL);
       }
+      tc_current_module = NULL;
     }
   }
 }

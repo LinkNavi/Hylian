@@ -60,6 +60,12 @@ typedef enum {
 } X64Reg;
 
 #define X64_NUM_ALLOCATABLE_INT_REGS 10
+/* The first this-many pool entries are SysV callee-saved (rbx, r12-r15) and
+   therefore survive a call; the rest do not. regalloc relies on this split to
+   decide what may stay in a register across a call, and x64_lower_func saves
+   and restores exactly the ones a function actually used. Keep in sync with
+   the ordering of x64_int_reg_pool in hyx64.c. */
+#define X64_NUM_CALLEE_SAVED_INT_REGS 5
 extern const X64Reg x64_int_reg_pool[X64_NUM_ALLOCATABLE_INT_REGS];
 
 /* xmm0-13 allocatable, xmm14/xmm15 reserved as fixed scratch for operand
@@ -67,6 +73,10 @@ extern const X64Reg x64_int_reg_pool[X64_NUM_ALLOCATABLE_INT_REGS];
    ISA constraints on xmm registers (no CL-style fixed-position requirement
    like shifts have for GPRs), so this is a plain identity mapping. */
 #define X64_NUM_ALLOCATABLE_FLOAT_REGS 14
+/* SysV x86-64 has NO callee-saved xmm registers - every one of xmm0-15 is
+   caller-saved. So a float value live across a call always has to spill;
+   there is no register that could hold it. */
+#define X64_NUM_CALLEE_SAVED_FLOAT_REGS 0
 extern const int x64_float_reg_pool[X64_NUM_ALLOCATABLE_FLOAT_REGS];
 #define X64_XMM_SCRATCH_A 14
 #define X64_XMM_SCRATCH_B 15
