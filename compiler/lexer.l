@@ -193,6 +193,8 @@ static char *strip_underscores(const char *s) {
 "usize"             { return USIZE; }
 "isize"             { return ISIZE; }
 
+"@section"          { return SECTION_ATTR; } /* placement attribute on a static, see parser.y */
+
 "int"               { return INT; }
 "str"               { return STRING; }
 "Error"             { return ERROR; }

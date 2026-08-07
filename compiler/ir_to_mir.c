@@ -915,7 +915,17 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
             int has_init = (ins->src1.kind == IROP_CONST_INT || ins->src1.kind == IROP_CONST_BOOL);
             int64_t init_val = ins->src1.kind == IROP_CONST_INT ? ins->src1.int_val
                               : ins->src1.kind == IROP_CONST_BOOL ? ins->src1.bool_val : 0;
-            mir_module_add_global(mod, ins->str_extra, has_init, init_val, 8);
+            if (ins->str_extra3) {
+                /* @section("...") global: a custom section is always emitted
+                   with explicit bytes (no .bss/NOBITS placement for it), so
+                   a value-less declaration still needs has_init=1 to get its
+                   (zero) bytes written into that section rather than treated
+                   as uninitialized. */
+                mir_module_add_global_ex(mod, ins->str_extra, 1, init_val, 8,
+                                         ins->str_extra3, NULL);
+            } else {
+                mir_module_add_global(mod, ins->str_extra, has_init, init_val, 8);
+            }
             tenv_set_var(&env, ins->str_extra, type_name_to_mir(ins->str_extra2));
             break;
         }

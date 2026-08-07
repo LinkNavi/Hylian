@@ -2362,6 +2362,7 @@ IRModule *lower_program(ProgramNode *prog) {
             ins->str_extra  = strdup(sv->var_name);
             ins->str_extra2 = (sv->var_type.kind == TYPE_SIMPLE && sv->var_type.name)
                               ? strdup(sv->var_type.name) : strdup("int");
+            ins->str_extra3 = sv->section ? strdup(sv->section) : NULL;
             if (sv->initializer && sv->initializer->type == NODE_LITERAL) {
                 LiteralNode *lit = (LiteralNode *)sv->initializer;
                 if (lit->lit_type == LIT_INT)

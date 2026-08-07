@@ -29,7 +29,11 @@ void mir_module_free(MIRModule *mod) {
     free(mod->funcs);
     for (int i = 0; i < mod->str_count; i++) { free(mod->strs[i].label); free(mod->strs[i].data); }
     free(mod->strs);
-    for (int i = 0; i < mod->global_count; i++) free(mod->globals[i].name);
+    for (int i = 0; i < mod->global_count; i++) {
+        free(mod->globals[i].name);
+        free(mod->globals[i].section);
+        free(mod->globals[i].init_bytes);
+    }
     free(mod->globals);
     free(mod);
 }
@@ -146,6 +150,12 @@ const char *mir_module_intern_string(MIRModule *mod, const char *data, int len) 
 }
 
 void mir_module_add_global(MIRModule *mod, const char *name, int has_init, int64_t init_val, int size) {
+    mir_module_add_global_ex(mod, name, has_init, init_val, size, NULL, NULL);
+}
+
+void mir_module_add_global_ex(MIRModule *mod, const char *name, int has_init,
+                              int64_t init_val, int size,
+                              const char *section, const unsigned char *init_bytes) {
     if (mod->global_count == mod->global_cap) {
         mod->global_cap *= 2;
         mod->globals = realloc(mod->globals, mod->global_cap * sizeof(MIRGlobalVar));
@@ -155,6 +165,13 @@ void mir_module_add_global(MIRModule *mod, const char *name, int has_init, int64
     g->has_init = has_init;
     g->init_val = init_val;
     g->size = size;
+    g->section = section ? strdup(section) : NULL;
+    if (init_bytes) {
+        g->init_bytes = malloc((size_t)size);
+        memcpy(g->init_bytes, init_bytes, (size_t)size);
+    } else {
+        g->init_bytes = NULL;
+    }
 }
 
 const char *mir_op_name(MIROp op) {

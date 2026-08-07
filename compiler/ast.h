@@ -303,6 +303,11 @@ typedef struct {
     ASTNode *initializer; /* may be NULL */
     int is_const;         /* 1 = const keyword was used */
     int array_size;       /* 0 = not a fixed array, >0 = fixed element count */
+    char *section;        /* NULL = default (.data/.bss), else an @section("...")
+                              name the linker should place this global under -
+                              e.g. Limine boot-protocol request structs, which
+                              must live in a section the bootloader scans for
+                              before any of our code runs. */
 } StaticVarNode;
 
 typedef struct {

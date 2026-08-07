@@ -33,8 +33,16 @@ void obj_module_free(ObjModule *mod) {
     objbuf_free(&mod->data);
     for (int i = 0; i < mod->func_count; i++) free(mod->funcs[i].name);
     for (int i = 0; i < mod->str_count; i++) free(mod->strs[i].name);
-    for (int i = 0; i < mod->global_count; i++) free(mod->globals[i].name);
+    for (int i = 0; i < mod->global_count; i++) {
+        free(mod->globals[i].name);
+        free(mod->globals[i].section);
+    }
+    for (int i = 0; i < mod->extra_section_count; i++) {
+        free(mod->extra_sections[i].name);
+        objbuf_free(&mod->extra_sections[i].data);
+    }
     free(mod->funcs); free(mod->strs); free(mod->globals); free(mod->relocs);
+    free(mod->extra_sections);
     free(mod);
 }
 
@@ -88,6 +96,7 @@ void obj_add_global(ObjModule *mod, const char *name, int has_init, int64_t init
     g->has_init = has_init;
     g->init_val = init_val;
     g->size = size;
+    g->section = NULL;
     if (has_init) {
         g->offset = mod->data.len;
         objbuf_write(&mod->data, &init_val, size);
@@ -95,4 +104,37 @@ void obj_add_global(ObjModule *mod, const char *name, int has_init, int64_t init
         g->offset = mod->bss_size;
         mod->bss_size += size;
     }
+}
+
+static ObjBuf *obj_get_or_add_section(ObjModule *mod, const char *name) {
+    for (int i = 0; i < mod->extra_section_count; i++)
+        if (strcmp(mod->extra_sections[i].name, name) == 0)
+            return &mod->extra_sections[i].data;
+    if (mod->extra_section_count == mod->extra_section_cap) {
+        mod->extra_section_cap = mod->extra_section_cap ? mod->extra_section_cap * 2 : 4;
+        mod->extra_sections = realloc(mod->extra_sections,
+                                      mod->extra_section_cap * sizeof(ObjExtraSection));
+    }
+    ObjExtraSection *s = &mod->extra_sections[mod->extra_section_count++];
+    s->name = strdup(name);
+    objbuf_init(&s->data);
+    return &s->data;
+}
+
+void obj_add_global_bytes(ObjModule *mod, const char *name, const char *section,
+                          const void *data, size_t size) {
+    if (mod->global_count == mod->global_cap) {
+        mod->global_cap *= 2;
+        mod->globals = realloc(mod->globals, mod->global_cap * sizeof(ObjGlobalSym));
+    }
+    ObjGlobalSym *g = &mod->globals[mod->global_count++];
+    g->name = strdup(name);
+    g->has_init = 1;
+    g->init_val = 0;
+    g->size = (int)size;
+    g->section = strdup(section);
+
+    ObjBuf *buf = obj_get_or_add_section(mod, section);
+    g->offset = buf->len;
+    objbuf_write(buf, data, size);
 }

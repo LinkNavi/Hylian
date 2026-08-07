@@ -26,7 +26,11 @@ typedef struct {
     int      has_init;
     int64_t  init_val;
     int      size;
-    size_t   offset;   /* offset into .data (if has_init) or .bss (if not) */
+    size_t   offset;   /* offset into .data (if has_init) or .bss (if not) -
+                           or into `section`'s own buffer, if section != NULL */
+    char    *section;  /* NULL = default (.data/.bss) placement; else the name
+                           of a custom section (see ObjExtraSection) this
+                           global's bytes were written into instead. */
 } ObjGlobalSym;
 
 typedef struct {
@@ -40,6 +44,17 @@ typedef struct {
     size_t   len, cap;
 } ObjBuf;
 
+/* A PROGBITS section beyond the fixed .text/.rodata/.data/.bss set, created
+   on first use by obj_add_global_bytes(). Needed for boot-protocol structs
+   (e.g. Limine's ".limine_requests") that a bootloader scans for by exact
+   section name before any of our code runs — an ordinary .data global isn't
+   enough because the *name* of the section is what identifies the data, not
+   just its bytes. */
+typedef struct {
+    char   *name;
+    ObjBuf  data;
+} ObjExtraSection;
+
 typedef struct {
     ObjBuf text;
     ObjBuf rodata;
@@ -50,6 +65,8 @@ typedef struct {
     ObjRodataSym *strs;    int str_count, str_cap;
     ObjGlobalSym *globals; int global_count, global_cap;
     ObjReloc     *relocs;  int reloc_count, reloc_cap;
+
+    ObjExtraSection *extra_sections; int extra_section_count, extra_section_cap;
 } ObjModule;
 
 ObjModule *obj_module_new(void);
@@ -65,6 +82,15 @@ void obj_add_string(ObjModule *mod, const char *label, const char *data, size_t 
 
 /* declares a global var: goes to .data if has_init, .bss otherwise */
 void obj_add_global(ObjModule *mod, const char *name, int has_init, int64_t init_val, int size);
+
+/* declares a global var with arbitrary initialized byte content (not just a
+   single 8-byte int) placed in a named custom section (created on first
+   use) instead of .data - e.g. a Limine boot-protocol request struct, whose
+   exact field bytes (magic numbers, revision, a null response pointer) must
+   be laid out at compile time and found by the bootloader via section name
+   before any of our code runs. */
+void obj_add_global_bytes(ObjModule *mod, const char *name, const char *section,
+                          const void *data, size_t size);
 
 /* writes a Linux ELF64 relocatable object (.o) - functions are STB_GLOBAL,
    string/global symbols STB_LOCAL, anything referenced by a reloc that

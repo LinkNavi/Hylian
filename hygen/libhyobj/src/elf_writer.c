@@ -74,9 +74,14 @@ typedef struct {
 
 #define SHN_UNDEF 0
 
-/* section indices, fixed order */
-enum { SEC_NULL, SEC_TEXT, SEC_RODATA, SEC_DATA, SEC_BSS, SEC_SYMTAB, SEC_STRTAB,
-       SEC_RELA_TEXT, SEC_NOTE_GNU_STACK, SEC_SHSTRTAB, SEC_COUNT };
+/* Fixed section indices. Any ObjModule extra sections (see ObjExtraSection -
+   custom-named PROGBITS sections like Limine's ".limine_requests") get
+   indices SEC_FIXED_COUNT .. SEC_FIXED_COUNT+extra_section_count-1, and
+   everything from SEC_SYMTAB on is pushed back by that many slots — so
+   those can no longer be plain enum constants; they're computed once
+   extra_section_count is known (see the `int SEC_SYMTAB = ...` locals near
+   the top of obj_write_elf). */
+enum { SEC_NULL, SEC_TEXT, SEC_RODATA, SEC_DATA, SEC_BSS, SEC_FIXED_COUNT };
 
 /* ---- growable byte buffer, local to this file ---- */
 typedef struct { uint8_t *d; size_t len, cap; } Buf;
@@ -119,7 +124,26 @@ static int symlist_add(SymList *s, const char *name, int binding, int type, int 
     return s->count++;
 }
 
+/* Index (SEC_FIXED_COUNT + n) of mod's extra section named `name`, or -1. */
+static int extra_section_index(const ObjModule *mod, const char *name) {
+    if (!name) return -1;
+    for (int i = 0; i < mod->extra_section_count; i++)
+        if (strcmp(mod->extra_sections[i].name, name) == 0) return SEC_FIXED_COUNT + i;
+    return -1;
+}
+
 int obj_write_elf(const ObjModule *mod, const char *path) {
+    /* Everything from .symtab on is pushed back by however many extra
+       sections (see ObjExtraSection) this module has, so those are runtime
+       values now rather than enum constants. */
+    int n_extra       = mod->extra_section_count;
+    int SEC_SYMTAB     = SEC_FIXED_COUNT + n_extra;
+    int SEC_STRTAB      = SEC_SYMTAB + 1;
+    int SEC_RELA_TEXT   = SEC_STRTAB + 1;
+    int SEC_NOTE_GNU_STACK = SEC_RELA_TEXT + 1;
+    int SEC_SHSTRTAB    = SEC_NOTE_GNU_STACK + 1;
+    int SEC_COUNT       = SEC_SHSTRTAB + 1;
+
     SymList syms;
     symlist_init(&syms);
     symlist_add(&syms, "", 0, 0, 0, 0, 0); /* index 0: reserved null symbol */
@@ -131,8 +155,9 @@ int obj_write_elf(const ObjModule *mod, const char *path) {
                     mod->strs[i].offset, mod->strs[i].len);
     for (int i = 0; i < mod->global_count; i++) {
         const ObjGlobalSym *g = &mod->globals[i];
-        symlist_add(&syms, g->name, STB_LOCAL, STT_OBJECT, g->has_init ? SEC_DATA : SEC_BSS,
-                    g->offset, g->size);
+        int shndx = g->section ? extra_section_index(mod, g->section)
+                               : (g->has_init ? SEC_DATA : SEC_BSS);
+        symlist_add(&syms, g->name, STB_LOCAL, STT_OBJECT, shndx, g->offset, g->size);
     }
     int first_global = syms.count;
 
@@ -184,6 +209,9 @@ int obj_write_elf(const ObjModule *mod, const char *path) {
     size_t off_rodata = buf_add_str(&shstrtab, ".rodata");
     size_t off_data = buf_add_str(&shstrtab, ".data");
     size_t off_bss = buf_add_str(&shstrtab, ".bss");
+    size_t *off_extra = malloc((n_extra > 0 ? n_extra : 1) * sizeof(size_t));
+    for (int i = 0; i < n_extra; i++)
+        off_extra[i] = buf_add_str(&shstrtab, mod->extra_sections[i].name);
     size_t off_symtab = buf_add_str(&shstrtab, ".symtab");
     size_t off_strtab = buf_add_str(&shstrtab, ".strtab");
     size_t off_rela_text = buf_add_str(&shstrtab, ".rela.text");
@@ -200,6 +228,12 @@ int obj_write_elf(const ObjModule *mod, const char *path) {
     size_t off_data_data = file_off; file_off += mod->data.len;
     while (file_off % 8) file_off++;
     /* .bss occupies no file space (SHT_NOBITS) */
+    size_t *off_extra_data = malloc((n_extra > 0 ? n_extra : 1) * sizeof(size_t));
+    for (int i = 0; i < n_extra; i++) {
+        off_extra_data[i] = file_off;
+        file_off += mod->extra_sections[i].data.len;
+        while (file_off % 8) file_off++;
+    }
     size_t off_symtab_data = file_off; file_off += symtab.len;
     while (file_off % 8) file_off++;
     size_t off_strtab_data = file_off; file_off += strtab.len;
@@ -221,10 +255,10 @@ int obj_write_elf(const ObjModule *mod, const char *path) {
     eh.e_shoff = off_shdrs;
     eh.e_ehsize = sizeof(Elf64_Ehdr);
     eh.e_shentsize = sizeof(Elf64_Shdr);
-    eh.e_shnum = SEC_COUNT;
-    eh.e_shstrndx = SEC_SHSTRTAB;
+    eh.e_shnum = (uint16_t)SEC_COUNT;
+    eh.e_shstrndx = (uint16_t)SEC_SHSTRTAB;
 
-    Elf64_Shdr sh[SEC_COUNT] = {0};
+    Elf64_Shdr *sh = calloc((size_t)SEC_COUNT, sizeof(Elf64_Shdr));
     sh[SEC_TEXT] = (Elf64_Shdr){ .sh_name = (uint32_t)off_text, .sh_type = SHT_PROGBITS,
         .sh_flags = SHF_ALLOC | SHF_EXECINSTR, .sh_offset = off_text_data, .sh_size = mod->text.len,
         .sh_addralign = 16 };
@@ -234,13 +268,22 @@ int obj_write_elf(const ObjModule *mod, const char *path) {
         .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_offset = off_data_data, .sh_size = mod->data.len, .sh_addralign = 8 };
     sh[SEC_BSS] = (Elf64_Shdr){ .sh_name = (uint32_t)off_bss, .sh_type = SHT_NOBITS,
         .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_offset = off_data_data, .sh_size = mod->bss_size, .sh_addralign = 8 };
+    /* Extra sections (Limine et al.): PROGBITS, allocated + writable (the
+       bootloader fills in each request's `response` pointer at boot time),
+       8-byte aligned to match the uint64_t-heavy structs that live there. */
+    for (int i = 0; i < n_extra; i++) {
+        sh[SEC_FIXED_COUNT + i] = (Elf64_Shdr){ .sh_name = (uint32_t)off_extra[i],
+            .sh_type = SHT_PROGBITS, .sh_flags = SHF_ALLOC | SHF_WRITE,
+            .sh_offset = off_extra_data[i], .sh_size = mod->extra_sections[i].data.len,
+            .sh_addralign = 8 };
+    }
     sh[SEC_SYMTAB] = (Elf64_Shdr){ .sh_name = (uint32_t)off_symtab, .sh_type = SHT_SYMTAB,
-        .sh_offset = off_symtab_data, .sh_size = symtab.len, .sh_link = SEC_STRTAB,
+        .sh_offset = off_symtab_data, .sh_size = symtab.len, .sh_link = (uint32_t)SEC_STRTAB,
         .sh_info = (uint32_t)first_global, .sh_addralign = 8, .sh_entsize = sizeof(Elf64_Sym) };
     sh[SEC_STRTAB] = (Elf64_Shdr){ .sh_name = (uint32_t)off_strtab, .sh_type = SHT_STRTAB,
         .sh_offset = off_strtab_data, .sh_size = strtab.len, .sh_addralign = 1 };
     sh[SEC_RELA_TEXT] = (Elf64_Shdr){ .sh_name = (uint32_t)off_rela_text, .sh_type = SHT_RELA,
-        .sh_offset = off_rela_data, .sh_size = relas.len, .sh_link = SEC_SYMTAB, .sh_info = SEC_TEXT,
+        .sh_offset = off_rela_data, .sh_size = relas.len, .sh_link = (uint32_t)SEC_SYMTAB, .sh_info = SEC_TEXT,
         .sh_addralign = 8, .sh_entsize = sizeof(Elf64_Rela) };
     sh[SEC_NOTE_GNU_STACK] = (Elf64_Shdr){ .sh_name = (uint32_t)off_note_stack, .sh_type = SHT_PROGBITS,
         .sh_flags = 0, .sh_offset = off_shstrtab_data, .sh_size = 0, .sh_addralign = 1 };
@@ -250,7 +293,7 @@ int obj_write_elf(const ObjModule *mod, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) {
         buf_free(&strtab); buf_free(&relas); buf_free(&symtab); buf_free(&shstrtab);
-        free(name_off);
+        free(name_off); free(off_extra); free(off_extra_data); free(sh);
         for (int i = 0; i < syms.count; i++) free(syms.e[i].name);
         free(syms.e);
         return 0;
@@ -261,14 +304,21 @@ int obj_write_elf(const ObjModule *mod, const char *path) {
     #define PAD_TO(target) do { while (pos < (long)(target)) { fputc(0, f); pos++; } } while (0)
     fwrite(mod->text.data, 1, mod->text.len, f); pos += mod->text.len; PAD_TO(off_rodata_data);
     fwrite(mod->rodata.data, 1, mod->rodata.len, f); pos += mod->rodata.len; PAD_TO(off_data_data);
-    fwrite(mod->data.data, 1, mod->data.len, f); pos += mod->data.len; PAD_TO(off_symtab_data);
+    fwrite(mod->data.data, 1, mod->data.len, f); pos += mod->data.len;
+    if (n_extra > 0) PAD_TO(off_extra_data[0]); else PAD_TO(off_symtab_data);
+    for (int i = 0; i < n_extra; i++) {
+        fwrite(mod->extra_sections[i].data.data, 1, mod->extra_sections[i].data.len, f);
+        pos += mod->extra_sections[i].data.len;
+        PAD_TO(i + 1 < n_extra ? off_extra_data[i + 1] : off_symtab_data);
+    }
     fwrite(symtab.d, 1, symtab.len, f); pos += symtab.len; PAD_TO(off_strtab_data);
     fwrite(strtab.d, 1, strtab.len, f); pos += strtab.len; PAD_TO(off_rela_data);
     fwrite(relas.d, 1, relas.len, f); pos += relas.len; PAD_TO(off_shstrtab_data);
     fwrite(shstrtab.d, 1, shstrtab.len, f); pos += shstrtab.len; PAD_TO(off_shdrs);
-    fwrite(sh, sizeof(sh), 1, f);
+    fwrite(sh, sizeof(Elf64_Shdr), (size_t)SEC_COUNT, f);
     #undef PAD_TO
     fclose(f);
+    free(off_extra); free(off_extra_data); free(sh);
 
     buf_free(&strtab); buf_free(&relas); buf_free(&symtab); buf_free(&shstrtab);
     free(name_off);

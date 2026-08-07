@@ -188,6 +188,7 @@ typedef struct {
     /* String annotations */
     char      *str_extra;     /* callee name, var name, class, asm body  */
     char      *str_extra2;    /* field name, enum variant                */
+    char      *str_extra3;    /* IR_STATIC_VAR: @section("...") name, or NULL */
     int        extra_int;     /* is_main flag, TypeKind, PRINT_ARG_* … */
 
     /* Variable-arity argument list (CALL, NEW, ARRAY_INIT) */

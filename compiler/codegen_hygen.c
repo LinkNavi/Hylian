@@ -77,7 +77,19 @@ int codegen_hygen(IRModule *mod, const char *outfile,
 
     for (int i = 0; i < mir->global_count; i++) {
         MIRGlobalVar *g = &mir->globals[i];
-        obj_add_global(obj, g->name, g->has_init, g->init_val, g->size);
+        if (g->section) {
+            /* Custom-section global (e.g. a Limine boot-protocol request):
+               always written as explicit bytes, whether from a real
+               compile-time-folded initializer (init_bytes) or a value-less
+               declaration (falls back to init_val, typically 0). */
+            if (g->init_bytes) {
+                obj_add_global_bytes(obj, g->name, g->section, g->init_bytes, (size_t)g->size);
+            } else {
+                obj_add_global_bytes(obj, g->name, g->section, &g->init_val, (size_t)g->size);
+            }
+        } else {
+            obj_add_global(obj, g->name, g->has_init, g->init_val, g->size);
+        }
     }
 
     if (!obj_write_elf(obj, outfile)) {

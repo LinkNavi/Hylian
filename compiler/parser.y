@@ -12,6 +12,14 @@ extern int yylineno;
 const char *current_parse_file = "<unknown>";
 const char *current_compile_target = "linux";
 
+/* Set by an `@section("name")` attribute, consumed by the very next
+   static_var_decl reduction and cleared immediately after. A file-scope
+   "pending attribute" global rather than a real nonterminal wrapping every
+   static_var_decl production, so this doesn't have to be threaded through
+   (and doesn't risk new conflicts in) that already-combinatorial rule set —
+   same style as current_parse_file/current_compile_target above. */
+static char *pending_section = NULL;
+
 void yyerror(const char *s) {
     /* Hint logic — inspect the Bison-generated message for common patterns */
     const char *hint = NULL;
@@ -167,6 +175,7 @@ void typelist_add(TypeList* l, Type t) {
 %token VOLATILE PACKED NAKED USIZE ISIZE UNION_KW STRUCT
 %token TILDE LSHIFT RSHIFT XOR CAST SIZE_OF AS
 %token MODULE
+%token SECTION_ATTR
 %token <str> ASM_BLOCK
 %token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET SEMICOLON COMMA DOT QUESTION COLON
 %token ASSIGN DECLARE_ASSIGN
@@ -254,6 +263,7 @@ program:
         $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
         $$->declarations[$$->decl_count++] = (ASTNode*)$2;
     }
+    | program section_attr { $$ = $1; }
     | program module_decl {
         $$ = $1;
         $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
@@ -327,6 +337,26 @@ include_path:
     }
     ;
 
+/* @section("name") immediately before a static declaration. Doesn't build a
+   node of its own — it just stashes the section name in `pending_section`,
+   which the very next static_var_decl reduction reads and clears (see the
+   `sv->section = pending_section; pending_section = NULL;` line duplicated
+   into each static_var_decl production below). */
+section_attr:
+    SECTION_ATTR LPAREN STRING_LITERAL RPAREN {
+        char *raw = $3;
+        size_t len = strlen(raw);
+        free(pending_section);
+        if (len >= 2 && raw[0] == '"' && raw[len - 1] == '"') {
+            pending_section = malloc(len - 1);
+            memcpy(pending_section, raw + 1, len - 2);
+            pending_section[len - 2] = '\0';
+        } else {
+            pending_section = strdup(raw);
+        }
+    }
+    ;
+
 static_var_decl:
     STATIC type IDENTIFIER ASSIGN expr SEMICOLON {
         StaticVarNode *sv = malloc(sizeof(StaticVarNode));
@@ -336,6 +366,7 @@ static_var_decl:
         sv->var_name = $3;
         sv->initializer = $5;
         sv->is_const = 0; sv->array_size = 0;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     | STATIC type IDENTIFIER SEMICOLON {
@@ -346,6 +377,7 @@ static_var_decl:
         sv->var_name = $3;
         sv->initializer = NULL;
         sv->is_const = 0; sv->array_size = 0;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     | PUBLIC STATIC type IDENTIFIER ASSIGN expr SEMICOLON {
@@ -356,6 +388,7 @@ static_var_decl:
         sv->var_name = $4;
         sv->initializer = $6;
         sv->is_const = 0; sv->array_size = 0;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     | PUBLIC STATIC type IDENTIFIER SEMICOLON {
@@ -366,6 +399,7 @@ static_var_decl:
         sv->var_name = $4;
         sv->initializer = NULL;
         sv->is_const = 0; sv->array_size = 0;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     | CONST type IDENTIFIER ASSIGN expr SEMICOLON {
@@ -374,6 +408,7 @@ static_var_decl:
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $2; sv->var_name = $3; sv->initializer = $5;
         sv->is_const = 1; sv->array_size = 0;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     | PUBLIC CONST type IDENTIFIER ASSIGN expr SEMICOLON {
@@ -382,6 +417,7 @@ static_var_decl:
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $3; sv->var_name = $4; sv->initializer = $6;
         sv->is_const = 1; sv->array_size = 0;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     | STATIC type IDENTIFIER LBRACKET NUMBER RBRACKET SEMICOLON {
@@ -390,6 +426,7 @@ static_var_decl:
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $2; sv->var_name = $3;
         sv->initializer = NULL; sv->is_const = 0; sv->array_size = (int)$5;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     | PUBLIC STATIC type IDENTIFIER LBRACKET NUMBER RBRACKET SEMICOLON {
@@ -398,6 +435,7 @@ static_var_decl:
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $3; sv->var_name = $4;
         sv->initializer = NULL; sv->is_const = 0; sv->array_size = (int)$6;
+        sv->section = pending_section; pending_section = NULL;
         $$ = (ASTNode*)sv;
     }
     ;
@@ -760,6 +798,21 @@ field_decl:
     PRIVATE type IDENTIFIER SEMICOLON { $$ = make_field($2, $3, 0); }
     | PUBLIC type IDENTIFIER SEMICOLON  { $$ = make_field($2, $3, 1); }
     | type IDENTIFIER SEMICOLON         { $$ = make_field($1, $2, 0); }
+    /* Fixed-size array field, e.g. `uint64 id[4];` — ast_field_byte_width()/
+       ast_field_offset() in ast.c already understand TYPE_ARRAY fields with
+       fixed_size > 0 (addressed as a whole block, sized as width*count) -
+       this was only ever missing the grammar to actually declare one. Needed
+       for hardware descriptor tables (GDT/IDT) and boot-protocol request
+       structs (Limine's `id[4]` magic-number array) alike. */
+    | type IDENTIFIER LBRACKET NUMBER RBRACKET SEMICOLON {
+        $$ = make_field(make_array_type($1, (int)$4), $2, 0);
+    }
+    | PUBLIC type IDENTIFIER LBRACKET NUMBER RBRACKET SEMICOLON {
+        $$ = make_field(make_array_type($2, (int)$5), $3, 1);
+    }
+    | PRIVATE type IDENTIFIER LBRACKET NUMBER RBRACKET SEMICOLON {
+        $$ = make_field(make_array_type($2, (int)$5), $3, 0);
+    }
     ;
 
 method_decl:

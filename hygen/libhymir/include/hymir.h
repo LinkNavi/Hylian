@@ -179,6 +179,9 @@ typedef struct {
     int     has_init;
     int64_t init_val;
     int     size;
+    char   *section;      /* NULL = default (.data/.bss) placement */
+    unsigned char *init_bytes; /* NULL = use init_val; else `size` raw bytes
+                                   (e.g. a compile-time-folded struct literal) */
 } MIRGlobalVar;
 
 typedef struct {
@@ -218,6 +221,14 @@ const char *mir_module_intern_string(MIRModule *mod, const char *data, int len);
 
 /* declares a global variable (data or bss depending on has_init) */
 void mir_module_add_global(MIRModule *mod, const char *name, int has_init, int64_t init_val, int size);
+
+/* Like mir_module_add_global, but for a global that needs a custom link
+   section (section != NULL) and/or more than 8 bytes of real initialized
+   data (init_bytes != NULL, `size` bytes - overrides init_val). Either or
+   both of section/init_bytes may be NULL to fall back to plain behavior. */
+void mir_module_add_global_ex(MIRModule *mod, const char *name, int has_init,
+                              int64_t init_val, int size,
+                              const char *section, const unsigned char *init_bytes);
 
 const char *mir_op_name(MIROp op);
 void mir_dump(const MIRModule *mod, FILE *out);
