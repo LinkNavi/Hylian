@@ -134,6 +134,7 @@ IR_WRITE_CR,        // crN = src1  (extra_int = N)
 IR_SAVE_REGS,      // push all GPRs (ISR entry); extra_int=1 → also push dummy error code
 IR_RESTORE_REGS,    // pop all GPRs (ISR exit);  extra_int=1 → skip error-code slot first
 IR_IRET,            // iretq — return from interrupt
+IR_SYSRET,          // sysretq — return to userspace after a syscall
 IR_OUTB,   // outb port, val  — src1=port src2=val
 IR_INB,    // inb port        — dest=result src1=port
 IR_OUTW,   // outw port, val  — src1=port src2=val (16-bit)

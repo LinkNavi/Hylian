@@ -453,6 +453,8 @@ static Type infer_expr(ASTNode *node) {
       result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "iret") == 0) {
       result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "sysret") == 0) {
+      result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "outb") == 0) {
       result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "inb") == 0) {

@@ -548,31 +548,31 @@ void halt(void) {
 
 // ── Limine memmap / HHDM accessors (called from pmm.hy) ──────────────────────
 
-uint64_t hylian_hhdm_offset(void) {
+uint64_t hhdm_offset(void) {
     if (!hhdm_request.response) return 0;
     return hhdm_request.response->offset;
 }
 
 // Returns the number of memmap entries, or 0 if unavailable.
-uint64_t hylian_memmap_count(void) {
+uint64_t memmap_count(void) {
     if (!memmap_request.response) return 0;
     return memmap_request.response->entry_count;
 }
 
 // Returns the base address of memmap entry i.
-uint64_t hylian_memmap_base(uint64_t i) {
+uint64_t memmap_base(uint64_t i) {
     if (!memmap_request.response) return 0;
     return memmap_request.response->entries[i]->base;
 }
 
 // Returns the length in bytes of memmap entry i.
-uint64_t hylian_memmap_len(uint64_t i) {
+uint64_t memmap_len(uint64_t i) {
     if (!memmap_request.response) return 0;
     return memmap_request.response->entries[i]->length;
 }
 
 // Returns the type of memmap entry i (0 = usable).
-uint64_t hylian_memmap_type(uint64_t i) {
+uint64_t memmap_type(uint64_t i) {
     if (!memmap_request.response) return 0xFFFFFFFFFFFFFFFFULL;
     return memmap_request.response->entries[i]->type;
 }

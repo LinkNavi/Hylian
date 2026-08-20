@@ -152,6 +152,7 @@ const char *ir_opcode_name(IROpcode op) {
     case IR_SAVE_REGS:      return "SAVE_REGS";
     case IR_RESTORE_REGS:   return "RESTORE_REGS";
     case IR_IRET:           return "IRET";
+    case IR_SYSRET:         return "SYSRET";
     case IR_OUTB:           return "OUTB";
     case IR_INB:            return "INB";
     case IR_ARENA_ALLOC:    return "ARENA_ALLOC";

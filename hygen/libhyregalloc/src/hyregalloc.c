@@ -66,7 +66,7 @@ static OpShape op_shape(MIROp op) {
         /* dest/src1/src2 all reads here (ptr, val-or-src, count) - see ir_to_mir.c */
         s.has_def = 0; s.dest_is_use = 1; s.use_src1 = 1; s.use_src2 = 1;
         break;
-    case MIR_CLI: case MIR_STI: case MIR_IRET:
+    case MIR_CLI: case MIR_STI: case MIR_IRET: case MIR_SYSRET:
     case MIR_SAVE_REGS: case MIR_RESTORE_REGS:
     case MIR_NOP: case MIR_ASM_RAW:
         s.has_def = 0; s.use_src1 = 0; s.use_src2 = 0;
@@ -90,7 +90,7 @@ typedef struct {
 
 static int is_terminator_op(MIROp op) {
     return op == MIR_RET || op == MIR_JMP || op == MIR_JMP_IF || op == MIR_JMP_UNLESS
-        || op == MIR_IRET;
+        || op == MIR_IRET || op == MIR_SYSRET;
 }
 
 typedef struct {
@@ -157,7 +157,7 @@ static CFG build_cfg(const MIRFunc *fn) {
                 blk->succ[blk->succ_count++] = label_to_block[lbl];
             }
             if (bi + 1 < nblocks) blk->succ[blk->succ_count++] = bi + 1;
-        } else if (lastop == MIR_RET || lastop == MIR_IRET) {
+        } else if (lastop == MIR_RET || lastop == MIR_IRET || lastop == MIR_SYSRET) {
             /* no successors */
         } else {
             if (bi + 1 < nblocks) blk->succ[blk->succ_count++] = bi + 1;

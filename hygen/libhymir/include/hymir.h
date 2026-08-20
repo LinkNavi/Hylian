@@ -93,7 +93,7 @@ typedef enum {
 
     /* raw / privileged escape hatch - kept 1:1 with old IR intent */
     MIR_ASM_RAW,    /* opaque byte-emit callback registered by frontend, see hymir_raw_fn */
-    MIR_CLI, MIR_STI, MIR_IRET, MIR_HLT,
+    MIR_CLI, MIR_STI, MIR_IRET, MIR_SYSRET, MIR_HLT,
     MIR_LGDT, MIR_LIDT, MIR_LTR, MIR_INVLPG,
     MIR_WRMSR, MIR_RDMSR,
     MIR_READ_CR, MIR_WRITE_CR,

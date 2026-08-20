@@ -28,11 +28,11 @@
 // It works because Hylian locals are 8-byte slots and x86 is little-endian,
 // so the value's low byte lands at the start of the slot's address.
 
-naked void hylian_print(usize str_ptr, usize len) {
+void hylian_print(usize str_ptr, usize len) {
     syscall(1, 1, cast<int>(str_ptr), cast<int>(len));
 }
 
-naked void hylian_println(usize str_ptr, usize len) {
+void hylian_println(usize str_ptr, usize len) {
     syscall(1, 1, cast<int>(str_ptr), cast<int>(len));
     usize newline = cast<usize>(10);
     usize newline_addr = cast<usize>(&newline);
@@ -52,7 +52,7 @@ naked void hylian_println(usize str_ptr, usize len) {
 // destination ranges can overlap, but the copy runs front-to-back and the
 // destination index is always <= the source index, so a byte is only ever
 // overwritten after it has already been read.
-naked int hylian_int_to_str(int val, usize buf, int buflen) {
+int hylian_int_to_str(int val, usize buf, int buflen) {
     if (buflen <= 0) {
         return 0;
     }

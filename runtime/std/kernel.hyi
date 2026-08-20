@@ -73,6 +73,13 @@ fn restore_regs()
 // Return from an interrupt handler (iretq).
 fn iret()
 
+// Return to userspace after a syscall (sysretq). rcx must hold the
+// userspace return address and r11 the userspace rflags - the CPU sets
+// both automatically on the `syscall` instruction that got you here, and
+// save_regs()/restore_regs() preserve them across the handler body as long
+// as the handler doesn't clobber rcx/r11 itself after restore_regs().
+fn sysret()
+
 // Fill a block of memory with a byte value.
 // ptr: pointer to the memory block
 // val: byte value to fill (0–255)

@@ -611,7 +611,55 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
         case MIR_CLI: enc_cli(out_code); break;
         case MIR_STI: enc_sti(out_code); break;
         case MIR_IRET: enc_iretq(out_code); break;
+        case MIR_SYSRET: enc_sysretq(out_code); break;
         case MIR_HLT: enc_hlt(out_code); break;
+
+        /* save_regs()/restore_regs() - the asm-free way to write an ISR body.
+           Pushes/pops every GPR but rsp, so the handler can freely clobber
+           registers between the two calls. extra_int=1 means "this vector
+           has no CPU-pushed error code" - save_regs(1) pushes a dummy 0
+           first so the stack layout matches vectors that do get one, and
+           restore_regs(1) drops that slot (or the real error code) before
+           the caller's iret(). Order is a mirror image so save/restore always
+           pair up regardless of which variant is used. */
+        case MIR_SAVE_REGS: {
+            if (ins->extra_int) enc_push_imm32(out_code, 0);
+            enc_push(out_code, X64_RAX);
+            enc_push(out_code, X64_RBX);
+            enc_push(out_code, X64_RCX);
+            enc_push(out_code, X64_RDX);
+            enc_push(out_code, X64_RSI);
+            enc_push(out_code, X64_RDI);
+            enc_push(out_code, X64_RBP);
+            enc_push(out_code, X64_R8);
+            enc_push(out_code, X64_R9);
+            enc_push(out_code, X64_R10);
+            enc_push(out_code, X64_R11);
+            enc_push(out_code, X64_R12);
+            enc_push(out_code, X64_R13);
+            enc_push(out_code, X64_R14);
+            enc_push(out_code, X64_R15);
+            break;
+        }
+        case MIR_RESTORE_REGS: {
+            enc_pop(out_code, X64_R15);
+            enc_pop(out_code, X64_R14);
+            enc_pop(out_code, X64_R13);
+            enc_pop(out_code, X64_R12);
+            enc_pop(out_code, X64_R11);
+            enc_pop(out_code, X64_R10);
+            enc_pop(out_code, X64_R9);
+            enc_pop(out_code, X64_R8);
+            enc_pop(out_code, X64_RBP);
+            enc_pop(out_code, X64_RDI);
+            enc_pop(out_code, X64_RSI);
+            enc_pop(out_code, X64_RDX);
+            enc_pop(out_code, X64_RCX);
+            enc_pop(out_code, X64_RBX);
+            enc_pop(out_code, X64_RAX);
+            if (ins->extra_int) enc_alu_ri32(out_code, ALU_ADD, X64_RSP, 8);
+            break;
+        }
 
         case MIR_OUTB: {
             load_operand(&ctx, ins->src1, X64_RDX); /* port in DX */

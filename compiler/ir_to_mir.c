@@ -327,6 +327,9 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
             tenv_clear_temps(&env);
             fn = mir_func_new(mod, ins->str_extra ? ins->str_extra : "?");
             fn->param_count = ins->param_count;
+            /* bit0 = is_main, bit1 = is_naked - see lower.c's
+               `begin->extra_int = is_main | (is_naked << 1);` */
+            fn->is_naked = (ins->extra_int >> 1) & 1;
             /* keep mir_new_vreg()'s ids clear of the IR temp ids we reuse verbatim */
             fn->vreg_count = scan_func_max_temp(ir, i);
             next_synth_label = scan_func_max_label(ir, i);
@@ -928,10 +931,23 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
                    a value-less declaration still needs has_init=1 to get its
                    (zero) bytes written into that section rather than treated
                    as uninitialized. */
-                mir_module_add_global_ex(mod, ins->str_extra, 1, init_val, 8,
+                int sec_elem_size = mir_type_size(type_name_to_mir(ins->str_extra2));
+                int sec_array_size = ins->extra_int >> 1;
+                int sec_total_size = sec_array_size > 0 ? sec_array_size * sec_elem_size : sec_elem_size;
+                mir_module_add_global_ex(mod, ins->str_extra, 1, init_val, sec_total_size,
                                          ins->str_extra3, NULL);
             } else {
-                mir_module_add_global(mod, ins->str_extra, has_init, init_val, 8);
+                /* extra_int packs is_const in bit 0 and array_size in the
+                   remaining bits (see lower.c's
+                   `ins->extra_int = (sv->is_const ? 1 : 0) | (sv->array_size << 1);`).
+                   Without this, `static uint8 idt_table[4096];` reserved a
+                   flat 8 bytes no matter the element count or width, so any
+                   write past the first 8 bytes silently clobbered whatever
+                   static happened to be linked right after it. */
+                int elem_size = mir_type_size(type_name_to_mir(ins->str_extra2));
+                int array_size = ins->extra_int >> 1;
+                int total_size = array_size > 0 ? array_size * elem_size : elem_size;
+                mir_module_add_global(mod, ins->str_extra, has_init, init_val, total_size);
             }
             tenv_set_var(&env, ins->str_extra, type_name_to_mir(ins->str_extra2));
             break;
@@ -961,6 +977,7 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         case IR_STI: mir_emit(fn, MIR_STI); break;
         case IR_HLT: mir_emit(fn, MIR_HLT); break;
         case IR_IRET: mir_emit(fn, MIR_IRET); break;
+        case IR_SYSRET: mir_emit(fn, MIR_SYSRET); break;
 
         case IR_LGDT: case IR_LIDT: {
             /* The real lgdt/lidt instructions take a pointer to an

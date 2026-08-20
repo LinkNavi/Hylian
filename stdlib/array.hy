@@ -37,15 +37,15 @@ static int ARRAY_HEADER_SIZE = 24;
 static int ARRAY_ELEM_SIZE   = 8;
 static int ARRAY_MIN_CAP     = 8;
 
-naked usize _arr_raw_alloc(int size) {
+usize _arr_raw_alloc(int size) {
     return cast<usize>(syscall(9, 0, size, 3, 34, -1, 0));
 }
 
-naked void _arr_raw_free(usize ptr, int size) {
+void _arr_raw_free(usize ptr, int size) {
     syscall(11, cast<int>(ptr), size, 0);
 }
 
-naked usize _arr_load(usize addr) {
+usize _arr_load(usize addr) {
     usize v;
     unsafe {
         *usize p = cast<*usize>(addr);
@@ -54,7 +54,7 @@ naked usize _arr_load(usize addr) {
     return v;
 }
 
-naked void _arr_store(usize addr, usize value) {
+void _arr_store(usize addr, usize value) {
     unsafe {
         *usize p = cast<*usize>(addr);
         *p = value;
@@ -62,7 +62,7 @@ naked void _arr_store(usize addr, usize value) {
 }
 
 // hylian_array_alloc: new empty array with room for at least `hint` elements.
-naked usize hylian_array_alloc(int hint) {
+usize hylian_array_alloc(int hint) {
     int cap = hint;
     if (cap < ARRAY_MIN_CAP) { cap = ARRAY_MIN_CAP; }
 
@@ -78,7 +78,7 @@ naked usize hylian_array_alloc(int hint) {
 // hylian_array_free: release an array's storage. Not emitted by the compiler
 // (arrays currently live for the life of the process), but needed by any code
 // that builds a lot of short-lived arrays and wants the memory back.
-naked void hylian_array_free(usize arr) {
+void hylian_array_free(usize arr) {
     if (arr == cast<usize>(0)) { return; }
     usize cap = _arr_load(arr + cast<usize>(8));
     usize data = _arr_load(arr + cast<usize>(16));
@@ -88,7 +88,7 @@ naked void hylian_array_free(usize arr) {
 
 // _arr_grow: make room for at least `needed` elements, doubling each time so
 // repeated pushes stay amortised O(1) rather than copying on every append.
-naked void _arr_grow(usize arr, int needed) {
+void _arr_grow(usize arr, int needed) {
     usize cap = _arr_load(arr + cast<usize>(8));
     if (cast<int>(cap) >= needed) { return; }
 
@@ -115,7 +115,7 @@ naked void _arr_grow(usize arr, int needed) {
 }
 
 // hylian_array_push: append one element.
-naked void hylian_array_push(usize arr, usize value) {
+void hylian_array_push(usize arr, usize value) {
     if (arr == cast<usize>(0)) { return; }
     usize len = _arr_load(arr);
     _arr_grow(arr, cast<int>(len) + 1);
@@ -126,7 +126,7 @@ naked void hylian_array_push(usize arr, usize value) {
 }
 
 // hylian_array_pop: remove and return the last element, or 0 if empty.
-naked usize hylian_array_pop(usize arr) {
+usize hylian_array_pop(usize arr) {
     if (arr == cast<usize>(0)) { return cast<usize>(0); }
     usize len = _arr_load(arr);
     if (len == cast<usize>(0)) { return cast<usize>(0); }
@@ -143,7 +143,7 @@ naked usize hylian_array_pop(usize arr) {
 // Returning 0 rather than reading past the end is deliberate: Hylian has no
 // exceptions and no panic-on-index yet, so the alternative to a bounds check
 // here is an out-of-bounds read that corrupts or crashes somewhere unrelated.
-naked usize hylian_array_get(usize arr, int idx) {
+usize hylian_array_get(usize arr, int idx) {
     if (arr == cast<usize>(0)) { return cast<usize>(0); }
     if (idx < 0) { return cast<usize>(0); }
     usize len = _arr_load(arr);
@@ -155,7 +155,7 @@ naked usize hylian_array_get(usize arr, int idx) {
 
 // hylian_array_set: overwrite the element at `idx`. Out-of-range writes are
 // ignored rather than corrupting memory, for the same reason as get.
-naked void hylian_array_set(usize arr, int idx, usize value) {
+void hylian_array_set(usize arr, int idx, usize value) {
     if (arr == cast<usize>(0)) { return; }
     if (idx < 0) { return; }
     usize len = _arr_load(arr);

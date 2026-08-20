@@ -276,6 +276,48 @@ if [ ! -d "./stdlib/platform" ] || [ -z "$(find ./stdlib/platform -type f 2>/dev
     warn "No platform files found in ./stdlib/platform/"
 fi
 
+# ── Step 6: Build & install kernel-dev runtime objects ────────────────────────
+#
+# runtime/platform/{limine,kernel}.c are freestanding runtime support objects
+# for `--freestanding --target limine` (and the older non-Limine `kernel`
+# target) - not part of ./stdlib, so the walk above never sees them. zora's
+# HylianBuilder looks for limine.o/limine.ld at exactly ${PLATFORM_DIR}, so a
+# kernel target can't link without this step.
+
+step "Building kernel-dev runtime objects"
+
+KERNEL_CFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -mno-red-zone -mcmodel=kernel -fno-pic"
+
+if [ -f "./runtime/platform/limine.c" ]; then
+    if gcc -c ./runtime/platform/limine.c -o ./runtime/platform/limine.o $KERNEL_CFLAGS; then
+        maybe_sudo "$PLATFORM_DIR" -- cp ./runtime/platform/limine.o "${PLATFORM_DIR}/limine.o"
+        maybe_sudo "$PLATFORM_DIR" -- cp ./runtime/platform/limine.ld "${PLATFORM_DIR}/limine.ld"
+        ok "Limine runtime support  →  ${PLATFORM_DIR}/{limine.o,limine.ld}"
+    else
+        fail "Failed to compile runtime/platform/limine.c"
+    fi
+else
+    warn "runtime/platform/limine.c not found - skipping Limine runtime support"
+fi
+
+if [ -f "./runtime/platform/kernel.c" ]; then
+    if gcc -c ./runtime/platform/kernel.c -o ./runtime/platform/kernel.o $KERNEL_CFLAGS; then
+        maybe_sudo "$PLATFORM_DIR" -- cp ./runtime/platform/kernel.o "${PLATFORM_DIR}/kernel.o"
+        ok "Non-Limine kernel runtime support  →  ${PLATFORM_DIR}/kernel.o"
+    else
+        fail "Failed to compile runtime/platform/kernel.c"
+    fi
+fi
+
+# `include { std.kernel }` resolves against <inst_std>/kernel.hyi for an
+# installed toolchain (compiler.c's candidate 5) - without this, hhdm_offset/
+# memmap_*/read_cr/write_cr/save_regs/etc. fail typecheck as undefined
+# functions for any kernel project outside the Hylian source tree itself.
+if [ -f "./runtime/std/kernel.hyi" ]; then
+    maybe_sudo "$STD_DIR" -- cp ./runtime/std/kernel.hyi "${STD_DIR}/kernel.hyi"
+    ok "std.kernel interface  →  ${STD_DIR}/kernel.hyi"
+fi
+
 
 # ── Step 7: Smoke test ────────────────────────────────────────────────────────
 

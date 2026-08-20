@@ -204,6 +204,7 @@ const char *mir_op_name(MIROp op) {
     case MIR_CALL: return "call"; case MIR_RET: return "ret";
     case MIR_ASM_RAW: return "asm_raw";
     case MIR_CLI: return "cli"; case MIR_STI: return "sti"; case MIR_IRET: return "iret";
+    case MIR_SYSRET: return "sysret";
     case MIR_HLT: return "hlt";
     case MIR_LGDT: return "lgdt"; case MIR_LIDT: return "lidt";
     case MIR_LTR: return "ltr"; case MIR_INVLPG: return "invlpg";
@@ -260,7 +261,7 @@ MIRInstr *mir_build_call(MIRFunc *fn, const char *callee, MIRValue *args, int ar
 
 static int is_terminator(MIROp op) {
     return op == MIR_RET || op == MIR_JMP || op == MIR_JMP_IF || op == MIR_JMP_UNLESS
-        || op == MIR_IRET;
+        || op == MIR_IRET || op == MIR_SYSRET;
 }
 
 static int is_float_op(MIROp op) {

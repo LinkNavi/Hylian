@@ -1178,6 +1178,12 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->dest = irop_temp(t);
             return t;
         }
+        if (strcmp(call->name, "sysret") == 0) {
+            int t = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_SYSRET);
+            ins->dest = irop_temp(t);
+            return t;
+        }
         if (strcmp(call->name, "outb") == 0 && call->arg_count >= 2) {
             int tport = lower_expr(call->args[0], s);
             int tval  = lower_expr(call->args[1], s);
@@ -2251,6 +2257,37 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 }
 
 
+/* The pure-Hylian implementation of `new`'s own arena machinery
+   (stdlib/mem.hy, plus array.hy's and runtime.hy's equally early-bootstrap
+   allocator/print primitives). Every non-naked function's prologue calls
+   arena_init(slot) and its epilogue calls arena_free(slot) - fine for
+   ordinary code, but fatal for these specific functions: arena_init calling
+   arena_init (via its own auto-injected prologue) recurses forever, and the
+   same cycle reaches every function below it in the bootstrap chain. These
+   used to be marked `naked` for exactly this reason, but `naked` also
+   (correctly, now that it actually does what its name says) skips SysV
+   param-to-local-slot copying and frame setup, which these ordinary
+   parameter-taking functions need. So the arena bypass is keyed on name
+   here instead, leaving `naked` free to mean what it says for real ISR/
+   syscall-entry code. */
+static int is_arena_bootstrap_fn(const char *name) {
+    if (!name) return 0;
+    static const char *names[] = {
+        "arena_init", "arena_alloc", "arena_free", "_arena_new_block",
+        "_mem_raw_alloc", "_mem_raw_free",
+        "hylian_multi_alloc", "hylian_make_err", "Error_message",
+        "_arr_raw_alloc", "_arr_raw_free", "_arr_load", "_arr_store",
+        "hylian_array_alloc", "hylian_array_free", "_arr_grow",
+        "hylian_array_push", "hylian_array_pop",
+        "hylian_array_get", "hylian_array_set",
+        "hylian_print", "hylian_println", "hylian_int_to_str",
+        NULL
+    };
+    for (int i = 0; names[i]; i++)
+        if (strcmp(name, names[i]) == 0) return 1;
+    return 0;
+}
+
 static void lower_func_body(
     const char  *name,
     ASTNode    **params,    int param_count,
@@ -2267,7 +2304,10 @@ static void lower_func_body(
     s->struct_param_count = 0;
     s->local_static_alias_count = 0;  /* fresh alias table per function */
     s->in_unsafe   = 0;
-    s->has_arena   = !is_naked;       /* naked functions skip arena entirely */
+    /* naked functions skip arena entirely; so do the arena/print bootstrap
+       primitives themselves, by name, to avoid recursing into their own
+       auto-injected arena_init/arena_free calls (see is_arena_bootstrap_fn). */
+    s->has_arena   = !is_naked && !is_arena_bootstrap_fn(name);
 
     /* IR_FUNC_BEGIN.
        ir_emit() may realloc() mod->instrs, which invalidates every IRInstr*

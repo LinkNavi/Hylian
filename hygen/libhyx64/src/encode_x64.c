@@ -237,6 +237,11 @@ void enc_push(X64Buf *b, X64Reg reg) {
     x64_buf_push(b, (uint8_t)(0x50 + (reg & 7)));
 }
 
+void enc_push_imm32(X64Buf *b, int32_t imm) {
+    x64_buf_push(b, 0x68);
+    x64_buf_write32(b, (uint32_t)imm);
+}
+
 void enc_pop(X64Buf *b, X64Reg reg) {
     if (reg >= 8) x64_buf_push(b, 0x41);
     x64_buf_push(b, (uint8_t)(0x58 + (reg & 7)));
@@ -279,6 +284,7 @@ void enc_cli(X64Buf *b) { x64_buf_push(b, 0xFA); }
 void enc_sti(X64Buf *b) { x64_buf_push(b, 0xFB); }
 void enc_hlt(X64Buf *b) { x64_buf_push(b, 0xF4); }
 void enc_iretq(X64Buf *b) { x64_buf_push(b, 0x48); x64_buf_push(b, 0xCF); }
+void enc_sysretq(X64Buf *b) { x64_buf_push(b, 0x48); x64_buf_push(b, 0x0F); x64_buf_push(b, 0x07); }
 void enc_in_al_dx(X64Buf *b) { x64_buf_push(b, 0xEC); }
 void enc_out_dx_al(X64Buf *b) { x64_buf_push(b, 0xEE); }
 /* 16-bit port I/O - same opcodes as the 8-bit forms, with the operand-size

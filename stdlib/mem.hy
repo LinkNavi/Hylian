@@ -41,15 +41,15 @@ static int ARENA_BLOCK_SIZE  = 65536;
 // can reuse the block machinery above instead of duplicating it.
 static usize MULTI_ARENA = 0;
 
-naked usize _mem_raw_alloc(int size) {
+usize _mem_raw_alloc(int size) {
     return cast<usize>(syscall(9, 0, size, 3, 34, -1, 0));
 }
 
-naked void _mem_raw_free(usize ptr, int size) {
+void _mem_raw_free(usize ptr, int size) {
     syscall(11, cast<int>(ptr), size, 0);
 }
 
-naked usize _arena_new_block(usize min_size) {
+usize _arena_new_block(usize min_size) {
     usize sz = min_size;
     if (sz < cast<usize>(ARENA_BLOCK_SIZE)) {
         sz = cast<usize>(ARENA_BLOCK_SIZE);
@@ -65,14 +65,14 @@ naked usize _arena_new_block(usize min_size) {
     return block;
 }
 
-naked void arena_init(usize slot) {
+void arena_init(usize slot) {
     usize block = _arena_new_block(cast<usize>(ARENA_BLOCK_SIZE));
     unsafe {
         *cast<*usize>(slot) = block;
     }
 }
 
-naked usize arena_alloc(usize slot, usize size) {
+usize arena_alloc(usize slot, usize size) {
     usize aligned = ((size + cast<usize>(7)) / cast<usize>(8)) * cast<usize>(8);
 
     usize block;
@@ -128,7 +128,7 @@ naked usize arena_alloc(usize slot, usize size) {
 // freed on return. Nothing frees MULTI_ARENA — multis leak by design for now,
 // which is a real limitation but a predictable one, and far better than the
 // use-after-free that arena-allocating them would produce.
-naked usize hylian_multi_alloc(usize tag, usize value) {
+usize hylian_multi_alloc(usize tag, usize value) {
     usize slot = cast<usize>(&MULTI_ARENA);
     if (MULTI_ARENA == cast<usize>(0)) {
         arena_init(slot);
@@ -156,7 +156,7 @@ naked usize hylian_multi_alloc(usize tag, usize value) {
 // Allocated from the same process-lifetime arena as multi values: an Error is
 // routinely returned upwards out of the function that created it, so it cannot
 // live in that function's own arena, which is freed on return.
-naked usize hylian_make_err(usize msg_ptr) {
+usize hylian_make_err(usize msg_ptr) {
     usize slot = cast<usize>(&MULTI_ARENA);
     if (MULTI_ARENA == cast<usize>(0)) {
         arena_init(slot);
@@ -170,7 +170,7 @@ naked usize hylian_make_err(usize msg_ptr) {
 
 // Error_message: the message an Error carries. Returns nil for a nil Error
 // rather than dereferencing it, so `e.message()` on a success value is safe.
-naked usize Error_message(usize err) {
+usize Error_message(usize err) {
     if (err == cast<usize>(0)) { return cast<usize>(0); }
     usize msg;
     unsafe {
@@ -179,7 +179,7 @@ naked usize Error_message(usize err) {
     return msg;
 }
 
-naked void arena_free(usize slot) {
+void arena_free(usize slot) {
     usize block;
     unsafe {
         block = *cast<*usize>(slot);

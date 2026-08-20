@@ -62,6 +62,7 @@ void enc_movzx_r64_r8(X64Buf *b, X64Reg dst, X64Reg src);
 void enc_ext_rr(X64Buf *b, X64Reg dst, X64Reg src, int src_size, int is_signed);
 
 void enc_push(X64Buf *b, X64Reg reg);
+void enc_push_imm32(X64Buf *b, int32_t imm);
 void enc_pop(X64Buf *b, X64Reg reg);
 void enc_ret(X64Buf *b);
 void enc_leave(X64Buf *b); /* mov rsp,rbp; pop rbp in one byte */
@@ -74,6 +75,7 @@ void enc_syscall(X64Buf *b);
 void enc_cli(X64Buf *b);
 void enc_sti(X64Buf *b);
 void enc_iretq(X64Buf *b);
+void enc_sysretq(X64Buf *b);
 void enc_hlt(X64Buf *b);
 void enc_in_al_dx(X64Buf *b);
 void enc_out_dx_al(X64Buf *b);
