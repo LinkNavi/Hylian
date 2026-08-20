@@ -49,4 +49,20 @@ typedef struct {
    Pass NULL/0 to clear. */
 void tc_set_externals(const TCExternal *ext, int count);
 
+/* Struct/class fields the LSP knows about from a source it can't merge into
+ * the AST it typechecks (vendor .hyi files scanned as text). Without this,
+ * member access on a vendor type (e.g. `color.r` on raylib's `Color`) has
+ * nowhere to look the field up and gets a false "no field 'r' on type
+ * 'Color'" — register_field() only ever sees fields declared in the
+ * program being typechecked itself. */
+typedef struct {
+    const char *class_name;
+    const char *field_name;
+    const char *type_name;  /* NULL/empty = unknown, resolved permissively */
+} TCExternalField;
+
+/* Borrowed, not copied — the array must outlive the typecheck() call.
+   Pass NULL/0 to clear. */
+void tc_set_external_fields(const TCExternalField *fields, int count);
+
 #endif

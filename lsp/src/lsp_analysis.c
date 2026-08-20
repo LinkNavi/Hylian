@@ -1763,14 +1763,18 @@ void lsp_project_update_file(LspProject *proj,
             if (it->kind == COMPLETE_FUNCTION || it->kind == COMPLETE_METHOD) {
                 parse_c_sig(it->detail, ret, name);
                 kind = TC_EXT_FUNC;
-            } else if (it->kind == COMPLETE_VARIABLE || it->kind == COMPLETE_FIELD) {
+            } else if (it->kind == COMPLETE_VARIABLE) {
                 /* constants like STDERR_FD, O_RDONLY, NR_WRITE */
                 snprintf(ret, sizeof(ret), "%s", it->detail[0] ? it->detail : "int");
                 kind = TC_EXT_VAR;
             } else if (it->kind == COMPLETE_MODULE) {
                 kind = TC_EXT_MODULE;
             } else {
-                continue; /* classes/enums are types, resolved separately */
+                /* COMPLETE_FIELD (struct fields) are handled below via
+                   tc_set_external_fields — they're only valid as `obj.field`,
+                   not as bare identifiers, so they don't belong here.
+                   Classes/enums are types, resolved separately. */
+                continue;
             }
 
             /* The index stores methods as "Class.method"; the typechecker wants
@@ -1948,10 +1952,46 @@ void lsp_project_update_file(LspProject *proj,
         /* Real stdlib symbols, parsed from source with the shared frontend. */
         register_stdlib_externals(proj, &exts, &ext_count);
 
+        /* Struct fields from vendor .hyi scans — registered separately from
+           `exts` above (see the COMPLETE_FIELD skip in step 2) so `r` isn't
+           also offered as a bare global variable; `obj.r` is the only valid
+           use of a field name. */
+        TCExternalField *extfields = NULL;
+        int extfield_count = 0;
+        for (int i = 0; i < proj->stdlib_completion_count; i++)
+        {
+            CompletionItem *it = &proj->stdlib_completions[i];
+            if (it->kind != COMPLETE_FIELD)
+                continue;
+            const char *dot = strchr(it->label, '.');
+            if (!dot)
+                continue; /* the bare short-name copy; qualified one carries the class */
+
+            char cls[128];
+            int cls_len = (int)(dot - it->label);
+            if (cls_len <= 0 || cls_len >= (int)sizeof(cls))
+                continue;
+            memcpy(cls, it->label, cls_len);
+            cls[cls_len] = '\0';
+
+            char ftype[64] = "", fname[128] = "";
+            sscanf(it->detail, "%63s %127s", ftype, fname);
+            if (!fname[0])
+                continue;
+
+            extfields = realloc(extfields, (extfield_count + 1) * sizeof(TCExternalField));
+            extfields[extfield_count].class_name = strdup(cls);
+            extfields[extfield_count].field_name = strdup(fname);
+            extfields[extfield_count].type_name = strdup(ftype);
+            extfield_count++;
+        }
+
         /* One typechecker for the CLI and the LSP; the externals carry the
            stdlib symbols this buffer's includes would have provided. */
         tc_set_externals(exts, ext_count);
+        tc_set_external_fields(extfields, extfield_count);
         typecheck(pf->program, filepath);
+        tc_set_external_fields(NULL, 0);
         tc_set_externals(NULL, 0);
 
         for (int i = 0; i < ext_count; i++)
@@ -1960,6 +2000,14 @@ void lsp_project_update_file(LspProject *proj,
             free((char *)exts[i].type_name);
         }
         free(exts);
+
+        for (int i = 0; i < extfield_count; i++)
+        {
+            free((char *)extfields[i].class_name);
+            free((char *)extfields[i].field_name);
+            free((char *)extfields[i].type_name);
+        }
+        free(extfields);
     }
 
     pf->diag_count = lsp_diag_count < LSP_DIAG_MAX

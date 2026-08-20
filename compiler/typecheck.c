@@ -212,6 +212,24 @@ static const TCExternal *ext_find(const char *name, TCExternalKind kind) {
   return NULL;
 }
 
+static const TCExternalField *g_ext_fields = NULL;
+static int                    g_ext_field_count = 0;
+
+void tc_set_external_fields(const TCExternalField *fields_in, int count) {
+  g_ext_fields = fields_in;
+  g_ext_field_count = fields_in ? count : 0;
+}
+
+static const TCExternalField *ext_field_find(const char *class_name, const char *fname) {
+  if (!g_ext_fields || !class_name || !fname) return NULL;
+  for (int i = 0; i < g_ext_field_count; i++)
+    if (g_ext_fields[i].class_name && g_ext_fields[i].field_name &&
+        strcmp(g_ext_fields[i].class_name, class_name) == 0 &&
+        strcmp(g_ext_fields[i].field_name, fname) == 0)
+      return &g_ext_fields[i];
+  return NULL;
+}
+
 /* Resolve an external's declared type name into a Type, defaulting to a
    permissive "unknown"-ish int rather than erroring: the LSP's index carries
    type names as free text, and being wrong about a type is much less harmful
@@ -613,7 +631,13 @@ static Type infer_expr(ASTNode *node) {
         if (fe) {
           result = fe->field_type;
         } else {
-          tc_error(node->line, "no field '%s' on type '%s'", ma->member, obj_type.name);
+          const TCExternalField *ef = ext_field_find(obj_type.name, ma->member);
+          if (ef) {
+            result = make_simple_type(
+                (char *)(ef->type_name && ef->type_name[0] ? ef->type_name : "int"), 0);
+          } else {
+            tc_error(node->line, "no field '%s' on type '%s'", ma->member, obj_type.name);
+          }
         }
       }
     }

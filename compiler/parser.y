@@ -1078,6 +1078,24 @@ for_init:
 var_decl:
     type IDENTIFIER ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_var_decl($1, $2, $4); }
     | type IDENTIFIER SEMICOLON           { $$ = (ASTNode*)make_var_decl($1, $2, NULL); }
+    /* struct literal with the type name inferred from the declared type:
+       `Color bleh = { r: 1, ... };` instead of `Color bleh = Color { ... };` */
+    | type IDENTIFIER ASSIGN LBRACE field_init_list RBRACE SEMICOLON {
+        StructLiteralNode *sl = malloc(sizeof(StructLiteralNode));
+        sl->base.type = NODE_STRUCT_LITERAL;
+        memset(&sl->base.resolved_type, 0, sizeof(Type));
+        sl->class_name = strdup($1.name ? $1.name : "");
+        NodeList *fl = (NodeList*)$5;
+        sl->field_count  = fl->count / 2;
+        sl->field_names  = malloc(sl->field_count * sizeof(char*));
+        sl->field_values = malloc(sl->field_count * sizeof(ASTNode*));
+        for (int i = 0; i < sl->field_count; i++) {
+            sl->field_names[i]  = ((IdentifierNode*)fl->items[i*2])->name;
+            sl->field_values[i] = fl->items[i*2+1];
+        }
+        free(fl->items); free(fl);
+        $$ = (ASTNode*)make_var_decl($1, $2, (ASTNode*)sl);
+    }
     | type QUESTION IDENTIFIER ASSIGN expr SEMICOLON {
         Type t = $1; t.nullable = 1;
         $$ = (ASTNode*)make_var_decl(t, $3, $5);
