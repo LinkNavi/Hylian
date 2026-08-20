@@ -110,6 +110,7 @@ typedef enum {
         /* Interrupt control */
         IR_CLI,      /* cli — disable interrupts */
         IR_STI,      /* sti — enable interrupts  */
+        IR_HLT,      /* hlt — halt the CPU until the next interrupt */
 
         /* Descriptor table & system intrinsics */
         IR_LGDT,     /* lgdt base, limit — src1=base src2=limit */
@@ -135,6 +136,8 @@ IR_RESTORE_REGS,    // pop all GPRs (ISR exit);  extra_int=1 → skip error-code
 IR_IRET,            // iretq — return from interrupt
 IR_OUTB,   // outb port, val  — src1=port src2=val
 IR_INB,    // inb port        — dest=result src1=port
+IR_OUTW,   // outw port, val  — src1=port src2=val (16-bit)
+IR_INW,    // inw port        — dest=result src1=port (16-bit)
     IR_ARENA_ALLOC, /* dest = arena_alloc(__arena__, size): str_extra=class_name, extra_int=size */
     IR_OPCODE_COUNT
 } IROpcode;
@@ -189,6 +192,10 @@ typedef struct {
     char      *str_extra;     /* callee name, var name, class, asm body  */
     char      *str_extra2;    /* field name, enum variant                */
     char      *str_extra3;    /* IR_STATIC_VAR: @section("...") name, or NULL */
+    unsigned char *init_bytes;    /* IR_STATIC_VAR: compile-time-folded struct-
+                                      literal bytes (see lower.c
+                                      fold_struct_literal_to_bytes), or NULL */
+    int            init_bytes_len;
     int        extra_int;     /* is_main flag, TypeKind, PRINT_ARG_* … */
 
     /* Variable-arity argument list (CALL, NEW, ARRAY_INIT) */

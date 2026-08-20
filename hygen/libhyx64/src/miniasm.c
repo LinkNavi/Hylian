@@ -198,6 +198,7 @@ int miniasm_assemble(const char *text, X64Buf *out, X64RelocList *out_relocs,
         else if (strcasecmp(mnemonic, "syscall") == 0) { enc_syscall(out); }
         else if (strcasecmp(mnemonic, "cli") == 0) { enc_cli(out); }
         else if (strcasecmp(mnemonic, "sti") == 0) { enc_sti(out); }
+        else if (strcasecmp(mnemonic, "hlt") == 0) { enc_hlt(out); }
         else if (strcasecmp(mnemonic, "iretq") == 0 || strcasecmp(mnemonic, "iret") == 0) { enc_iretq(out); }
         else if (strcasecmp(mnemonic, "wrmsr") == 0) { enc_wrmsr(out); }
         else if (strcasecmp(mnemonic, "rdmsr") == 0) { enc_rdmsr(out); }

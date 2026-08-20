@@ -106,6 +106,21 @@ void obj_add_global(ObjModule *mod, const char *name, int has_init, int64_t init
     }
 }
 
+void obj_add_global_data(ObjModule *mod, const char *name, const void *data, size_t size) {
+    if (mod->global_count == mod->global_cap) {
+        mod->global_cap *= 2;
+        mod->globals = realloc(mod->globals, mod->global_cap * sizeof(ObjGlobalSym));
+    }
+    ObjGlobalSym *g = &mod->globals[mod->global_count++];
+    g->name = strdup(name);
+    g->has_init = 1;
+    g->init_val = 0;
+    g->size = (int)size;
+    g->section = NULL;
+    g->offset = mod->data.len;
+    objbuf_write(&mod->data, data, size);
+}
+
 static ObjBuf *obj_get_or_add_section(ObjModule *mod, const char *name) {
     for (int i = 0; i < mod->extra_section_count; i++)
         if (strcmp(mod->extra_sections[i].name, name) == 0)

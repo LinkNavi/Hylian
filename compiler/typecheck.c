@@ -74,6 +74,7 @@ typedef struct {
   Type return_type;
   Type param_types[16];
   int param_count;
+  int is_external_decl;
 } FuncInfo;
 
 typedef struct {
@@ -438,6 +439,28 @@ static Type infer_expr(ASTNode *node) {
       result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "inb") == 0) {
       result = make_simple_type("int", 0);
+    } else if (fc->name && strcmp(fc->name, "outw") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "inw") == 0) {
+      result = make_simple_type("int", 0);
+    } else if (fc->name && strcmp(fc->name, "io_wait") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "enable_interrupts") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "disable_interrupts") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "halt") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "vga_clear") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "vga_set_color") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "vga_print") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "vga_println") == 0) {
+      result = make_simple_type("void", 0);
+    } else if (fc->name && strcmp(fc->name, "vga_put_char") == 0) {
+      result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "memset") == 0) {
       result = make_simple_type("void", 0);
     } else if (fc->name && strcmp(fc->name, "memcpy") == 0) {
@@ -866,13 +889,14 @@ static void infer_function(ASTNode **params, int param_count, ASTNode **body,
 
 
 static void register_func(const char *name, Type return_type, ASTNode **params,
-                          int param_count) {
+                          int param_count, int is_external_decl) {
   if (func_count >= 256)
     return;
   FuncInfo *fi = &funcs[func_count++];
   fi->name = (char *)name;
   fi->return_type = return_type;
   fi->param_count = param_count < 16 ? param_count : 16;
+  fi->is_external_decl = is_external_decl;
   for (int i = 0; i < fi->param_count; i++) {
     if (params && params[i]) {
       VarDeclNode *p = (VarDeclNode *)params[i];
@@ -890,6 +914,13 @@ int tc_func_return_is_bool(const char *name) {
   return fi->return_type.kind == TYPE_SIMPLE &&
          fi->return_type.name &&
          strcmp(fi->return_type.name, "bool") == 0;
+}
+
+int tc_func_is_external_decl(const char *name) {
+  if (!name) return 0;
+  FuncInfo *fi = func_lookup(name);
+  if (!fi) return 0;
+  return fi->is_external_decl;
 }
 
 static void register_field(const char *class_name, const char *fname,
@@ -948,7 +979,8 @@ void typecheck(ProgramNode *program, const char *filename) {
 
     if (d->type == NODE_FUNC) {
       FuncNode *fn = (FuncNode *)d;
-      register_func(fn->name, fn->return_type, fn->params, fn->param_count);
+      register_func(fn->name, fn->return_type, fn->params, fn->param_count,
+                    d->from_include && fn->body_count == 0);
     }
 
     if (d->type == NODE_MODULE) {
@@ -961,7 +993,8 @@ void typecheck(ProgramNode *program, const char *filename) {
           char mangled[256];
           snprintf(mangled, sizeof(mangled), "%s__%s", mn->name, fn->name);
           char *mangled_copy = strdup(mangled);
-          register_func(mangled_copy, fn->return_type, fn->params, fn->param_count);
+          register_func(mangled_copy, fn->return_type, fn->params, fn->param_count,
+                        d->from_include && fn->body_count == 0);
           /* Deliberately NOT registered under the plain name here anymore —
              that used to make e.g. `catFunc(...)` pass typecheck from
              *anywhere* in the program, even though lower.c only ever emits
@@ -994,7 +1027,7 @@ void typecheck(ProgramNode *program, const char *filename) {
         /* We need a stable heap copy of the mangled name */
         char *mangled_copy = strdup(mangled);
         register_func(mangled_copy, mn->return_type, mn->params,
-                      mn->param_count);
+                      mn->param_count, 0);
       }
       if (cn->has_ctor) {
         char ctor_mangled[256];
@@ -1002,7 +1035,7 @@ void typecheck(ProgramNode *program, const char *filename) {
         char *ctor_copy = strdup(ctor_mangled);
         Type self_type = make_simple_type(cn->name, 0);
         register_func(ctor_copy, self_type, cn->ctor_params,
-                      cn->ctor_param_count);
+                      cn->ctor_param_count, 0);
       }
     }
   }

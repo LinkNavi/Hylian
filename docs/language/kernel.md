@@ -51,7 +51,14 @@ This flag does three things:
 
 ## The `kernel` Module
 
-The `kernel` module is a special standard library module designed for bare-metal x86-64 targets. It provides the minimal primitives needed to produce output and control the CPU without any OS underneath.
+`include { kernel }` is a documentation marker, not a real file: every name
+below is either a compiler intrinsic (resolved purely by call name, no
+include required) or an ordinary function resolved at *link* time against
+whichever runtime object you link in (`runtime/platform/limine.o` for
+`--target limine`, `kernel.o` for the older non-Limine `kernel` platform).
+Writing `include { kernel }` is recognized and does nothing - the names it
+would notionally bring in are always available, include or not - it exists
+so kernel source reads the same way any other module-using file does.
 
 ### Importing
 
@@ -63,13 +70,21 @@ include { kernel }
 
 #### VGA Text Output
 
+All five resolve at link time against `runtime/platform/limine.o` (or
+`kernel.o`) - link one of those in (`zora build` on a `"kernel"` target does
+this for you) or these fail with an undefined reference.
+
 | Function | Signature | Description |
 |---|---|---|
 | `vga_clear` | `void vga_clear()` | Clears the VGA text buffer (fills with spaces using the current color) |
 | `vga_set_color` | `void vga_set_color(uint8 color)` | Sets the foreground/background color byte for subsequent writes |
-| `vga_print` | `void vga_print(str text)` | Writes a null-terminated string to the VGA buffer at the current cursor position |
-| `vga_println` | `void vga_println(str text)` | Like `vga_print`, but advances the cursor to the next line afterward |
-| `vga_put_char` | `void vga_put_char(uint8 c)` | Writes a single character to the VGA buffer |
+| `vga_print` | `void vga_print(str text)` | Writes a null-terminated string via the same display+serial path as `print`/`println`, at the current cursor position |
+| `vga_println` | `void vga_println(str text)` | Like `vga_print`, but writes a trailing newline afterward |
+| `vga_put_char` | `void vga_put_char(uint8 c)` | Writes a single character |
+
+For plain text output without any of the above, the ordinary `print`/
+`println` syntax already works under `--target limine` — see
+[Runtime support](#runtime-support).
 
 #### Port I/O
 
@@ -82,6 +97,12 @@ include { kernel }
 | `io_wait` | `void io_wait()` | Issues a dummy port write to introduce a small I/O delay (required by some legacy hardware) |
 
 #### CPU Control
+
+`enable_interrupts`/`disable_interrupts`/`cli`/`sti`/`lgdt`/`lidt`/`ltr`/
+`invlpg`/`wrmsr`/`rdmsr` are compiler intrinsics — they work with nothing
+linked in beyond your own object. `halt` is the one exception: it's an
+ordinary function (a fixed `cli` + `hlt`-forever sequence), resolved at link
+time the same way the VGA functions above are.
 
 | Function | Signature | Description |
 |---|---|---|
@@ -255,7 +276,7 @@ packed class GdtEntry {
         limit_low   = cast<uint16>(limit & 0xFFFF);
         base_low    = cast<uint16>(base  & 0xFFFF);
         base_mid    = cast<uint8>((base  >> 16) & 0xFF);
-        this.access = access;
+        self.access = access;
         granularity = cast<uint8>(((limit >> 16) & 0x0F) | (gran & 0xF0));
         base_high   = cast<uint8>((base  >> 24) & 0xFF);
     }
@@ -371,63 +392,95 @@ void main() {
 
 ---
 
-## Building and Linking
+## Building with Zora (recommended)
 
-A freestanding kernel binary requires three steps: compiling Hylian to assembly, assembling to an object file, and linking with a custom linker script.
+The `zora` build tool has a `"kernel"` target type that drives the whole
+Limine build for you - no manual `hylian`/`ld` invocations, no linker script
+to write:
 
-### 1. Compile Hylian to NASM Assembly
+```toml
+[project]
+name = "mykernel"
+version = "0.1.0"
+
+[target.mykernel]
+type = "kernel"
+sources = ["src/main.hy"]
+```
 
 ```sh
-hylian --freestanding kernel.hyl -o kernel.asm
+zora build
 ```
 
-### 2. Assemble with NASM
+This compiles `src/main.hy` with `--freestanding --target limine` (which
+renames your `main` to the `_start` symbol Limine jumps to), and links the
+result with `ld -T` against the installed `runtime/platform/limine.ld` /
+`limine.o` - the same Limine runtime support object described below, found
+via the installed stdlib (`$HYLIAN_LIB/std/platform/`, or the usual
+`/usr/local/lib/hylian/std/platform` fallback). The output is a
+higher-half-linked ELF at `zora-build/bin/<target-name>`, ready to hand to
+`xorriso`/`limine bios-install` (or any other Limine-compatible boot media
+step) - `zora build` does not build a bootable ISO itself, only the kernel
+binary.
+
+A `"kernel"` target is not runnable with `zora run` (there is no OS to
+execve it into) — boot the resulting ELF with a Limine-built ISO and an
+emulator (e.g. `qemu-system-x86_64 -cdrom mykernel.iso -serial stdio`) or
+real hardware instead.
+
+Note that a kernel target does **not** link `stdlib/mem.hy` or
+`stdlib/runtime.hy` the way an ordinary `"bin"` target does — both of those
+make raw Linux `mmap`/`munmap`/`write` syscalls that mean nothing with no OS
+underneath. The Limine runtime object supplies freestanding-safe
+replacements for the same symbol names instead (a bump allocator backing
+`new`, and print/println routed through the VGA/serial output below), so
+`new` and `print`/`println` both still work in a kernel target.
+
+## Building Manually
+
+You can also drive `hylian`/`ld` directly instead of going through Zora - the
+steps below are what `zora build` automates for a `"kernel"` target.
+
+### 1. Compile Hylian to an Object File
+
+`hylian` emits a real ELF64 relocatable object directly - there is no
+separate assembly step or NASM invocation for the `hygen` backend that
+ships today.
 
 ```sh
-nasm -f elf64 kernel.asm -o kernel.o
+hylian --freestanding --target limine kernel.hy -o kernel.o
 ```
 
-### 3. Link with `ld`
+`--freestanding` renames your `main` function to the `_start` symbol a
+bootloader jumps to (there's no crt0 to call `main` for you); `--target
+limine` doesn't change the bytes of `kernel.o` at all (see
+[Limine Bootloader Support](#limine-bootloader-support) below) - it only
+matters for validating the flag and documenting intent.
 
-Do **not** use `gcc` or `clang` to link a freestanding kernel — they will inject C runtime startup code. Use `ld` directly with a linker script.
+### 2. Link with `ld`
 
-A minimal linker script (`kernel.ld`):
-
-```ld
-ENTRY(_start)
-
-SECTIONS {
-    . = 0x100000;
-
-    .text   : { *(.text)   }
-    .rodata : { *(.rodata) }
-    .data   : { *(.data)   }
-    .bss    : { *(.bss)    }
-}
-```
-
-Link command:
+Do **not** use `gcc` or `clang` to link a freestanding kernel — they will inject C runtime startup code. Use `ld` directly against the shipped Limine linker script and runtime support object (see below):
 
 ```sh
-ld -T kernel.ld -o kernel.elf kernel.o
+ld -T runtime/platform/limine.ld kernel.o runtime/platform/limine.o -o kernel.elf
 ```
 
-### 4. Create a Bootable Image (optional)
+### 3. Create a Bootable Image
 
-To produce a raw binary suitable for a bootloader like GRUB or Limine:
-
-```sh
-objcopy -O binary kernel.elf kernel.bin
-```
+`kernel.elf` is a normal higher-half-linked ELF executable; turning it into
+bootable media (an El Torito ISO with `xorriso`, deployed with
+`limine bios-install`, or a `limine.conf` entry with `protocol: limine`) is
+a [Limine](https://github.com/limine-bootloader/limine) concern, not a
+Hylian one - see that project's own documentation for the current
+invocation.
 
 ### Full Build Script
 
 ```sh
 #!/bin/sh
 set -e
-hylian --freestanding kernel.hyl -o kernel.asm
-nasm -f elf64 kernel.asm -o kernel.o
-ld -T kernel.ld -o kernel.elf kernel.o
+hylian --freestanding --target limine kernel.hy -o kernel.o
+ld -T runtime/platform/limine.ld kernel.o runtime/platform/limine.o -o kernel.elf
 echo "Build succeeded: kernel.elf"
 ```
 
@@ -439,34 +492,35 @@ Hylian has built-in support for the [Limine bootloader](https://github.com/limin
 
 ### What `--target limine` does
 
-- Emits a `_start` entry point that the Limine protocol expects.
-- Outputs a `.limine_requests` ELF section containing the Limine base-revision magic numbers that tell the bootloader your kernel speaks the Limine protocol.
-- Switches the default linker script to `runtime/platform/limine.ld`, which places the kernel in the higher half at `0xFFFFFFFF80000000 + 1 MiB`.
+- `--freestanding` (used together with `--target limine`) emits a `_start` entry point that the Limine protocol expects - the compiler renames whichever function is your program's `main` to `_start` in the object's symbol table.
+- A static struct-literal global in a custom `@section(...)` (e.g. a Limine base-revision/feature-request struct) is written as real, compile-time-folded bytes into that section, so a `.limine_requests` section containing the Limine base-revision magic numbers is exactly as reliable as any other `@section` global you declare.
+- `runtime/platform/limine.ld` places the kernel in the higher half at `0xFFFFFFFF80000000 + 1 MiB`; pass it to `ld -T` explicitly (or use `zora build` on a `"kernel"` target, which does this for you).
 
 ### Build commands
 
 ```sh
-# 1. Compile Hylian to NASM assembly targeting Limine
-hylian kernel.hy --target limine -o kernel.asm
+# 1. Compile Hylian directly to an ELF64 object targeting Limine
+hylian kernel.hy --target limine --freestanding -o kernel.o
 
-# 2. Assemble with NASM
-nasm -f elf64 kernel.asm -o kernel.o
-
-# 3. Link against the Limine runtime support object
+# 2. Link against the Limine runtime support object
 ld -T runtime/platform/limine.ld kernel.o runtime/platform/limine.o -o kernel.elf
 ```
 
 ### Runtime support
 
-`runtime/platform/limine.c` is compiled alongside your kernel and handles:
+`runtime/platform/limine.o` (linked in explicitly, either by `zora build`
+or by hand per the build commands above) is compiled alongside your kernel and handles:
 
 - **The Limine protocol handshake** — fills in the request structures and validates the bootloader response.
-- **VGA text output** — implements the `vga_*` family of functions provided by `std.kernel`.
-- **Port I/O helpers** — `outb`, `inb`, `outw`, `inw`, `io_wait`.
-- **CPU control stubs** — `halt`, `cli`, `sti`, `enable_interrupts`, `disable_interrupts`.
-- **Memory utilities** — `memset`, `memcpy`.
+- **`print`/`println`** — the compiler-generated calls backing the print/println *syntax* (`hylian_print`/`hylian_println`/`hylian_int_to_str`) write to the framebuffer and the serial port, instead of `stdlib/runtime.hy`'s normal Linux `write` syscall.
+- **`new`** — the compiler-generated arena calls (`arena_init`/`arena_alloc`/`arena_free`) are backed by a freestanding bump allocator, instead of `stdlib/mem.hy`'s normal Linux `mmap`/`munmap` syscalls.
+- **Memory utilities** — `hy_alloc`, `hy_free`, and libc-shaped stubs (`strlen`, `malloc`, `realloc`, `free`) some stdlib code expects to link against.
+- **VGA text output** — `vga_clear`, `vga_set_color`, `vga_print`, `vga_println`, `vga_put_char`, under exactly those source-level names (see [VGA Text Output](#vga-text-output) above).
+- **`halt`** — `cli` followed by `hlt` forever (see [CPU Control](#cpu-control) above).
 
-You do not need to write or modify this file yourself; it is part of the Hylian runtime distribution.
+Port I/O (`outb`/`inb`/`outw`/`inw`/`io_wait`) and the rest of CPU control (`cli`/`sti`/`hlt`, `lgdt`/`lidt`/`ltr`/`invlpg`, `wrmsr`/`rdmsr`) are **not** functions this file provides — they're compiler intrinsics that lower straight to the corresponding x86 instruction at the call site, so they work identically with or without `limine.o` linked in.
+
+You do not need to write or modify `limine.c` yourself; it is part of the Hylian runtime distribution.
 
 ### Higher-half addressing
 

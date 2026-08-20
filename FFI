@@ -1,0 +1,19 @@
+Need to have ffi in hylian with these:
+
+ASAP{
+system lib support (using Zora)
+Lsp support (when used with zora) (Generate a HYI file (look at lsp, tree sitter hylian, and tools/bindgen.py) and have the lsp just look at aviable classes, structs, funcs, and consts using libclang)
+have more features than the orginal tools/bindgen.py
+Clean Usage (just run zora dep add --tui to add system dep to the project)
+}
+
+After{
+Simple .c/.cpp and header or just header only support
+}
+
+
+Endgame {
+I can program a RayLib game with no major issues
+I can use a header with no major issues
+FFI is great and works
+}

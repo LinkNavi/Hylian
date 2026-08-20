@@ -600,6 +600,18 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
         if (strncmp(inc, "link:", 5) == 0) continue;
         if (strncmp(inc, "pkg:",  4) == 0) continue;
 
+        /* `include { kernel }` - the bare-metal primitives it names (cli,
+           sti, hlt, outb, inb, lgdt, ..., the vga_ family, halt,
+           enable_interrupts, disable_interrupts - see
+           docs/language/kernel.md) are either compiler intrinsics resolved
+           purely by call name (lower.c) or ordinary calls resolved at LINK
+           time against whatever runtime object actually gets linked in
+           (runtime/platform/limine.o, kernel.o, ...) - there is no
+           kernel.hy for either of those to come from. Recognize the name so
+           it is a documented no-op instead of a "cannot open kernel.hy"
+           error. */
+        if (strcmp(inc, "kernel") == 0) continue;
+
         /* vendors.* paths are resolved as .hyi interface files */
         if (strncmp(inc, "vendors.", 8) == 0) {
             const char *vendor_module = inc + 8; /* e.g. "vendors.vulkan" -> "vulkan" */

@@ -430,6 +430,26 @@ void *hy_alloc(unsigned long bytes) {
 
 void hy_free(void *p, unsigned long b) { (void)p; (void)b; }
 
+// ── Arena (backs `new`) ───────────────────────────────────────────────────────
+//
+// Every non-naked function's compiler-generated prologue/epilogue calls
+// arena_init/arena_alloc/arena_free unconditionally (see compiler/lower.c) -
+// stdlib/mem.hy's implementation of these three names issues raw Linux
+// mmap/munmap syscalls directly, which has no meaning with no OS underneath,
+// so a kernel target must not link that file. This is the freestanding
+// replacement: hy_alloc above is already a bump allocator, so there's no
+// block list to maintain here - `slot` only exists to satisfy the calling
+// convention every caller threads through it. arena_free is a no-op, exactly
+// like hy_free above (bump allocator, no reclamation).
+void arena_init(unsigned long slot) { (void)slot; }
+
+unsigned long arena_alloc(unsigned long slot, unsigned long size) {
+    (void)slot;
+    return (unsigned long)hy_alloc(size);
+}
+
+void arena_free(unsigned long slot) { (void)slot; }
+
 // ── Hylian runtime ABI ────────────────────────────────────────────────────────
 
 void hylian_print(const char *buf, unsigned long len) {
@@ -458,9 +478,17 @@ long hylian_int_to_str(long val, char *buf, long buflen) {
     return len;
 }
 
-void hylian_vga_set_color(int c) { text_color = (uint8_t)(c & 0xFF); }
+// ── std.kernel VGA/CPU functions ────────────────────────────────────────────
+// Unlike hylian_print/hylian_println/hylian_int_to_str above (called by the
+// compiler under those exact hardcoded names for the print/println syntax),
+// these are ordinary functions a kernel program calls by the name documented
+// in docs/language/kernel.md - vga_clear(), not hylian_vga_clear(). There is
+// no name-mangling layer for ordinary calls, so the symbol name here has to
+// match the source-level call exactly.
 
-void hylian_vga_clear(void) {
+void vga_set_color(int c) { text_color = (uint8_t)(c & 0xFF); }
+
+void vga_clear(void) {
     struct limine_framebuffer *fb = fb_get();
     if (fb) {
         fb_clear_screen(fb);
@@ -469,6 +497,29 @@ void hylian_vga_clear(void) {
     text_row = text_col = 0;
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
         VGA_BUFFER[i] = (uint16_t)(' ' | ((uint16_t)text_color << 8));
+}
+
+// vga_print/vga_println write through the same display+serial path as
+// hylian_print/hylian_println above, just addressed by a nul-terminated
+// `str` (a single pointer) instead of the compiler's internal ptr+len pair.
+void vga_print(const char *text) {
+    if (!text) return;
+    for (unsigned long i = 0; text[i]; i++) {
+        display_putchar(text[i]);
+        serial_putchar(text[i]);
+    }
+}
+
+void vga_println(const char *text) {
+    vga_print(text);
+    display_putchar('\n');
+    serial_putchar('\n');
+}
+
+void vga_put_char(int c) {
+    char ch = (char)(c & 0xFF);
+    display_putchar(ch);
+    serial_putchar(ch);
 }
 
 void hylian_outb(int port, int value) {
@@ -484,6 +535,16 @@ int hylian_inb(int port) {
 }
 
 void hylian_halt(void) { hy_halt(); }
+
+// halt(): disable interrupts, then hlt forever - see docs/language/kernel.md's
+// CPU Control table. cli/sti/hlt themselves are compiler intrinsics (raw
+// instructions at the call site, see compiler/lower.c), so this is the one
+// piece of the table that's an actual function - a fixed sequence of them,
+// not a single instruction.
+void halt(void) {
+    __asm__ volatile ("cli");
+    while (1) __asm__ volatile ("hlt");
+}
 
 // ── Limine memmap / HHDM accessors (called from pmm.hy) ──────────────────────
 

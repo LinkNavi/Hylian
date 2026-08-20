@@ -109,6 +109,20 @@ void hy_free(void *ptr, unsigned long bytes) {
     // bump allocator: free is a no-op
 }
 
+// ── Arena (backs `new`) ───────────────────────────────────────────────────────
+// See limine.c's copy of this for the full explanation: stdlib/mem.hy's
+// arena_init/arena_alloc/arena_free issue raw Linux mmap/munmap syscalls,
+// which don't work with no OS underneath, so a kernel target links this
+// hy_alloc-backed replacement instead.
+void arena_init(unsigned long slot) { (void)slot; }
+
+unsigned long arena_alloc(unsigned long slot, unsigned long size) {
+    (void)slot;
+    return (unsigned long)hy_alloc(size);
+}
+
+void arena_free(unsigned long slot) { (void)slot; }
+
 // ── Hylian runtime ABI ────────────────────────────────────────────────────────
 
 void hylian_print(const char *buf, unsigned long len) {
@@ -146,16 +160,34 @@ long hylian_int_to_str(long val, char *buf, long buflen) {
 }
 
 // ── Kernel-specific VGA helpers (callable via std.kernel) ─────────────────────
+// Named to match the source-level call exactly (vga_clear(), not
+// hylian_vga_clear()) - there is no name-mangling layer for ordinary calls,
+// unlike hylian_print/hylian_println above (hardcoded names the compiler
+// itself emits for the print/println syntax).
 
-void hylian_vga_set_color(int color) {
+void vga_set_color(int color) {
     vga_color = (uint8_t)(color & 0xFF);
 }
 
-void hylian_vga_clear(void) {
+void vga_clear(void) {
     vga_row = 0;
     vga_col = 0;
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
         VGA_BUFFER[i] = (uint16_t)(' ' | ((uint16_t)vga_color << 8));
+}
+
+void vga_print(const char *text) {
+    if (!text) return;
+    for (unsigned long i = 0; text[i]; i++) vga_putchar(text[i]);
+}
+
+void vga_println(const char *text) {
+    vga_print(text);
+    vga_putchar('\n');
+}
+
+void vga_put_char(int c) {
+    vga_putchar((char)(c & 0xFF));
 }
 
 // ── Port I/O ──────────────────────────────────────────────────────────────────
@@ -182,6 +214,15 @@ int hylian_inb(int port) {
 
 void hylian_halt(void) {
     hy_halt();
+}
+
+// halt(): the source-level name from docs/language/kernel.md's CPU Control
+// table - disable interrupts, then hlt forever. cli/sti/hlt themselves are
+// compiler intrinsics (raw instructions at the call site), so this is the
+// one entry in that table that's an actual function.
+void halt(void) {
+    __asm__ volatile ("cli");
+    while (1) __asm__ volatile ("hlt");
 }
 
 // ── C runtime stubs ───────────────────────────────────────────────────────────

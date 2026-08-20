@@ -1163,7 +1163,71 @@ static void scan_hyi_vendor_file(LspProject *proj, const char *filepath, const c
     fclose(f);
 }
 
-static void resolve_vendor_import(LspProject *proj, const char *inc)
+static void zora_project_root_for_file(const LspProject *proj, const char *filepath,
+                                       char *out, int outsz)
+{
+    const ZoraProjectInfo *zp = zora_project_for_file(proj, filepath);
+    if (zp && zp->subdir[0])
+        snprintf(out, outsz, "%s/%s", proj->root_dir, zp->subdir);
+    else
+        snprintf(out, outsz, "%s", proj->root_dir);
+}
+
+static void scan_vendor_dir(LspProject *proj, const char *project_root)
+{
+    char vendors_path[1024];
+    snprintf(vendors_path, sizeof(vendors_path), "%s/vendors", project_root);
+    normalise_path(vendors_path);
+    DIR *vd = opendir(vendors_path);
+    if (!vd)
+        return;
+
+    struct dirent *vent;
+    while ((vent = readdir(vd)) != NULL)
+    {
+        if (vent->d_name[0] == '.')
+            continue;
+
+        char sub_path[1024];
+        snprintf(sub_path, sizeof(sub_path), "%s/%s", vendors_path, vent->d_name);
+        normalise_path(sub_path);
+
+        struct stat vst;
+        if (lstat(sub_path, &vst) != 0)
+            continue;
+        if (S_ISLNK(vst.st_mode))
+            continue;
+
+        if (S_ISDIR(vst.st_mode))
+        {
+            char hyi_path[1024];
+            snprintf(hyi_path, sizeof(hyi_path), "%s/%s.hyi", sub_path, vent->d_name);
+            normalise_path(hyi_path);
+            FILE *tf = fopen(hyi_path, "r");
+            if (tf)
+            {
+                fclose(tf);
+                scan_hyi_vendor_file(proj, hyi_path, vent->d_name);
+            }
+        }
+        else if (S_ISREG(vst.st_mode))
+        {
+            int nlen = strlen(vent->d_name);
+            if (nlen > 4 && strcmp(vent->d_name + nlen - 4, ".hyi") == 0)
+            {
+                char alias[128];
+                int alen = nlen - 4;
+                if (alen >= (int)sizeof(alias)) alen = (int)sizeof(alias) - 1;
+                memcpy(alias, vent->d_name, alen);
+                alias[alen] = '\0';
+                scan_hyi_vendor_file(proj, sub_path, alias);
+            }
+        }
+    }
+    closedir(vd);
+}
+
+static void resolve_vendor_import(LspProject *proj, ProjectFile *pf, const char *inc)
 {
     /* Strip "vendors." prefix */
     const char *alias = inc;
@@ -1187,15 +1251,19 @@ static void resolve_vendor_import(LspProject *proj, const char *inc)
         /* Or the class name entry would equal alias itself for single-token vendors */
     }
 
-    /* Try {root}/vendors/{alias}/{alias}.hyi first, then {root}/vendors/{alias}.hyi */
+    char project_root[1024];
+    zora_project_root_for_file(proj, pf ? pf->filepath : NULL,
+                               project_root, sizeof(project_root));
+
+    /* Try {project}/vendors/{alias}/{alias}.hyi first, then {project}/vendors/{alias}.hyi */
     char hyi_path[1024];
-    snprintf(hyi_path, sizeof(hyi_path), "%s/vendors/%s/%s.hyi", proj->root_dir, alias, alias);
+    snprintf(hyi_path, sizeof(hyi_path), "%s/vendors/%s/%s.hyi", project_root, alias, alias);
     normalise_path(hyi_path);
 
     FILE *test = fopen(hyi_path, "r");
     if (!test)
     {
-        snprintf(hyi_path, sizeof(hyi_path), "%s/vendors/%s.hyi", proj->root_dir, alias);
+        snprintf(hyi_path, sizeof(hyi_path), "%s/vendors/%s.hyi", project_root, alias);
         normalise_path(hyi_path);
         test = fopen(hyi_path, "r");
     }
@@ -1207,12 +1275,12 @@ static void resolve_vendor_import(LspProject *proj, const char *inc)
     else
     {
         lsp_log("[lsp_analysis] no .hyi found for vendor: %s", alias);
-        lsp_log("looked in: %s/vendors/%s/%s.hyi", proj->root_dir, alias, alias);
+        lsp_log("looked in: %s/vendors/%s/%s.hyi", project_root, alias, alias);
     }
 
     /* If there's also a .hy source file, resolve it as a normal user file */
     char hy_path[1024];
-    snprintf(hy_path, sizeof(hy_path), "%s/vendors/%s/%s.hy", proj->root_dir, alias, alias);
+    snprintf(hy_path, sizeof(hy_path), "%s/vendors/%s/%s.hy", project_root, alias, alias);
     normalise_path(hy_path);
     FILE *hy_test = fopen(hy_path, "r");
     if (hy_test)
@@ -1466,7 +1534,7 @@ static void resolve_imports(LspProject *proj, ProjectFile *pf)
         /* vendors.* — resolve .hyi (and optionally .hy) from the vendors dir */
         if (strncmp(inc, "vendors.", 8) == 0)
         {
-            resolve_vendor_import(proj, inc);
+            resolve_vendor_import(proj, pf, inc);
             continue;
         }
 
@@ -1570,59 +1638,14 @@ LspProject *lsp_project_create(const char *root_dir)
     }
     lsp_log("[lsp_analysis] stdlib programs indexed: %d", proj->stdlib_program_count);
 
-    /* Scan vendors directory upfront for any .hyi files */
-    char vendors_path[1024];
-    snprintf(vendors_path, sizeof(vendors_path), "%s/vendors", proj->root_dir);
-    normalise_path(vendors_path);
-    DIR *vd = opendir(vendors_path);
-    if (vd)
-    {
-        struct dirent *vent;
-        while ((vent = readdir(vd)) != NULL)
-        {
-            if (vent->d_name[0] == '.')
-                continue;
-
-            /* Check for subdirectory: vendors/{alias}/{alias}.hyi */
-            char sub_path[1024];
-            snprintf(sub_path, sizeof(sub_path), "%s/%s", vendors_path, vent->d_name);
-            normalise_path(sub_path);
-
-            struct stat vst;
-            if (lstat(sub_path, &vst) != 0)
-                continue;
-
-            if (S_ISLNK(vst.st_mode))
-                continue;
-
-            if (S_ISDIR(vst.st_mode))
-            {
-                char hyi_path[1024];
-                snprintf(hyi_path, sizeof(hyi_path), "%s/%s.hyi", sub_path, vent->d_name);
-                normalise_path(hyi_path);
-                FILE *tf = fopen(hyi_path, "r");
-                if (tf)
-                {
-                    fclose(tf);
-                    scan_hyi_vendor_file(proj, hyi_path, vent->d_name);
-                }
-            }
-            else if (S_ISREG(vst.st_mode))
-            {
-                /* vendors/{alias}.hyi directly in vendors/ */
-                int nlen = strlen(vent->d_name);
-                if (nlen > 4 && strcmp(vent->d_name + nlen - 4, ".hyi") == 0)
-                {
-                    char alias[128];
-                    int alen = nlen - 4;
-                    if (alen >= (int)sizeof(alias)) alen = (int)sizeof(alias) - 1;
-                    memcpy(alias, vent->d_name, alen);
-                    alias[alen] = '\0';
-                    scan_hyi_vendor_file(proj, sub_path, alias);
-                }
-            }
-        }
-        closedir(vd);
+    scan_vendor_dir(proj, proj->root_dir);
+    for (int i = 0; i < proj->zora_project_count; i++) {
+        if (!proj->zora_projects[i].subdir[0])
+            continue;
+        char project_root[1280];
+        snprintf(project_root, sizeof(project_root), "%s/%s",
+                 proj->root_dir, proj->zora_projects[i].subdir);
+        scan_vendor_dir(proj, project_root);
     }
 
     for (int i = 0; i < proj->file_count; i++)

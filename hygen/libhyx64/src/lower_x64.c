@@ -611,6 +611,7 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
         case MIR_CLI: enc_cli(out_code); break;
         case MIR_STI: enc_sti(out_code); break;
         case MIR_IRET: enc_iretq(out_code); break;
+        case MIR_HLT: enc_hlt(out_code); break;
 
         case MIR_OUTB: {
             load_operand(&ctx, ins->src1, X64_RDX); /* port in DX */
@@ -623,6 +624,41 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
             enc_in_al_dx(out_code);
             enc_movzx_r64_r8(out_code, X64_RAX, X64_RAX);
             store_result(&ctx, ins->dest, X64_RAX);
+            break;
+        }
+
+        case MIR_OUTW: {
+            load_operand(&ctx, ins->src1, X64_RDX); /* port in DX */
+            load_operand(&ctx, ins->src2, X64_RAX); /* value in AX */
+            enc_out_dx_ax(out_code);
+            break;
+        }
+        case MIR_INW: {
+            load_operand(&ctx, ins->src1, X64_RDX);
+            enc_in_ax_dx(out_code);
+            enc_ext_rr(out_code, X64_RAX, X64_RAX, 2, 0); /* zero-extend AX -> RAX */
+            store_result(&ctx, ins->dest, X64_RAX);
+            break;
+        }
+
+        case MIR_LGDT: {
+            load_operand(&ctx, ins->src1, X64_RAX); /* descriptor address (ir_to_mir.c already built it) */
+            enc_lgdt_mem(out_code, X64_RAX);
+            break;
+        }
+        case MIR_LIDT: {
+            load_operand(&ctx, ins->src1, X64_RAX);
+            enc_lidt_mem(out_code, X64_RAX);
+            break;
+        }
+        case MIR_LTR: {
+            load_operand(&ctx, ins->src1, X64_RAX); /* selector, low 16 bits used */
+            enc_ltr_r16(out_code, X64_RAX);
+            break;
+        }
+        case MIR_INVLPG: {
+            load_operand(&ctx, ins->src1, X64_RAX); /* linear address */
+            enc_invlpg_mem(out_code, X64_RAX);
             break;
         }
 

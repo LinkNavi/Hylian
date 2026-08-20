@@ -915,7 +915,14 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
             int has_init = (ins->src1.kind == IROP_CONST_INT || ins->src1.kind == IROP_CONST_BOOL);
             int64_t init_val = ins->src1.kind == IROP_CONST_INT ? ins->src1.int_val
                               : ins->src1.kind == IROP_CONST_BOOL ? ins->src1.bool_val : 0;
-            if (ins->str_extra3) {
+            if (ins->init_bytes) {
+                /* Compile-time-folded struct literal (see lower.c
+                   fold_struct_literal_to_bytes) - real multi-field byte
+                   content, sized to the actual class layout rather than the
+                   fixed 8 bytes every other static gets. */
+                mir_module_add_global_ex(mod, ins->str_extra, 1, 0, ins->init_bytes_len,
+                                         ins->str_extra3, ins->init_bytes);
+            } else if (ins->str_extra3) {
                 /* @section("...") global: a custom section is always emitted
                    with explicit bytes (no .bss/NOBITS placement for it), so
                    a value-less declaration still needs has_init=1 to get its
@@ -952,13 +959,44 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         /* ---- privileged / kernel intrinsics: direct 1:1 to dedicated MIR ops ---- */
         case IR_CLI: mir_emit(fn, MIR_CLI); break;
         case IR_STI: mir_emit(fn, MIR_STI); break;
+        case IR_HLT: mir_emit(fn, MIR_HLT); break;
         case IR_IRET: mir_emit(fn, MIR_IRET); break;
 
         case IR_LGDT: case IR_LIDT: {
-            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
-            MIRValue b = lower_operand(&ins->src2, &env, mod, fn);
+            /* The real lgdt/lidt instructions take a pointer to an
+               already-built 10-byte descriptor (2-byte limit, 8-byte base)
+               in memory - there is no "base in one operand, limit in
+               another" form. Build that descriptor in a 16-byte (8-aligned)
+               scratch slot carved out of this function's own stack frame
+               (same MIR_ALLOCA_LOCAL mechanism print/println's int-to-string
+               buffer uses - see the PRINT_ARG_INT case above), write limit
+               and base into it, then hand the x64 backend just the
+               resulting address. Until this existed, MIR_LGDT/MIR_LIDT had
+               a src1/src2 pair the x64 backend never consumed at all - see
+               lower_x64.c's warn_unhandled - so lgdt()/lidt() silently
+               compiled to nothing. */
+            MIRValue base_v  = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue limit_v = lower_operand(&ins->src2, &env, mod, fn);
+
+            int buf = mir_new_vreg(fn);
+            MIRInstr *alloc = mir_emit(fn, MIR_ALLOCA_LOCAL);
+            alloc->dest = mir_vreg(buf, MIR_PTR);
+            alloc->extra_int = 16;
+
+            limit_v.type = MIR_U16;
+            MIRInstr *st_limit = mir_emit(fn, MIR_STORE);
+            st_limit->dest = mir_vreg(buf, MIR_PTR);
+            st_limit->src1 = limit_v;
+            st_limit->mem_offset = 0;
+
+            base_v.type = MIR_U64;
+            MIRInstr *st_base = mir_emit(fn, MIR_STORE);
+            st_base->dest = mir_vreg(buf, MIR_PTR);
+            st_base->src1 = base_v;
+            st_base->mem_offset = 2;
+
             MIRInstr *m = mir_emit(fn, ins->op == IR_LGDT ? MIR_LGDT : MIR_LIDT);
-            m->src1 = a; m->src2 = b;
+            m->src1 = mir_vreg(buf, MIR_PTR);
             break;
         }
 
@@ -1013,6 +1051,23 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
         case IR_INB: {
             MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
             MIRInstr *m = mir_emit(fn, MIR_INB);
+            m->dest = mir_vreg(ins->dest.temp_id, MIR_U64);
+            m->src1 = a;
+            tenv_set_temp(&env, ins->dest.temp_id, MIR_U64);
+            break;
+        }
+
+        case IR_OUTW: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
+            MIRValue b = lower_operand(&ins->src2, &env, mod, fn);
+            MIRInstr *m = mir_emit(fn, MIR_OUTW);
+            m->src1 = a; m->src2 = b;
+            break;
+        }
+
+        case IR_INW: {
+            MIRValue a = lower_operand(&ins->src1, &env, mod, fn);
+            MIRInstr *m = mir_emit(fn, MIR_INW);
             m->dest = mir_vreg(ins->dest.temp_id, MIR_U64);
             m->src1 = a;
             tenv_set_temp(&env, ins->dest.temp_id, MIR_U64);

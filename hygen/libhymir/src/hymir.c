@@ -204,11 +204,13 @@ const char *mir_op_name(MIROp op) {
     case MIR_CALL: return "call"; case MIR_RET: return "ret";
     case MIR_ASM_RAW: return "asm_raw";
     case MIR_CLI: return "cli"; case MIR_STI: return "sti"; case MIR_IRET: return "iret";
+    case MIR_HLT: return "hlt";
     case MIR_LGDT: return "lgdt"; case MIR_LIDT: return "lidt";
     case MIR_LTR: return "ltr"; case MIR_INVLPG: return "invlpg";
     case MIR_WRMSR: return "wrmsr"; case MIR_RDMSR: return "rdmsr";
     case MIR_READ_CR: return "read_cr"; case MIR_WRITE_CR: return "write_cr";
     case MIR_OUTB: return "outb"; case MIR_INB: return "inb";
+    case MIR_OUTW: return "outw"; case MIR_INW: return "inw";
     case MIR_SAVE_REGS: return "save_regs"; case MIR_RESTORE_REGS: return "restore_regs";
     case MIR_MEMSET: return "memset"; case MIR_MEMCPY: return "memcpy";
     case MIR_SYSCALL: return "syscall";

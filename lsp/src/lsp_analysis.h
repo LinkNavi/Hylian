@@ -23,7 +23,7 @@ typedef struct {
     char           documentation[512];
 } CompletionItem;
 
-#define MAX_COMPLETIONS 1024
+#define MAX_COMPLETIONS 8192
 
 
 typedef struct {

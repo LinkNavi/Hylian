@@ -14,6 +14,11 @@ void typecheck(ProgramNode *program, const char *filename);
    can emit `movzx rax, al` after calls that return a C _Bool / bool. */
 int tc_func_return_is_bool(const char *name);
 
+/* Returns 1 when the named function is a bodyless declaration that came from
+   an include file. Generated .hyi declarations for C libraries have this
+   shape, and lowering needs to use the platform C ABI for their arguments. */
+int tc_func_is_external_decl(const char *name);
+
 /* ── externally-supplied symbols ──────────────────────────────────────────────
  *
  * The CLI typechecks a fully-merged program: compile_file() has already pulled

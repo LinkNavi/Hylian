@@ -1,0 +1,4 @@
+Before releasing:
+Kernel Dev is viable
+FFI is great and works [in progress]
+No Major Bugs

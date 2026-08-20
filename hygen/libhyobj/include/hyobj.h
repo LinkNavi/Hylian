@@ -92,6 +92,15 @@ void obj_add_global(ObjModule *mod, const char *name, int has_init, int64_t init
 void obj_add_global_bytes(ObjModule *mod, const char *name, const char *section,
                           const void *data, size_t size);
 
+/* Like obj_add_global_bytes, but for a multi-byte (possibly >8 byte)
+   initializer with no custom section - a compile-time-folded struct literal
+   (see lower.c fold_struct_literal_to_bytes) that just needs to live in the
+   ordinary .data section like any other initialized global. obj_add_global
+   can't be reused for this: it only ever copies sizeof(int64_t) worth of
+   bytes from a single scalar value, which would read past the end of a
+   larger struct's data. */
+void obj_add_global_data(ObjModule *mod, const char *name, const void *data, size_t size);
+
 /* writes a Linux ELF64 relocatable object (.o) - functions are STB_GLOBAL,
    string/global symbols STB_LOCAL, anything referenced by a reloc that
    isn't one of the above becomes an STB_GLOBAL UNDEF symbol for the linker

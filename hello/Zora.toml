@@ -1,0 +1,9 @@
+[project]
+name = "hello"
+version = "0.1.0"
+
+[target.hello]
+type = "bin"
+# Hylian compiles from a single entry point and follows its own
+# include{} graph from there - list just the entry file, not a glob.
+sources = ["src/main.hy"]

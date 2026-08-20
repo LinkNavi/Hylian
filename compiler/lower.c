@@ -532,6 +532,45 @@ static int lower_is_struct_param(LowerState *s, const char *name) {
     return 0;
 }
 
+static ClassNode *lower_find_class(LowerState *s, const char *name) {
+    if (!s || !s->mod || !name) return NULL;
+    for (int i = 0; i < s->mod->class_count; i++) {
+        ClassNode *cn = s->mod->classes[i];
+        if (cn && cn->name && strcmp(cn->name, name) == 0)
+            return cn;
+    }
+    return NULL;
+}
+
+static int lower_class_payload_size(LowerState *s, const char *name) {
+    ClassNode *cn = lower_find_class(s, name);
+    if (!cn) return 8;
+
+    if (cn->is_union) {
+        int max_w = 0;
+        for (int i = 0; i < cn->field_count; i++) {
+            int w = lower_field_byte_width(s, cn->fields[i]);
+            if (w > max_w) max_w = w;
+        }
+        return max_w ? max_w : 8;
+    }
+
+    int sz = 0;
+    for (int i = 0; i < cn->field_count; i++)
+        sz += lower_field_byte_width(s, cn->fields[i]);
+    return sz ? sz : 8;
+}
+
+static const char *lower_int_load_type_for_size(int size) {
+    switch (size) {
+    case 1: return "uint8";
+    case 2: return "uint16";
+    case 4: return "uint32";
+    case 8: return "uint64";
+    default: return NULL;
+    }
+}
+
 /*
  * Lower one call argument. A by-value struct is COPIED into a hidden local and
  * its address passed, which is what gives struct arguments value semantics:
@@ -572,6 +611,24 @@ static int lower_call_arg(ASTNode *arg, LowerState *s) {
     cp->extra_src  = irop_temp(tcount);
 
     return tdst;
+}
+
+static int lower_c_call_arg(ASTNode *arg, LowerState *s) {
+    if (!arg || !lower_is_value_struct(s, &arg->resolved_type))
+        return lower_expr(arg, s);
+
+    const char *load_type = lower_int_load_type_for_size(
+        lower_class_payload_size(s, arg->resolved_type.name));
+    if (!load_type)
+        return lower_call_arg(arg, s);
+
+    int taddr = lower_expr(arg, s);
+    int tout = alloc_temp(s);
+    IRInstr *ld = ir_emit(s->mod, IR_LOAD_PTR);
+    ld->dest = irop_temp(tout);
+    ld->src1 = irop_temp(taddr);
+    ld->str_extra = strdup(load_type);
+    return tout;
 }
 
 /* Emit code for `node`; return the temp ID that holds the result. */
@@ -986,6 +1043,28 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->dest = irop_temp(t);
             return t;
         }
+        /* ── enable_interrupts() / disable_interrupts() ──────────────────
+           Plain aliases for sti()/cli() (see docs/language/kernel.md's CPU
+           Control table) - same IR opcode, just a second spelling. */
+        if (strcmp(call->name, "enable_interrupts") == 0) {
+            int t = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_STI);
+            ins->dest = irop_temp(t);
+            return t;
+        }
+        if (strcmp(call->name, "disable_interrupts") == 0) {
+            int t = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_CLI);
+            ins->dest = irop_temp(t);
+            return t;
+        }
+        /* ── hlt() ──────────────────────────────────────────────────────── */
+        if (strcmp(call->name, "hlt") == 0) {
+            int t = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_HLT);
+            ins->dest = irop_temp(t);
+            return t;
+        }
 
         /* ── lgdt(base, limit) / lidt(base, limit) ─────────────────────────── */
         if (strcmp(call->name, "lgdt") == 0 && call->arg_count >= 2) {
@@ -1117,6 +1196,37 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->dest = irop_temp(t);
             return t;
         }
+        if (strcmp(call->name, "outw") == 0 && call->arg_count >= 2) {
+            int tport = lower_expr(call->args[0], s);
+            int tval  = lower_expr(call->args[1], s);
+            int t     = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_OUTW);
+            ins->src1 = irop_temp(tport);
+            ins->src2 = irop_temp(tval);
+            ins->dest = irop_temp(t);
+            return t;
+        }
+        if (strcmp(call->name, "inw") == 0 && call->arg_count >= 1) {
+            int tport = lower_expr(call->args[0], s);
+            int t     = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_INW);
+            ins->src1 = irop_temp(tport);
+            ins->dest = irop_temp(t);
+            return t;
+        }
+        /* ── io_wait() ─────────────────────────────────────────────────────
+           Dummy write to an unused POST-code port (0x80) to burn a few
+           microseconds - the standard OSDev trick for legacy hardware (PIC,
+           PIT, ...) that needs a delay between successive port writes but
+           has no clock the CPU can wait on this early in boot. */
+        if (strcmp(call->name, "io_wait") == 0) {
+            int t = alloc_temp(s);
+            IRInstr *ins = ir_emit(s->mod, IR_OUTB);
+            ins->src1 = irop_const_int(0x80);
+            ins->src2 = irop_const_int(0);
+            ins->dest = irop_temp(t);
+            return t;
+        }
 
         /* ── memset(ptr, val, count) ────────────────────────────────────── */
         if (strcmp(call->name, "memset") == 0 && call->arg_count >= 3) {
@@ -1242,12 +1352,6 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         {
             int t = alloc_temp(s);
             int nargs = call->arg_count;
-            IROperand *arg_ops = NULL;
-            if (nargs > 0) {
-                arg_ops = malloc(nargs * sizeof(IROperand));
-                for (int i = 0; i < nargs; i++)
-                    arg_ops[i] = irop_temp(lower_call_arg(call->args[i], s));
-            }
             /* If we're inside a module and the callee is a sibling function,
                mangle it to ModuleName__funcname so it resolves correctly. */
             const char *resolved_name = call->name;
@@ -1261,6 +1365,17 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                         resolved_name = mangled_sibling;
                         break;
                     }
+                }
+            }
+            int use_c_abi_args = tc_func_is_external_decl(resolved_name);
+            IROperand *arg_ops = NULL;
+            if (nargs > 0) {
+                arg_ops = malloc(nargs * sizeof(IROperand));
+                for (int i = 0; i < nargs; i++) {
+                    int ta = use_c_abi_args
+                           ? lower_c_call_arg(call->args[i], s)
+                           : lower_call_arg(call->args[i], s);
+                    arg_ops[i] = irop_temp(ta);
                 }
             }
             IRInstr *ins = ir_emit(s->mod, IR_CALL);
@@ -2292,6 +2407,148 @@ static void lower_func_body(
 }
 
 
+/* Fold an expression to a compile-time integer constant, for a struct
+   literal used as a static initializer (see fold_struct_literal_to_bytes
+   below). Handles the shapes that actually show up in that position: int
+   literals, negative int literals, `nil` (0), and `cast<T>(expr)` (the cast
+   itself is a no-op for constant-folding purposes - just fold what's being
+   cast). Anything else (a variable, a function call, ...) isn't something
+   this can know the value of before the program runs, so it fails rather
+   than guessing 0 and silently laying out the wrong bytes. */
+static int fold_const_int(ASTNode *node, long *out) {
+    if (!node) return 0;
+    if (node->type == NODE_LITERAL) {
+        LiteralNode *lit = (LiteralNode *)node;
+        if (lit->lit_type == LIT_INT)  { *out = atol(lit->value); return 1; }
+        if (lit->lit_type == LIT_NIL)  { *out = 0; return 1; }
+        if (lit->lit_type == LIT_BOOL) { *out = (strcmp(lit->value, "true") == 0) ? 1 : 0; return 1; }
+        return 0;
+    }
+    if (node->type == NODE_UNARY_OP) {
+        UnaryOpNode *un = (UnaryOpNode *)node;
+        if (strcmp(un->op, "-") == 0) {
+            long v;
+            if (!fold_const_int(un->operand, &v)) return 0;
+            *out = -v;
+            return 1;
+        }
+        return 0;
+    }
+    if (node->type == NODE_BINARY_OP) {
+        BinaryOpNode *bin = (BinaryOpNode *)node;
+        if (strcmp(bin->op, "cast") == 0) return fold_const_int(bin->left, out);
+        return 0;
+    }
+    if (node->type == NODE_IDENTIFIER) {
+        /* `nil` sometimes parses as a bare identifier rather than a LIT_NIL
+           literal depending on context - treat it the same way. */
+        IdentifierNode *id = (IdentifierNode *)node;
+        if (strcmp(id->name, "nil") == 0) { *out = 0; return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+/* Compile-time-fold a struct-literal initializer (`ClassName { field: value,
+   ... }`) into a raw byte buffer for a static's real initialized section
+   data. This is deliberately separate from NODE_STRUCT_LITERAL's normal
+   lowering (above, in lower_expr) which allocates a stack slot and emits
+   runtime IR_SET_FIELD stores - fine for a local, useless for a static that
+   something outside our own code (e.g. a bootloader) reads before any of
+   our code has had a chance to run a single instruction. Any field the
+   literal doesn't mention stays zero (calloc'd), matching a plain `Foo f;`
+   zero-init. Returns NULL (after printing a diagnostic) if the class isn't
+   known or a field's value isn't something fold_const_int can resolve at
+   compile time - better than silently emitting wrong bytes for, say, a
+   boot-protocol request the bootloader will then fail to recognize. */
+static unsigned char *fold_struct_literal_to_bytes(StructLiteralNode *sl, LowerState *s, int *out_size) {
+    ClassNode *cls = NULL;
+    for (int i = 0; i < s->mod->class_count; i++) {
+        if (s->mod->classes[i] && s->mod->classes[i]->name &&
+            strcmp(s->mod->classes[i]->name, sl->class_name) == 0) {
+            cls = s->mod->classes[i];
+            break;
+        }
+    }
+    if (!cls) {
+        fprintf(stderr, "hylian: unknown class '%s' in static struct-literal initializer\n",
+                sl->class_name);
+        return NULL;
+    }
+
+    int total = ast_class_byte_size(s->mod->classes, s->mod->class_count, sl->class_name);
+    unsigned char *buf = calloc(1, (size_t)total);
+
+    for (int i = 0; i < sl->field_count; i++) {
+        const char *fname = sl->field_names[i];
+        ASTNode    *fval  = sl->field_values[i];
+
+        FieldNode *fn = NULL;
+        for (int fi = 0; fi < cls->field_count; fi++) {
+            if (cls->fields[fi] && cls->fields[fi]->name && strcmp(cls->fields[fi]->name, fname) == 0) {
+                fn = cls->fields[fi];
+                break;
+            }
+        }
+        if (!fn) {
+            fprintf(stderr, "hylian: '%s' has no field '%s' (static struct-literal initializer)\n",
+                    sl->class_name, fname);
+            free(buf);
+            return NULL;
+        }
+
+        int width = 8;
+        int offset = ast_field_offset(s->mod->classes, s->mod->class_count,
+                                      sl->class_name, fname, &width, NULL);
+        if (offset < 0) {
+            fprintf(stderr, "hylian: could not resolve offset of '%s.%s'\n", sl->class_name, fname);
+            free(buf);
+            return NULL;
+        }
+
+        if (fn->field_type.kind == TYPE_ARRAY && fn->field_type.fixed_size > 0) {
+            if (fval->type != NODE_ARRAY_LITERAL) {
+                fprintf(stderr, "hylian: '%s.%s' is a fixed-size array field - initialize it "
+                                "with an array literal (e.g. [a, b, c])\n", sl->class_name, fname);
+                free(buf);
+                return NULL;
+            }
+            ArrayLiteralNode *al = (ArrayLiteralNode *)fval;
+            if (al->elem_count != fn->field_type.fixed_size) {
+                fprintf(stderr, "hylian: '%s.%s' expects exactly %d elements, got %d\n",
+                        sl->class_name, fname, fn->field_type.fixed_size, al->elem_count);
+                free(buf);
+                return NULL;
+            }
+            int total_w = ast_field_byte_width(s->mod->classes, s->mod->class_count, fn);
+            int elem_w  = total_w / fn->field_type.fixed_size;
+            for (int ei = 0; ei < al->elem_count; ei++) {
+                long v;
+                if (!fold_const_int(al->elements[ei], &v)) {
+                    fprintf(stderr, "hylian: '%s.%s[%d]' is not a compile-time constant\n",
+                            sl->class_name, fname, ei);
+                    free(buf);
+                    return NULL;
+                }
+                memcpy(buf + offset + ei * elem_w, &v, (size_t)elem_w);
+            }
+        } else {
+            long v;
+            if (!fold_const_int(fval, &v)) {
+                fprintf(stderr, "hylian: '%s.%s' is not a compile-time constant\n",
+                        sl->class_name, fname);
+                free(buf);
+                return NULL;
+            }
+            memcpy(buf + offset, &v, (size_t)width);
+        }
+    }
+
+    *out_size = total;
+    return buf;
+}
+
+
 IRModule *lower_program(ProgramNode *prog) {
     IRModule  *mod = ir_module_new();
     LowerState s   = { .mod = mod, .next_temp = 0, .next_label = 0, .loop_top = 0 };
@@ -2363,7 +2620,19 @@ IRModule *lower_program(ProgramNode *prog) {
             ins->str_extra2 = (sv->var_type.kind == TYPE_SIMPLE && sv->var_type.name)
                               ? strdup(sv->var_type.name) : strdup("int");
             ins->str_extra3 = sv->section ? strdup(sv->section) : NULL;
-            if (sv->initializer && sv->initializer->type == NODE_LITERAL) {
+            if (sv->initializer && sv->initializer->type == NODE_STRUCT_LITERAL) {
+                int nbytes = 0;
+                unsigned char *bytes = fold_struct_literal_to_bytes(
+                    (StructLiteralNode *)sv->initializer, &s, &nbytes);
+                if (bytes) {
+                    ins->init_bytes     = bytes;
+                    ins->init_bytes_len = nbytes;
+                    /* str_extra2 (type name) already carries the class name
+                       via var_type.name for a struct-typed static, so codegen
+                       knows the right size even without src1. */
+                }
+                ins->src1 = irop_const_int(0);
+            } else if (sv->initializer && sv->initializer->type == NODE_LITERAL) {
                 LiteralNode *lit = (LiteralNode *)sv->initializer;
                 if (lit->lit_type == LIT_INT)
                     ins->src1 = irop_const_int(atol(lit->value));

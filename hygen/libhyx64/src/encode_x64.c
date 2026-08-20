@@ -277,9 +277,46 @@ size_t enc_jcc_rel32(X64Buf *b, CondCode cc) {
 void enc_syscall(X64Buf *b) { x64_buf_push(b, 0x0F); x64_buf_push(b, 0x05); }
 void enc_cli(X64Buf *b) { x64_buf_push(b, 0xFA); }
 void enc_sti(X64Buf *b) { x64_buf_push(b, 0xFB); }
+void enc_hlt(X64Buf *b) { x64_buf_push(b, 0xF4); }
 void enc_iretq(X64Buf *b) { x64_buf_push(b, 0x48); x64_buf_push(b, 0xCF); }
 void enc_in_al_dx(X64Buf *b) { x64_buf_push(b, 0xEC); }
 void enc_out_dx_al(X64Buf *b) { x64_buf_push(b, 0xEE); }
+/* 16-bit port I/O - same opcodes as the 8-bit forms, with the operand-size
+   override prefix (0x66) to select AX over AL. */
+void enc_in_ax_dx(X64Buf *b) { x64_buf_push(b, 0x66); x64_buf_push(b, 0xED); }
+void enc_out_dx_ax(X64Buf *b) { x64_buf_push(b, 0x66); x64_buf_push(b, 0xEF); }
+
+/* lgdt/lidt/invlpg take a MEMORY operand ([addr], mod=0) - the caller MUST
+   pass a register that is safe to use as a bare [reg] base in the mod=0
+   ModRM encoding, i.e. not RSP/R12 (needs a SIB byte) and not RBP/R13
+   (mod=0 rm=101 means RIP-relative, not [rbp]/[r13]). Every call site in
+   lower_x64.c loads the operand into RAX specifically for this reason. */
+void enc_lgdt_mem(X64Buf *b, X64Reg addr) {
+    if (addr >= 8) x64_buf_push(b, 0x41);
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, 0x01);
+    x64_buf_push(b, x64_modrm(0, 2, addr));
+}
+void enc_lidt_mem(X64Buf *b, X64Reg addr) {
+    if (addr >= 8) x64_buf_push(b, 0x41);
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, 0x01);
+    x64_buf_push(b, x64_modrm(0, 3, addr));
+}
+void enc_invlpg_mem(X64Buf *b, X64Reg addr) {
+    if (addr >= 8) x64_buf_push(b, 0x41);
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, 0x01);
+    x64_buf_push(b, x64_modrm(0, 7, addr));
+}
+/* ltr r/m16 - register form. A segment selector is always 16 bits; no 66
+   operand-size prefix is needed for this particular opcode/group. */
+void enc_ltr_r16(X64Buf *b, X64Reg reg) {
+    if (reg >= 8) x64_buf_push(b, 0x41);
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, 0x00);
+    x64_buf_push(b, x64_modrm(3, 3, reg));
+}
 void enc_wrmsr(X64Buf *b) { x64_buf_push(b, 0x0F); x64_buf_push(b, 0x30); }
 void enc_rdmsr(X64Buf *b) { x64_buf_push(b, 0x0F); x64_buf_push(b, 0x32); }
 
