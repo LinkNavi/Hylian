@@ -11,7 +11,15 @@ resolves to `stdlib/os/fs.hy` on disk).
 | [`string`](string.md) | String manipulation |
 | [`mem`](mem.md) | The arena allocator backing `new` — always linked |
 | [`runtime`](runtime.md) | Builtins behind the `print`/`println` syntax — always linked |
-| [`net`](net.md) | Raw IPv4/TCP sockets |
+| [`bytes`](bytes.md) | Length-carrying byte buffers (binary-safe), growable `Buffer` |
+| [`map`](map.md) | String-keyed hash map |
+| [`net`](net.md) | Raw IPv4 TCP/UDP sockets |
+| [`dns`](dns.md) | Hostname → IPv4 resolver (`/etc/hosts` + UDP DNS) |
+| [`http`](http.md) | HTTP/1.1 client (plain `http://`) |
+| [`https`](https.md) | HTTP client over TLS + scheme-agnostic `fetch` |
+| [`tls`](tls.md) | Verified TLS client connections (system OpenSSL) |
+| [`inflate`](inflate.md) | DEFLATE / gzip decompression |
+| [`tar`](tar.md) | tar reader / safe extractor |
 | [`time`](time.md) | Wall-clock time and sleep |
 | [`os.exec`](os.exec.md) | Process creation and control |
 | [`os.fs`](os.fs.md) | Filesystem operations |

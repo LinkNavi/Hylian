@@ -1,0 +1,17 @@
+No DNS resolution — net.hy is explicit about this: IPv4/TCP only, callers must pass a raw dotted-quad IP. No getaddrinfo, no /etc/hosts parsing, no resolver. You can't connect() to github.com, only to 140.82.x.x. This is the single biggest blocker — you'd have to either hardcode IPs or write a DNS-over-UDP resolver from scratch (packet building/parsing, which the language can do, but nothing exists yet).
+
+No TLS/SSL — everything in net.hy is a plaintext socket. Almost every real package registry is HTTPS-only. There's no crypto primitives (AES/SHA/RSA/EC), no TLS handshake code, nothing to link against (no OpenSSL FFI wrapper either — check FFI dir, but nothing calls into libssl currently). Without this you're limited to http:// mirrors you control yourself.
+
+No HTTP layer at all — net.hy stops at raw send/recv. There's no request builder, no status-line/header parser, no chunked-transfer-encoding support. You'd be writing an HTTP/1.1 client from scratch on top of the sockets.
+
+No hash map / dictionary type — confirmed nothing in the language or stdlib (array<T> exists, no map<K,V>). A package manager needs this for a dependency graph, a lockfile's {name: version} table, HTTP headers, etc. You'd have to fake it with parallel arrays or write your own hash table.
+
+No string split/join/format — string.hy has trim, slice, index_of, contains, concat, case conversion — but no split(s, delim) and no sprintf-style formatting. You'll need these constantly for parsing HTTP responses, semver strings, and manifest files.
+
+No archive/decompression support — no tar, zip, or gzip anywhere in the codebase. Registries serve compressed tarballs; you'd need to implement inflate/gzip decoding and a tar reader yourself, or design your registry to serve raw uncompressed files (simplifies things a lot for v1).
+
+No directory listing (readdir) — fs.hy has open/read/write/stat/mkdir/etc. but no opendir/readdir equivalent, which you'd want for walking an extracted package or a local cache directory.
+
+Known compiler bugs that'll bite you directly: from BUGS, str.starts_with() as a method doesn't work (must call starts_with(s, prefix) as a free function — you already have this pattern in net.hy's comments), and eh = eh++ double-increments unpredictably — worth avoiding post-increment-in-assignment in the retry/loop logic you'll write.
+
+Practical path forward: given no DNS/TLS, the realistic v1 is an HTTP-only registry at a raw IP (or you resolve hostnames once yourself and hardcode/cache the IP), fetching uncompressed tarballs-as-flat-files or even just raw .hy source files, skipping compression until gzip/tar support exists, and rolling your own tiny hash map for the dependency table since nothing in the stdlib provides one.

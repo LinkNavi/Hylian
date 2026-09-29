@@ -58,7 +58,10 @@ str int_to_str(int n) {
         pos -= 1;
     }
 
-    return slice(cast<str>(buf), pos + 1, 31);
+    // Point at the first digit instead of slice()-ing from buf: the bytes
+    // before it are all NUL, so length(buf) is 0 and slice() clamped the
+    // result to "" (int_to_str always returned an empty string).
+    return cast<str>(buf + cast<usize>(pos + 1));
 }
 
 // str_to_int: parse a decimal string (optional leading whitespace, optional

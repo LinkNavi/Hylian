@@ -211,3 +211,18 @@ code. Most of the rest of this reference describes what the *grammar* supports e
 where a note above says the backend isn't there yet — that's the point of this page:
 read the feature docs for the design, read this page for what's actually load-bearing
 right now.
+
+---
+
+### Notes found while building the networking stack
+
+- **Nested generics need a space:** `cast<array<str>>(x)` fails to parse because `>>` lexes
+  as a shift operator. Write `cast<array<str> >(x)`.
+- **Class values are stored inline, not by pointer.** `cast<MyClass>(raw_alloc(n))` doesn't
+  give you a heap object that survives being returned from a function. The stdlib modules
+  that need a heap-allocated handle (`map`, `bytes` buffers, `http` responses) use an
+  opaque `usize` pointing at a raw word block instead.
+- **`in` is a reserved word** (for-in loops) — it can't be used as a variable name.
+- **Zora:** `zora` links `mem`, `runtime` and `array` automatically, but stdlib modules
+  written in Hylian are found via `include { std.<module> }` (from `$HYLIAN_LIB` or the
+  installed `/usr/local/lib/hylian/std`), so re-run `devInstall.sh` after changing `stdlib/`.

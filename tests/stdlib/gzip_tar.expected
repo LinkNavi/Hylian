@@ -1,0 +1,8 @@
+ok data.gz
+ok data0.gz
+ok small.gz
+corrupt rejected
+4
+4
+-1
+unsafe path in archive: ../escape.txt

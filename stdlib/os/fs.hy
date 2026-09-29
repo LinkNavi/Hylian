@@ -3,6 +3,7 @@
 include {
     platform.linux_x86_64,
     string,
+    bytes,
 }
 
 // open: open a file, returns a file descriptor or a negative errno on error.
@@ -273,4 +274,52 @@ int pipe(usize read_fd_out, usize write_fd_out) {
     }
     raw_free(fds, 8);
     return rc;
+}
+
+// list_dir: names of the entries in directory `path`, in the order the
+// filesystem returns them (unsorted), excluding "." and "..". Returns nil if
+// the directory can't be opened (missing, not a directory, no permission);
+// an empty directory gives an empty array.
+//
+//   array<str> names = list_dir("cache");
+//   int i = 0;
+//   while (i < names.len) { ... names[i] ... i += 1; }
+//
+// Reads with getdents64, whose records are:
+//   offset 0: d_ino (8)   offset 8: d_off (8)   offset 16: d_reclen (2)
+//   offset 18: d_type (1) offset 19: d_name (NUL-terminated)
+// A record's reclen is the distance to the next one.
+array<str> list_dir(str path) {
+    int fd = open(path, O_RDONLY + O_DIRECTORY, 0);
+    if (fd < 0) { return nil; }
+
+    array<str> names = [];
+    int cap = 8192;
+    usize buf = bytes_alloc(cap);
+    while (true) {
+        int n = syscall(NR_GETDENTS64, fd, cast<int>(buf), cap);
+        if (n <= 0) { break; }
+        int off = 0;
+        while (off < n) {
+            int reclen = get8(buf, off + 16) + get8(buf, off + 17) * 256;
+            int nlen = 0;
+            while (get8(buf, off + 19 + nlen) != 0) { nlen += 1; }
+            str name = bytes_to_str(buf, off + 19, nlen);
+            if (!equals(name, ".") && !equals(name, "..")) { names.push(name); }
+            off += reclen;
+        }
+    }
+    bytes_free(buf, cap);
+    close(fd);
+    return names;
+}
+
+// mkdir_p: create `path` and any missing parent directories (like
+// `mkdir -p`). Returns true if the directory exists afterwards.
+bool mkdir_p(str path) {
+    if (is_dir(path)) { return true; }
+    int slash = last_index_of(path, "/");
+    if (slash > 0) { mkdir_p(slice(path, 0, slash)); }
+    mkdir(path, 493); // 0755
+    return is_dir(path);
 }

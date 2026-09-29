@@ -49,6 +49,7 @@ static int NR_KILL          = 62;
 static int NR_UNAME         = 63;
 static int NR_FCNTL         = 72;
 static int NR_GETCWD        = 79;
+static int NR_GETDENTS64   = 217;
 static int NR_CHDIR         = 80;
 static int NR_MKDIR         = 83;
 static int NR_RMDIR         = 84;
@@ -87,6 +88,7 @@ static int O_RDWR   = 2;
 static int O_CREAT  = 0x40;
 static int O_TRUNC  = 0x200;
 static int O_APPEND = 0x400;
+static int O_DIRECTORY = 0x10000;
 
 // ── access() mode bits ───────────────────────────────────────────────────────
 

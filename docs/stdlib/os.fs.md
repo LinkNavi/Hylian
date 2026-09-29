@@ -43,3 +43,25 @@ int main() {
     return 0;
 }
 ```
+
+## Directory listing and `mkdir -p`
+
+| Function | Signature | Description |
+|---|---|---|
+| `list_dir` | `array<str> list_dir(str path)` | Names of the entries in a directory (excluding `.` and `..`), in filesystem order — **unsorted**. Returns `nil` if the directory can't be opened; an empty directory gives an empty array. Uses `getdents64`. |
+| `mkdir_p` | `bool mkdir_p(str path)` | Create `path` and any missing parents (mode `0755`). Returns `true` if the directory exists afterwards. |
+
+```hylian
+include { io, string, os.fs, }
+
+int main() {
+    array<str> names = list_dir("cache");
+    if (names == nil) { return 1; }
+    int i = 0;
+    while (i < names.len) {
+        println(names[i]);
+        i += 1;
+    }
+    return 0;
+}
+```

@@ -47,13 +47,18 @@ what's on disk:
 | Include path | File | Contents |
 |---|---|---|
 | `io` | `stdlib/io.hy` | `print`, `println`, `eprint`, `eprintln`, `int_to_str`, `str_to_int`, `read_line` |
-| `string` | `stdlib/string.hy` | `length`, `is_empty`, `equals`, `index_of`, `contains`, `starts_with`, `ends_with`, `slice`, `trim`/`trim_start`/`trim_end`, `to_upper`, `to_lower`, `concat` |
+| `string` | `stdlib/string.hy` | `length`, `is_empty`, `equals`, `index_of`, `contains`, `starts_with`, `ends_with`, `slice`, `trim`/`trim_start`/`trim_end`, `to_upper`, `to_lower`, `concat`, `split`, `join`, `replace`, `repeat`, `format`, `parse_int`, `parse_hex`, `char_at`, `last_index_of` |
 | `mem` | `stdlib/mem.hy` | The arena allocator backing `new` (`arena_init`/`arena_alloc`/`arena_free`) — always linked, not something you `include` directly. |
 | `runtime` | `stdlib/runtime.hy` | `hylian_print`/`hylian_println`, the builtins the `print`/`println` *syntax* itself compiles down to — always linked regardless of what you `include`. |
-| `net` | `stdlib/net.hy` | Raw IPv4/TCP sockets: `tcp_socket`, `connect`, `bind`, `listen`, `accept`, `send`, `recv`, `close`, `shutdown` |
+| `net` | `stdlib/net.hy` | Raw IPv4 TCP/UDP sockets: `tcp_socket`, `udp_socket`, `connect`, `bind`, `listen`, `accept`, `send`, `recv`, `sendto`, `recvfrom`, `close`, `shutdown`, `set_timeout` |
+| `bytes` | `stdlib/bytes.hy` | Binary-safe byte buffers (`get8`/`set8`, `bytes_copy`, growable `buf_*`) |
+| `map` | `stdlib/map.hy` | String-keyed hash map (`map_new`, `map_put`, `map_get`, …) |
+| `dns` | `stdlib/dns.hy` | `dns_resolve` (`/etc/hosts` + UDP DNS) |
+| `http` / `https` / `tls` | `stdlib/http.hy`, `https.hy`, `tls.hy` | HTTP/1.1 client, HTTPS via system OpenSSL, `fetch` |
+| `inflate` / `tar` | `stdlib/inflate.hy`, `tar.hy` | `gunzip`, `tar_extract`, `tar_list` |
 | `time` | `stdlib/time.hy` | `now`, `nanos`, `millis`, `sleep` |
 | `os.exec` | `stdlib/os/exec.hy` | `fork`, `pid`, `kill`, `wait`, `exec`, `spawn` |
-| `os.fs` | `stdlib/os/fs.hy` | `open`, `create`, `close`, `read`, `write`, `pread`, `pwrite`, `read_all`, `write_all`, `exists`, `mkdir`, `rmdir`, `remove`, `chmod`, `chown`, `cwd`, `chdir`, `dup`, `dup2`, `pipe` |
+| `os.fs` | `stdlib/os/fs.hy` | `open`, `create`, `close`, `read`, `write`, `pread`, `pwrite`, `read_all`, `write_all`, `exists`, `mkdir`, `mkdir_p`, `list_dir`, `rmdir`, `remove`, `chmod`, `chown`, `cwd`, `chdir`, `dup`, `dup2`, `pipe` |
 | `os.mount` | `stdlib/os/mount.hy` | `mount`, `unmount`, `reboot`, `poweroff`, `halt`, `enable_cad`, `disable_cad` |
 | `os.user` | `stdlib/os/user.hy` | `uid`, `gid`, `euid`, `egid`, `set_uid`, `set_gid`, `is_root` |
 | `platform.linux_x86_64` | `stdlib/platform/linux_x86_64.hy` | Syscall numbers, flag constants, and the shared `raw_alloc`/`raw_free` every other module builds on |

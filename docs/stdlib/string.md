@@ -25,10 +25,28 @@ become sugar for `trim(s)` later without changing this file.
 | `to_upper` | `str to_upper(str s)` | ASCII-only uppercase conversion; returns a new string. |
 | `to_lower` | `str to_lower(str s)` | ASCII-only lowercase conversion; returns a new string. |
 | `concat` | `str concat(str a, str b)` | New string containing `a` followed by `b`. |
+| `char_at` | `int char_at(str s, int i)` | Byte at index `i` as `0`–`255`, or `-1` if out of range. |
+| `last_index_of` | `int last_index_of(str s, str needle)` | Index of the last occurrence of `needle`, or `-1`. |
+| `index_of_from` | `int index_of_from(str s, str needle, int from)` | Like `index_of`, searching from byte offset `from`; the result indexes into `s`. |
+| `split` | `array<str> split(str s, str delim)` | Pieces between each `delim`. `split("a,b,,c", ",")` → `["a","b","","c"]`; adjacent delimiters give empty strings, `split("", ",")` gives `[""]`, an empty `delim` gives `[s]`. |
+| `join` | `str join(array<str> parts, str sep)` | Concatenate `parts` with `sep` between each pair. |
+| `replace` | `str replace(str s, str from, str to)` | Every occurrence of `from` replaced by `to` (an empty `from` returns a copy). |
+| `repeat` | `str repeat(str s, int n)` | `s` repeated `n` times (`""` for `n <= 0`). |
+| `format` | `str format(str fmt, array<str> args)` | Substitute each `{}` in `fmt` with the next element of `args`. Leftover `{}` stay as-is; extra args are ignored. No format specifiers — convert numbers with `int_to_str` first (there are no variadics). |
+| `parse_int` | `int parse_int(str s, int fallback)` | Optionally-signed decimal integer; `fallback` if `s` is empty or not entirely digits. |
+| `parse_hex` | `int parse_hex(str s, int fallback)` | Unprefixed hex integer (either case); `fallback` on bad input. |
 
-There is no `split`, `join`, `replace`, `to_int`/`to_float`/`from_int` in the current
-`string.hy` — those appeared in older drafts of this documentation but don't exist in
-the source today.
+```hylian
+include { io, string, }
+
+int main() {
+    array<str> parts = split("GET /index.html HTTP/1.1", " ");
+    println(parts[1]);                                       // /index.html
+    println(join(parts, "|"));                               // GET|/index.html|HTTP/1.1
+    println(format("{} has {} items", ["cart", int_to_str(3)]));
+    return 0;
+}
+```
 
 ```hylian
 include { io, string, }

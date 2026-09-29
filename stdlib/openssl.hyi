@@ -1,0 +1,40 @@
+// Hylian stdlib interface — std.openssl
+//
+// Hand-written binding for the handful of OpenSSL (libssl 1.1 / 3.x) calls
+// that std.tls needs. Handles (SSL_CTX*, SSL*, ...) are plain `usize`
+// addresses; nothing here is meant to be called directly - use `tls`/`https`.
+//
+// A project that uses tls/https must link libssl + libcrypto, e.g. by adding
+// a system dependency in Zora.toml:
+//
+//   [[target.myapp.deps]]
+//   system = "openssl"
+//
+// NOTE: C `int` results are only defined in the low 32 bits of the return
+// register; tls.hy sign-extends them itself.
+
+module std.openssl
+
+link "libssl.so.3"
+pkg "openssl"
+
+fn TLS_client_method() -> usize
+fn SSL_CTX_new(method: usize) -> usize
+fn SSL_CTX_free(ctx: usize)
+fn SSL_CTX_set_default_verify_paths(ctx: usize) -> int
+fn SSL_CTX_load_verify_locations(ctx: usize, cafile: str, capath: str) -> int
+fn SSL_CTX_set_options(ctx: usize, options: usize) -> usize
+fn SSL_CTX_set_verify(ctx: usize, mode: int, callback: usize)
+fn SSL_new(ctx: usize) -> usize
+fn SSL_free(ssl: usize)
+fn SSL_set_fd(ssl: usize, fd: int) -> int
+fn SSL_ctrl(ssl: usize, cmd: int, larg: int, parg: usize) -> int
+fn SSL_set1_host(ssl: usize, hostname: str) -> int
+fn SSL_get0_param(ssl: usize) -> usize
+fn X509_VERIFY_PARAM_set1_ip_asc(param: usize, ipasc: str) -> int
+fn SSL_connect(ssl: usize) -> int
+fn SSL_read(ssl: usize, buf: usize, num: int) -> int
+fn SSL_write(ssl: usize, buf: usize, num: int) -> int
+fn SSL_shutdown(ssl: usize) -> int
+fn SSL_get_error(ssl: usize, ret: int) -> int
+fn SSL_get_verify_result(ssl: usize) -> int

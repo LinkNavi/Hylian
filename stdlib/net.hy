@@ -1,12 +1,13 @@
 // net — low-level IPv4/TCP sockets over raw syscalls.
 //
-// Deliberately minimal for v0.1.0: IPv4 + TCP only, no DNS/getaddrinfo (that
-// needs either a resolver library or reading /etc/hosts + a real parser,
-// neither of which exists here yet - callers pass a raw dotted-quad IP).
+// IPv4 only: TCP streams plus UDP datagrams. This module itself takes raw
+// dotted-quad IPs; hostname lookup lives in `dns` (dns_resolve) and HTTP in
+// `http`, both built on this.
 
 include {
     platform.linux_x86_64,
     string,
+    bytes,
 }
 
 // _htons: host-to-network byte order for a 16-bit port number (x86-64 is
@@ -191,4 +192,69 @@ void close(int fd) {
 // how: 0=read, 1=write, 2=both.
 int shutdown(int fd, int how) {
     return syscall(NR_SHUTDOWN, fd, how);
+}
+
+// ── binary-safe send/recv ────────────────────────────────────────────────────
+//
+// send()/recv() above take `str`, which is fine for text but awkward for
+// binary payloads; these take a raw buffer address (see `bytes`).
+
+// send_bytes: send len bytes from buf. Returns bytes sent or a negative errno.
+int send_bytes(int fd, usize buf, int len) {
+    return syscall(NR_SENDTO, fd, cast<int>(buf), len, 0, 0, 0);
+}
+
+// recv_bytes: receive up to len bytes into buf. Returns bytes read, 0 when
+// the peer closed the connection, or a negative errno (-11 EAGAIN on timeout).
+int recv_bytes(int fd, usize buf, int len) {
+    return syscall(NR_RECVFROM, fd, cast<int>(buf), len, 0, 0, 0);
+}
+
+// send_all: keep calling send until all len bytes are out. Returns true on
+// success, false if the connection failed part way.
+bool send_all(int fd, usize buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = syscall(NR_SENDTO, fd, cast<int>(buf + cast<usize>(sent)), len - sent, 0, 0, 0);
+        if (n <= 0) { return false; }
+        sent += n;
+    }
+    return true;
+}
+
+// set_timeout: make recv (and connect's replies) on fd give up after
+// `seconds` instead of blocking forever - recv then returns -11 (EAGAIN).
+// Also applies to send. Returns 0 on success.
+int set_timeout(int fd, int seconds) {
+    usize tv = bytes_alloc(16); // struct timeval { tv_sec; tv_usec; }
+    set64(tv, 0, seconds);
+    set64(tv, 8, 0);
+    int a = syscall(NR_SETSOCKOPT, fd, 1, 20, cast<int>(tv), 16); // SOL_SOCKET, SO_RCVTIMEO
+    int b = syscall(NR_SETSOCKOPT, fd, 1, 21, cast<int>(tv), 16); // SO_SNDTIMEO
+    bytes_free(tv, 16);
+    if (a != 0) { return a; }
+    return b;
+}
+
+// ── UDP ──────────────────────────────────────────────────────────────────────
+
+// udp_socket: create a UDP/IPv4 socket. Returns a file descriptor or -1.
+int udp_socket() {
+    return syscall(NR_SOCKET, AF_INET, SOCK_DGRAM, 0);
+}
+
+// sendto: send one datagram of len bytes from buf to ip:port.
+// Returns bytes sent, or a negative errno / -1 on a malformed ip.
+int sendto(int fd, usize buf, int len, str ip, int port) {
+    if (!_parse_ipv4_valid(ip)) { return -1; }
+    SockAddrIn sa;
+    _fill_sockaddr_in(cast<usize>(&sa), ip, port);
+    return syscall(NR_SENDTO, fd, cast<int>(buf), len, 0, cast<int>(&sa), 16);
+}
+
+// recvfrom: receive one datagram (up to len bytes) into buf. Returns its
+// size or a negative errno (-11 on timeout; see set_timeout). The sender's
+// address is not reported.
+int recvfrom(int fd, usize buf, int len) {
+    return syscall(NR_RECVFROM, fd, cast<int>(buf), len, 0, 0, 0);
 }

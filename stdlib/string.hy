@@ -274,3 +274,194 @@ str concat(str a, str b) {
     unsafe { *uint8 tp = cast<*uint8>(term); *tp = 0; }
     return cast<str>(buf);
 }
+
+// char_at: the byte at index i as an int (0-255), or -1 if i is out of range.
+int char_at(str s, int i) {
+    if (i < 0 || i >= length(s)) { return -1; }
+    uint8 c;
+    unsafe { *uint8 bp = cast<*uint8>(cast<usize>(s) + cast<usize>(i)); c = *bp; }
+    return cast<int>(c);
+}
+
+// last_index_of: index of the last occurrence of needle in s, or -1.
+int last_index_of(str s, str needle) {
+    int ls = length(s);
+    int ln = length(needle);
+    if (ln == 0) { return ls; }
+    int i = ls - ln;
+    while (i >= 0) {
+        bool matched = true;
+        int j = 0;
+        while (j < ln) {
+            if (char_at(s, i + j) != char_at(needle, j)) { matched = false; }
+            j += 1;
+        }
+        if (matched) { return i; }
+        i -= 1;
+    }
+    return -1;
+}
+
+// index_of_from: like index_of, but starts searching at byte offset `from`.
+// Returns an index into s (not into the tail), or -1.
+int index_of_from(str s, str needle, int from) {
+    int ls = length(s);
+    int ln = length(needle);
+    if (from < 0) { from = 0; }
+    if (from > ls) { return -1; }
+    int i = from;
+    while (i <= ls - ln) {
+        bool matched = true;
+        int j = 0;
+        while (j < ln) {
+            if (char_at(s, i + j) != char_at(needle, j)) { matched = false; }
+            j += 1;
+        }
+        if (matched) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// split: break s into the pieces between each occurrence of delim.
+//   split("a,b,,c", ",") -> ["a", "b", "", "c"]
+// Adjacent delimiters yield empty strings, and an empty s yields [""] (one
+// empty piece), matching how most languages behave. An empty delim returns
+// [s] rather than looping forever.
+array<str> split(str s, str delim) {
+    array<str> parts = [];
+    int ls = length(s);
+    int ld = length(delim);
+    if (ld == 0) {
+        parts.push(slice(s, 0, ls));
+        return parts;
+    }
+    int start = 0;
+    while (true) {
+        int hit = index_of_from(s, delim, start);
+        if (hit < 0) {
+            parts.push(slice(s, start, ls));
+            return parts;
+        }
+        parts.push(slice(s, start, hit));
+        start = hit + ld;
+    }
+    return parts;
+}
+
+// join: concatenate parts with sep between each pair.
+//   join(["a", "b", "c"], "-") -> "a-b-c"
+str join(array<str> parts, str sep) {
+    int n = parts.len;
+    int ls = length(sep);
+    int total = 0;
+    int i = 0;
+    while (i < n) {
+        total += length(parts[i]);
+        i += 1;
+    }
+    if (n > 1) { total += ls * (n - 1); }
+
+    usize buf = raw_alloc(total + 1);
+    int pos = 0;
+    i = 0;
+    while (i < n) {
+        if (i > 0) { pos = _copy_into(buf, pos, sep); }
+        pos = _copy_into(buf, pos, parts[i]);
+        i += 1;
+    }
+    unsafe { *uint8 tp = cast<*uint8>(buf + cast<usize>(total)); *tp = 0; }
+    return cast<str>(buf);
+}
+
+// _copy_into: copy src's bytes to buf+pos, returning the new position.
+static int _copy_into(usize buf, int pos, str src) {
+    int n = length(src);
+    int i = 0;
+    while (i < n) {
+        uint8 c;
+        unsafe {
+            *uint8 sbp = cast<*uint8>(cast<usize>(src) + cast<usize>(i)); c = *sbp;
+            *uint8 dbp = cast<*uint8>(buf + cast<usize>(pos + i)); *dbp = c;
+        }
+        i += 1;
+    }
+    return pos + n;
+}
+
+// replace: every occurrence of `from` in s replaced by `to`. An empty `from`
+// returns a copy of s unchanged.
+str replace(str s, str from, str to) {
+    if (length(from) == 0) { return slice(s, 0, length(s)); }
+    return join(split(s, from), to);
+}
+
+// repeat: s concatenated n times ("" for n <= 0).
+str repeat(str s, int n) {
+    array<str> parts = [];
+    int i = 0;
+    while (i < n) {
+        parts.push(s);
+        i += 1;
+    }
+    return join(parts, "");
+}
+
+// format: substitute each "{}" in fmt with the next element of args, in order.
+//   format("GET {} HTTP/{}", ["/x", "1.1"]) -> "GET /x HTTP/1.1"
+// Placeholders beyond the end of args are left as "{}"; extra args are ignored.
+// There are no format specifiers - convert numbers with int_to_str first
+// (Hylian has no variadics, so args is a str array).
+str format(str fmt, array<str> args) {
+    array<str> pieces = split(fmt, "{}");
+    array<str> out = [];
+    int i = 0;
+    while (i < pieces.len) {
+        out.push(pieces[i]);
+        if (i < pieces.len - 1) {
+            if (i < args.len) { out.push(args[i]); } else { out.push("{}"); }
+        }
+        i += 1;
+    }
+    return join(out, "");
+}
+
+// parse_int: parse an optionally-signed decimal integer. Returns `fallback`
+// if s is empty or contains anything other than digits after the sign.
+int parse_int(str s, int fallback) {
+    int n = length(s);
+    if (n == 0) { return fallback; }
+    int i = 0;
+    int sign = 1;
+    if (char_at(s, 0) == 45) { sign = -1; i = 1; }
+    else if (char_at(s, 0) == 43) { i = 1; }
+    if (i >= n) { return fallback; }
+    int v = 0;
+    while (i < n) {
+        int c = char_at(s, i);
+        if (c < 48 || c > 57) { return fallback; }
+        v = v * 10 + (c - 48);
+        i += 1;
+    }
+    return v * sign;
+}
+
+// parse_hex: parse an unprefixed hexadecimal integer (either case); returns
+// `fallback` on empty or non-hex input.
+int parse_hex(str s, int fallback) {
+    int n = length(s);
+    if (n == 0) { return fallback; }
+    int v = 0;
+    int i = 0;
+    while (i < n) {
+        int c = char_at(s, i);
+        int d = -1;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        else if (c >= 97 && c <= 102) { d = c - 87; }
+        else if (c >= 65 && c <= 70) { d = c - 55; }
+        if (d < 0) { return fallback; }
+        v = v * 16 + d;
+        i += 1;
+    }
+    return v;
+}
