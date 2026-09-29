@@ -108,6 +108,84 @@ static char *strip_underscores(const char *s) {
 }
 
 
+/* Append `s` (with len bytes) to a growing malloc'd buffer. */
+static void sb_add(char **buf, size_t *len, size_t *cap, const char *s, size_t n) {
+    if (*len + n + 1 > *cap) {
+        while (*len + n + 1 > *cap) *cap = *cap ? *cap * 2 : 128;
+        *buf = realloc(*buf, *cap);
+    }
+    memcpy(*buf + *len, s, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+}
+
+/* Append a string-literal spelling of raw (still escaped, exactly as written
+   in the source) literal text. It already contains valid escapes, so it is
+   emitted verbatim inside quotes - except `{`, which is written as \x7b so an
+   unmatched "{{" in a literal can never be mistaken for interpolation when
+   the rewritten text is lexed again. */
+static void sb_add_quoted(char **buf, size_t *len, size_t *cap, const char *text, size_t n) {
+    sb_add(buf, len, cap, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        if (text[i] == '{') sb_add(buf, len, cap, "\\x7b", 4);
+        else sb_add(buf, len, cap, text + i, 1);
+    }
+    sb_add(buf, len, cap, "\"", 1);
+}
+
+/* Append expression source taken from inside a string literal: the only
+   escapes that are undone are \" and \\, which the string form needed and the
+   expression form doesn't ('\n' etc. are left for the char-literal rule). */
+static void sb_add_expr(char **buf, size_t *len, size_t *cap, const char *text, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (text[i] == '\\' && i + 1 < n && (text[i + 1] == '"' || text[i + 1] == '\\')) i++;
+        sb_add(buf, len, cap, text + i, 1);
+    }
+}
+
+/* Rewrite an interpolated string body (raw source text between the quotes) `a {{x + 1}} b` into the token text
+       __interp("a ", (x + 1), " b")
+   which the parser reads as an ordinary call. lower.c gives __interp its
+   meaning: convert each argument to text by its type and concatenate (so a
+   lone {{expr}} still yields a string). The
+   text is pushed back onto the input so the expressions are lexed and parsed
+   by exactly the same code as everything else - no second expression parser. */
+static char *rewrite_interpolation(const char *body, size_t blen) {
+    char *out = NULL; size_t olen = 0, ocap = 0;
+    sb_add(&out, &olen, &ocap, "__interp(", 9);
+    size_t i = 0, lit_start = 0;
+    int nargs = 0;
+    while (i <= blen) {
+        int at_open = (i + 1 < blen && body[i] == '{' && body[i + 1] == '{');
+        if (at_open || i == blen) {
+            size_t close = 0;
+            if (at_open) {
+                /* find the matching "}}"; if there is none the rest is literal */
+                for (size_t j = i + 2; j + 1 < blen; j++)
+                    if (body[j] == '}' && body[j + 1] == '}') { close = j; break; }
+                if (!close) { i++; continue; }
+            }
+            if (i > lit_start || (i == blen && nargs == 0)) {
+                if (nargs) sb_add(&out, &olen, &ocap, ", ", 2);
+                sb_add_quoted(&out, &olen, &ocap, body + lit_start, i - lit_start);
+                nargs++;
+            }
+            if (!at_open) break;
+            if (nargs) sb_add(&out, &olen, &ocap, ", ", 2);
+            sb_add(&out, &olen, &ocap, "(", 1);
+            sb_add_expr(&out, &olen, &ocap, body + i + 2, close - (i + 2));
+            sb_add(&out, &olen, &ocap, ")", 1);
+            nargs++;
+            i = close + 2;
+            lit_start = i;
+            continue;
+        }
+        i++;
+    }
+    sb_add(&out, &olen, &ocap, ")", 1);
+    return out;
+}
+
 %}
 
 %option noyywrap
@@ -117,6 +195,15 @@ static char *strip_underscores(const char *s) {
 
 [ \t\r\n]+          { /* skip whitespace */ }
 "//".*              { /* skip single-line comments */ }
+"/*"                {
+    /* C-style block comment (not nested) */
+    int c, prev = 0;
+    while ((c = input()) != EOF) {
+        if (c == '\n') yylineno++;
+        if (prev == '*' && c == '/') break;
+        prev = c;
+    }
+}
 
 "asm{"              {
     int capacity = 256;
@@ -155,6 +242,10 @@ static char *strip_underscores(const char *s) {
     return ASM_BLOCK;
 }
 "include"           { return INCLUDE; }
+"do"                { return DO; }
+"defer"             { return DEFER; }
+"typedef"           { return TYPEDEF; }
+"sizeof"            { return SIZE_OF; }
 "module"            { return MODULE; }
 "class"             { return CLASS; }
 "enum"              { return ENUM; }
@@ -206,7 +297,32 @@ static char *strip_underscores(const char *s) {
 "as"      { return AS; }
 "size_of" { return SIZE_OF; }
 [a-zA-Z_][a-zA-Z0-9_]*  { yylval.str = strdup(yytext); return IDENTIFIER; }
-[0-9]+\.[0-9]+           { yylval.str = strdup(yytext); return FLOAT_LITERAL; }
+[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)?  { yylval.str = strip_underscores(yytext); return FLOAT_LITERAL; }
+[0-9][0-9_]*[eE][+-]?[0-9]+                  { yylval.str = strip_underscores(yytext); return FLOAT_LITERAL; }
+0[bB][01_]+  {
+    char *clean = strip_underscores(yytext + 2);
+    yylval.num = (long)(unsigned long long)strtoull(clean, NULL, 2);
+    free(clean);
+    return NUMBER;
+}
+0[oO][0-7_]+  {
+    char *clean = strip_underscores(yytext + 2);
+    yylval.num = (long)(unsigned long long)strtoull(clean, NULL, 8);
+    free(clean);
+    return NUMBER;
+}
+'([^\\'\n]|\\x[0-9a-fA-F]{1,2}|\\.)'  {
+    /* character literal: 'a', '\n', '\x41' - an int holding the byte value.
+       Reuse the string-escape decoder on the text between the quotes. */
+    char *inner = strdup(yytext + 1);
+    inner[strlen(inner) - 1] = '\0';
+    char *quoted = malloc(strlen(inner) + 3);
+    sprintf(quoted, "\"%s\"", inner);
+    char *dec = decode_escapes(quoted);
+    yylval.num = (long)(unsigned char)dec[1];
+    free(inner); free(quoted); free(dec);
+    return NUMBER;
+}
 0[xX][0-9a-fA-F_]+  {
     char *clean = strip_underscores(yytext);
     yylval.num = (long)(unsigned long long)strtoull(clean, NULL, 16);
@@ -222,11 +338,14 @@ static char *strip_underscores(const char *s) {
 \"([^\\\"]|\\.)*\"       {
     /* yytext includes the surrounding quotes; decode_escapes keeps them */
     if (has_interpolation(yytext + 1)) {
-        yylval.str = decode_escapes(yytext);
-        return INTERP_STRING;
-    }
+        char *rewritten = rewrite_interpolation(yytext + 1, strlen(yytext) - 2);
+        for (int k = (int)strlen(rewritten) - 1; k >= 0; k--) unput(rewritten[k]);
+        free(rewritten);
+        /* no token of its own: the pushed-back __interp(...) call is lexed next */
+    } else {
     yylval.str = decode_escapes(yytext);
     return STRING_LITERAL;
+    }
 }
 
 "{"                 { return LBRACE; }
@@ -246,6 +365,13 @@ static char *strip_underscores(const char *s) {
 "*="                { return STAR_ASSIGN; }
 "/="                { return SLASH_ASSIGN; }
 "%="                { return MOD_ASSIGN; }
+"<<="               { return LSHIFT_ASSIGN; }
+">>="               { return RSHIFT_ASSIGN; }
+"&="                { return AND_ASSIGN; }
+"|="                { return OR_ASSIGN; }
+"^="                { return XOR_ASSIGN; }
+"..="               { return DOTDOTEQ; }
+".."                { return DOTDOT; }
 "="                 { return ASSIGN; }
 ":="                { return DECLARE_ASSIGN; }
 ":"                 { return COLON; }

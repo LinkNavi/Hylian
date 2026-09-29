@@ -156,16 +156,29 @@ usize hylian_multi_alloc(usize tag, usize value) {
 // Allocated from the same process-lifetime arena as multi values: an Error is
 // routinely returned upwards out of the function that created it, so it cannot
 // live in that function's own arena, which is freed on return.
-usize hylian_make_err(usize msg_ptr) {
+usize hylian_make_err(usize msg_ptr, usize code) {
     usize slot = cast<usize>(&MULTI_ARENA);
     if (MULTI_ARENA == cast<usize>(0)) {
         arena_init(slot);
     }
-    usize e = arena_alloc(slot, cast<usize>(8));
+    // two words: the message pointer, then the integer code (`Err("msg", 42)`;
+    // plain `Err("msg")` has code 0)
+    usize e = arena_alloc(slot, cast<usize>(16));
     unsafe {
         *cast<*usize>(e) = msg_ptr;
+        *cast<*usize>(e + cast<usize>(8)) = code;
     }
     return e;
+}
+
+// Error_code: the integer code an Error carries (0 for a nil Error).
+usize Error_code(usize err) {
+    if (err == cast<usize>(0)) { return cast<usize>(0); }
+    usize code;
+    unsafe {
+        code = *cast<*usize>(err + cast<usize>(8));
+    }
+    return code;
 }
 
 // Error_message: the message an Error carries. Returns nil for a nil Error

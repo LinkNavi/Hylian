@@ -20,6 +20,52 @@ const char *current_compile_target = "linux";
    same style as current_parse_file/current_compile_target above. */
 static char *pending_section = NULL;
 
+/* ── type aliases ─────────────────────────────────────────────────────────────
+   `typedef <type> Name;` records an alias here; every later mention of the
+   identifier `Name` in type position resolves to the aliased type at parse
+   time (so nothing past the parser needs to know aliases exist). A few
+   C-style spellings are built in, mapped onto the sized types the backend
+   already understands. */
+typedef struct { char *name; Type type; } TypeAlias;
+static TypeAlias *type_aliases = NULL;
+static int type_alias_count = 0;
+
+static const char *builtin_type_alias(const char *n) {
+    static const char *map[][2] = {
+        {"char","uint8"},{"byte","uint8"},{"u8","uint8"},{"u16","uint16"},
+        {"u32","uint32"},{"u64","uint64"},{"i8","int8"},{"i16","int16"},
+        {"i32","int32"},{"i64","int64"},{"short","int16"},{"ushort","uint16"},
+        {"uint","uint64"},{"long","int64"},{"ulong","uint64"},
+        {"size_t","usize"},{"ssize_t","isize"},{"uintptr","usize"},
+        {NULL,NULL}
+    };
+    for (int i = 0; map[i][0]; i++)
+        if (strcmp(n, map[i][0]) == 0) return map[i][1];
+    return NULL;
+}
+
+static Type resolve_type_name(char *name) {
+    for (int i = type_alias_count - 1; i >= 0; i--)
+        if (strcmp(type_aliases[i].name, name) == 0) return type_aliases[i].type;
+    const char *b = builtin_type_alias(name);
+    if (b) return make_simple_type((char *)b, 0);
+    return make_simple_type(name, 0);
+}
+
+static void add_type_alias(char *name, Type t) {
+    type_aliases = realloc(type_aliases, (type_alias_count + 1) * sizeof(TypeAlias));
+    type_aliases[type_alias_count].name = strdup(name);
+    type_aliases[type_alias_count].type = t;
+    type_alias_count++;
+}
+
+/* `do { body } while (cond);` has no node of its own: it is rewritten as
+       bool __do_N = true;
+       while (__do_N || cond) { __do_N = false; body }
+   so `continue` (which re-tests the loop condition) still runs `cond`, and
+   `break` works, exactly as in C. */
+static int do_while_counter = 0;
+
 void yyerror(const char *s) {
     /* Hint logic — inspect the Bison-generated message for common patterns */
     const char *hint = NULL;
@@ -153,6 +199,13 @@ void typelist_add(TypeList* l, Type t) {
 
 %define parse.error verbose
 
+/* The two reduce/reduce conflicts are `Foo ? x ...` at the start of a
+   statement, which is either a nullable-type declaration (`Foo? x = e;`) or
+   a ternary expression statement (`c ? a : b;`). Bison picks the earlier rule
+   (the declaration), which is what we want: a ternary is never useful as a
+   bare statement, and inside any expression there is no ambiguity. (Bison
+   only accepts %expect-rr for GLR parsers, so this stays a documented warning.) */
+
 %union {
     char* str;
     long num;
@@ -181,6 +234,8 @@ void typelist_add(TypeList* l, Type t) {
 %token ASSIGN DECLARE_ASSIGN
 %token INC DEC
 %token PLUS_ASSIGN MINUS_ASSIGN STAR_ASSIGN SLASH_ASSIGN MOD_ASSIGN
+%token LSHIFT_ASSIGN RSHIFT_ASSIGN AND_ASSIGN OR_ASSIGN XOR_ASSIGN
+%token DO DEFER TYPEDEF DOTDOT DOTDOTEQ
 %token AND OR NOT
 %token GE LE EQ NE GT LT
 %token ADDROF_FN
@@ -205,11 +260,13 @@ void typelist_add(TypeList* l, Type t) {
 %type <node_list> class_body stmt_list param_list params arg_list args union_types include_list switch_arms field_init_list
 %type <node> include_path
 %type <node> if_stmt
+%type <str> assign_op
 %type <node_list> else_tail
 
 
 /* Operator precedence, lowest to highest */
-%right ASSIGN PLUS_ASSIGN MINUS_ASSIGN STAR_ASSIGN SLASH_ASSIGN MOD_ASSIGN
+%right ASSIGN PLUS_ASSIGN MINUS_ASSIGN STAR_ASSIGN SLASH_ASSIGN MOD_ASSIGN LSHIFT_ASSIGN RSHIFT_ASSIGN AND_ASSIGN OR_ASSIGN XOR_ASSIGN
+%right QUESTION COLON
 %left OR
 %left AND
 %left PIPE
@@ -264,6 +321,23 @@ program:
         $$->declarations[$$->decl_count++] = (ASTNode*)$2;
     }
     | program section_attr { $$ = $1; }
+    | program TYPEDEF type IDENTIFIER SEMICOLON {
+        add_type_alias($4, $3);
+        free($4);
+        $$ = $1;
+    }
+    /* plain top-level variable: `int counter = 0;` is `static int counter = 0;` */
+    | program type IDENTIFIER ASSIGN expr SEMICOLON {
+        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR;
+        memset(&sv->base.resolved_type, 0, sizeof(Type));
+        sv->var_type = $2; sv->var_name = $3; sv->initializer = $5;
+        sv->is_const = 0; sv->array_size = 0;
+        sv->section = pending_section; pending_section = NULL;
+        $$ = $1;
+        $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
+        $$->declarations[$$->decl_count++] = (ASTNode*)sv;
+    }
     | program module_decl {
         $$ = $1;
         $$->declarations = realloc($$->declarations, ($$->decl_count+1)*sizeof(ASTNode*));
@@ -668,7 +742,8 @@ enum_body:
     }
     | enum_body COMMA IDENTIFIER {
         EnumNode *en = $1;
-        int next_val = en->variant_count;
+        /* one more than the previous variant, so `A, B = 5, C` gives C == 6 */
+        int next_val = en->variants[en->variant_count - 1].value + 1;
         en->variants = realloc(en->variants,
                                (en->variant_count + 1) * sizeof(EnumVariant));
         en->variants[en->variant_count].name  = strdup($3);
@@ -846,9 +921,20 @@ params:
         list_add(l,(ASTNode*)make_var_decl($1,$2,NULL));
         $$=l;
     }
+    | type IDENTIFIER ASSIGN expr {
+        /* default value; the initializer slot is otherwise unused on params */
+        NodeList* l=list_new();
+        list_add(l,(ASTNode*)make_var_decl($1,$2,$4));
+        $$=l;
+    }
     | params COMMA type IDENTIFIER {
         NodeList* l=(NodeList*)$1;
         list_add(l,(ASTNode*)make_var_decl($3,$4,NULL));
+        $$=l;
+    }
+    | params COMMA type IDENTIFIER ASSIGN expr {
+        NodeList* l=(NodeList*)$1;
+        list_add(l,(ASTNode*)make_var_decl($3,$4,$6));
         $$=l;
     }
     ;
@@ -888,9 +974,11 @@ type:
     | ISIZE    { $$ = make_simple_type("isize", 0); }
 | STAR type  { $$ = make_rawptr_type($2); }
 | AMP  type  { $$ = make_ref_type($2); }
-    | IDENTIFIER { $$ = make_simple_type($1,    0); free($1); }
+    | IDENTIFIER { $$ = resolve_type_name($1); }
     /* array<T> */
     | ARRAY LT type GT                      { $$ = make_array_type($3, 0); }
+    /* array<array<T>>: the lexer reads the closing '>>' as one shift token */
+    | ARRAY LT ARRAY LT type RSHIFT         { $$ = make_array_type(make_array_type($5, 0), 0); }
     /* array<T, N> */
     | ARRAY LT type COMMA NUMBER GT         { $$ = make_array_type($3, $5); }
     /* multi<any> */
@@ -950,6 +1038,17 @@ stmt:
     | static_var_decl { $$ = $1; }
     /* error recovery: skip a malformed statement up to the next ';' */
     | error SEMICOLON { $$ = NULL; yyerrok; }
+    /* defer call();   /   defer { ...statements... }   - runs when the function returns */
+    | DEFER expr SEMICOLON {
+        ASTNode **b = malloc(sizeof(ASTNode*));
+        b[0] = $2;
+        $$ = (ASTNode*)make_defer(b, 1);
+    }
+    | DEFER LBRACE stmt_list RBRACE {
+        NodeList *sl = (NodeList*)$3;
+        $$ = (ASTNode*)make_defer(sl->items, sl->count);
+        free(sl);
+    }
     | BREAK SEMICOLON    { $$ = (ASTNode*)make_break(); }
     | CONTINUE SEMICOLON { $$ = (ASTNode*)make_continue(); }
     | ASM_BLOCK {
@@ -994,12 +1093,27 @@ stmt:
     | IDENTIFIER ASSIGN expr SEMICOLON {
         $$ = (ASTNode*)make_assign($1, $3);
     }
-    /* compound assign */
-    | IDENTIFIER PLUS_ASSIGN expr SEMICOLON  { $$ = (ASTNode*)make_compound_assign("+=", $1, $3); }
-    | IDENTIFIER MINUS_ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_compound_assign("-=", $1, $3); }
-    | IDENTIFIER STAR_ASSIGN expr SEMICOLON  { $$ = (ASTNode*)make_compound_assign("*=", $1, $3); }
-    | IDENTIFIER SLASH_ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_compound_assign("/=", $1, $3); }
-    | IDENTIFIER MOD_ASSIGN expr SEMICOLON   { $$ = (ASTNode*)make_compound_assign("%=", $1, $3); }
+    /* compound assign: x += e; x <<= e; ... */
+    | IDENTIFIER assign_op expr SEMICOLON { $$ = (ASTNode*)make_compound_assign($2, $1, $3); }
+    /* compound assign through a field / element / pointer:
+       p.x += e;   a[i] -= e;   *p |= e;
+       Rewritten to a plain store of `target op e`, so the target expression is
+       evaluated twice - keep side effects out of it. */
+    | expr DOT IDENTIFIER assign_op expr SEMICOLON {
+        char op[4]; strncpy(op, $4, strlen($4) - 1); op[strlen($4) - 1] = '\0';
+        $$ = (ASTNode*)make_member_assign($1, $3,
+                 (ASTNode*)make_binary_op(op, (ASTNode*)make_member_access($1, strdup($3)), $5));
+    }
+    | expr LBRACKET expr RBRACKET assign_op expr SEMICOLON {
+        char op[4]; strncpy(op, $5, strlen($5) - 1); op[strlen($5) - 1] = '\0';
+        $$ = (ASTNode*)make_index_assign($1, $3,
+                 (ASTNode*)make_binary_op(op, (ASTNode*)make_index($1, $3), $6));
+    }
+    | STAR expr assign_op expr SEMICOLON {
+        char op[4]; strncpy(op, $3, strlen($3) - 1); op[strlen($3) - 1] = '\0';
+        $$ = (ASTNode*)make_binary_op("deref_store", $2,
+                 (ASTNode*)make_binary_op(op, (ASTNode*)make_unary_op("deref", $2, 0), $4));
+    }
     /* member assign: obj.field = expr */
     | expr DOT IDENTIFIER ASSIGN expr SEMICOLON {
         $$ = (ASTNode*)make_member_assign($1, $3, $5);
@@ -1027,6 +1141,44 @@ stmt:
         NodeList* sl=(NodeList*)$9; fn->body=sl->items; fn->body_count=sl->count; free(sl);
         $$ = (ASTNode*)fn;
     }
+    /* do { body } while (cond);  - see do_while_counter */
+    | DO LBRACE stmt_list RBRACE WHILE LPAREN expr RPAREN SEMICOLON {
+        char flag[48]; snprintf(flag, sizeof(flag), "__do_first_%d", do_while_counter++);
+        /* flag declared in an enclosing scope alongside the loop: emit as an
+           `if (true) { bool flag = true; while (...) {...} }` wrapper so the
+           declaration and loop travel as one statement */
+        NodeList* sl=(NodeList*)$3;
+        NodeList* inner = list_new();
+        list_add(inner, (ASTNode*)make_assign(flag, (ASTNode*)make_literal("false", LIT_BOOL)));
+        for (int i = 0; i < sl->count; i++) list_add(inner, sl->items[i]);
+        WhileNode* wn = make_while((ASTNode*)make_binary_op("||", (ASTNode*)make_identifier(strdup(flag)), $7));
+        wn->body = inner->items; wn->body_count = inner->count; free(inner);
+        free(sl->items); free(sl);
+        IfNode* wrap = make_if((ASTNode*)make_literal("true", LIT_BOOL));
+        wrap->then_body = malloc(2 * sizeof(ASTNode*));
+        wrap->then_body[0] = (ASTNode*)make_var_decl(make_simple_type("bool", 0), strdup(flag),
+                                                     (ASTNode*)make_literal("true", LIT_BOOL));
+        wrap->then_body[1] = (ASTNode*)wn;
+        wrap->then_count = 2;
+        $$ = (ASTNode*)wrap;
+    }
+    /* range loops: for (i in a..b) is i = a .. b-1;  for (i in a..=b) includes b */
+    | FOR LPAREN IDENTIFIER IN expr DOTDOT expr RPAREN LBRACE stmt_list RBRACE {
+        ForNode* fn = make_for(
+            (ASTNode*)make_var_decl(make_simple_type("int", 0), strdup($3), $5),
+            (ASTNode*)make_binary_op("<", (ASTNode*)make_identifier(strdup($3)), $7),
+            (ASTNode*)make_compound_assign("+=", $3, (ASTNode*)make_literal("1", LIT_INT)));
+        NodeList* sl=(NodeList*)$10; fn->body=sl->items; fn->body_count=sl->count; free(sl);
+        $$ = (ASTNode*)fn;
+    }
+    | FOR LPAREN IDENTIFIER IN expr DOTDOTEQ expr RPAREN LBRACE stmt_list RBRACE {
+        ForNode* fn = make_for(
+            (ASTNode*)make_var_decl(make_simple_type("int", 0), strdup($3), $5),
+            (ASTNode*)make_binary_op("<=", (ASTNode*)make_identifier(strdup($3)), $7),
+            (ASTNode*)make_compound_assign("+=", $3, (ASTNode*)make_literal("1", LIT_INT)));
+        NodeList* sl=(NodeList*)$10; fn->body=sl->items; fn->body_count=sl->count; free(sl);
+        $$ = (ASTNode*)fn;
+    }
     /* for-in: for (item in collection) */
     | FOR LPAREN IDENTIFIER IN expr RPAREN LBRACE stmt_list RBRACE {
         ForInNode* fn = make_for_in($3, 0, $5);
@@ -1052,6 +1204,19 @@ stmt:
     }
     ;
 
+assign_op:
+    PLUS_ASSIGN    { $$ = "+="; }
+    | MINUS_ASSIGN { $$ = "-="; }
+    | STAR_ASSIGN  { $$ = "*="; }
+    | SLASH_ASSIGN { $$ = "/="; }
+    | MOD_ASSIGN   { $$ = "%="; }
+    | LSHIFT_ASSIGN { $$ = "<<="; }
+    | RSHIFT_ASSIGN { $$ = ">>="; }
+    | AND_ASSIGN   { $$ = "&="; }
+    | OR_ASSIGN    { $$ = "|="; }
+    | XOR_ASSIGN   { $$ = "^="; }
+    ;
+
 switch_arms:
     /* empty */ { $$ = list_new(); }
     | switch_arms CASE expr COLON LBRACE stmt_list RBRACE {
@@ -1072,6 +1237,11 @@ for_init:
     type IDENTIFIER ASSIGN expr { $$ = (ASTNode*)make_var_decl($1, $2, $4); }
     | type IDENTIFIER           { $$ = (ASTNode*)make_var_decl($1, $2, NULL); }
     | IDENTIFIER ASSIGN expr    { $$ = (ASTNode*)make_assign($1, $3); }
+    | IDENTIFIER INC            { $$ = (ASTNode*)make_unary_op("++", (ASTNode*)make_identifier($1), 1); }
+    | IDENTIFIER DEC            { $$ = (ASTNode*)make_unary_op("--", (ASTNode*)make_identifier($1), 1); }
+    | INC IDENTIFIER            { $$ = (ASTNode*)make_unary_op("++", (ASTNode*)make_identifier($2), 0); }
+    | DEC IDENTIFIER            { $$ = (ASTNode*)make_unary_op("--", (ASTNode*)make_identifier($2), 0); }
+    | IDENTIFIER assign_op expr { $$ = (ASTNode*)make_compound_assign($2, $1, $3); }
     | /* empty */               { $$ = NULL; }
     ;
 
@@ -1095,6 +1265,15 @@ var_decl:
         }
         free(fl->items); free(fl);
         $$ = (ASTNode*)make_var_decl($1, $2, (ASTNode*)sl);
+    }
+    /* fixed-size local array: `int buf[16];` is a zero-filled array<int> of
+       length 16 (elements are one machine word each, like every array) */
+    | type IDENTIFIER LBRACKET expr RBRACKET SEMICOLON {
+        FuncCallNode *z = make_func_call("hylian_array_zeros");
+        z->args = malloc(sizeof(ASTNode*));
+        z->args[0] = $4;
+        z->arg_count = 1;
+        $$ = (ASTNode*)make_var_decl(make_array_type($1, 0), $2, (ASTNode*)z);
     }
     | type QUESTION IDENTIFIER ASSIGN expr SEMICOLON {
         Type t = $1; t.nullable = 1;
@@ -1203,13 +1382,21 @@ expr:
         free(tname);
         $$ = (ASTNode*)make_binary_op("cast", $6, type_node);
     }
-    /* size_of */
-    | SIZE_OF LPAREN IDENTIFIER RPAREN {
+    | CAST LT ARRAY LT type RSHIFT LPAREN expr RPAREN {
+        ASTNode *type_node = (ASTNode*)make_literal("void", LIT_STRING);
+        $$ = (ASTNode*)make_binary_op("cast", $8, type_node);
+    }
+    /* size_of(T) / sizeof(T) - T is any type, including builtin ones like int */
+    | SIZE_OF LPAREN type RPAREN {
         FuncCallNode *c = make_func_call("__size_of__");
         c->args = malloc(sizeof(ASTNode*));
-        c->args[0] = (ASTNode*)make_identifier($3);
+        c->args[0] = (ASTNode*)make_identifier($3.name ? strdup($3.name) : strdup("usize"));
         c->arg_count = 1;
         $$ = (ASTNode*)c;
+    }
+    /* ternary */
+    | expr QUESTION expr COLON expr {
+        $$ = (ASTNode*)make_ternary($1, $3, $5);
     }
     /* unary */
     | NOT expr          { $$ = (ASTNode*)make_unary_op("!", $2, 0); }

@@ -11,6 +11,8 @@ resolves to `stdlib/os/fs.hy` on disk).
 | [`string`](string.md) | String manipulation |
 | [`mem`](mem.md) | The arena allocator backing `new` — always linked |
 | [`runtime`](runtime.md) | Builtins behind the `print`/`println` syntax — always linked |
+| [`math`](math.md) | Integer and float math (`min`, `sqrt`, `sin`, `pow`, ...) |
+| [`assert`](assert.md) | `assert`, `assert_eq` — exit with a message on failure |
 | [`bytes`](bytes.md) | Length-carrying byte buffers (binary-safe), growable `Buffer` |
 | [`map`](map.md) | String-keyed hash map |
 | [`net`](net.md) | Raw IPv4 TCP/UDP sockets |

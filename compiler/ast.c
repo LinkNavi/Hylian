@@ -202,6 +202,14 @@ CompoundAssignNode *make_compound_assign(char *op, char *name, ASTNode *value) {
     return n;
 }
 
+TernaryNode *make_ternary(ASTNode *cond, ASTNode *then_expr, ASTNode *else_expr) {
+    TernaryNode *n = malloc(sizeof(TernaryNode));
+    n->base.type = NODE_TERNARY;
+    zero_resolved_type(&n->base);
+    n->cond = cond; n->then_expr = then_expr; n->else_expr = else_expr;
+    return n;
+}
+
 BinaryOpNode *make_binary_op(char *op, ASTNode *left, ASTNode *right) {
     BinaryOpNode *n = malloc(sizeof(BinaryOpNode));
     n->base.type = NODE_BINARY_OP;
@@ -280,6 +288,15 @@ BreakNode *make_break() {
 UnsafeBlockNode *make_unsafe_block(ASTNode **body, int body_count) {
     UnsafeBlockNode *n = malloc(sizeof(UnsafeBlockNode));
     n->base.type = NODE_UNSAFE;
+    zero_resolved_type(&n->base);
+    n->body       = body;
+    n->body_count = body_count;
+    return n;
+}
+
+DeferNode *make_defer(ASTNode **body, int body_count) {
+    DeferNode *n = calloc(1, sizeof(DeferNode));
+    n->base.type = NODE_DEFER;
     zero_resolved_type(&n->base);
     n->body       = body;
     n->body_count = body_count;

@@ -75,6 +75,17 @@ usize hylian_array_alloc(int hint) {
     return header;
 }
 
+// hylian_array_zeros: an array whose length is already `n`, every element 0.
+// Backs the fixed-size local declaration `int buf[16];` (the parser rewrites it
+// to `array<int> buf = hylian_array_zeros(16)`). The data block comes straight
+// from an anonymous mmap, which the kernel zero-fills, so nothing needs
+// clearing here.
+usize hylian_array_zeros(int n) {
+    usize header = hylian_array_alloc(n);
+    _arr_store(header, cast<usize>(n));
+    return header;
+}
+
 // hylian_array_free: release an array's storage. Not emitted by the compiler
 // (arrays currently live for the life of the process), but needed by any code
 // that builds a lot of short-lived arrays and wants the memory back.

@@ -116,3 +116,180 @@ int hylian_int_to_str(int val, usize buf, int buflen) {
     }
     return len;
 }
+
+// ── string building helpers for interpolation and float printing ────────────
+//
+// The compiler calls these directly (like hylian_int_to_str above): string
+// interpolation `"n = {{n}}"` lowers to a chain of hylian_str_concat calls
+// over hylian_str_from_* conversions, and print/println of a float goes
+// through hylian_float_to_str. Also always-linked, so also on the
+// is_arena_bootstrap_fn allowlist in compiler/lower.c (no auto arena).
+
+// hylian_str_alloc: n zeroed bytes for a string. Strings are small and
+// immutable, so rather than an mmap (a whole page) per string they're carved
+// out of 64 KiB chunks that are never freed - same "leaks by design, but
+// predictable" trade-off as multi values in mem.hy. Because they're never
+// freed, an interpolated string is safe to return from a function.
+static int _str_pool_ptr = 0;
+static int _str_pool_end = 0;
+
+usize hylian_str_alloc(int n) {
+    int need = (n + 8) / 8 * 8;
+    if (need > 32768) {
+        // big strings get their own mapping
+        return cast<usize>(syscall(9, 0, need, 3, 34, -1, 0));
+    }
+    if (_str_pool_ptr == 0 || _str_pool_ptr + need > _str_pool_end) {
+        int chunk = 65536;
+        int base = syscall(9, 0, chunk, 3, 34, -1, 0);
+        _str_pool_ptr = base;
+        _str_pool_end = base + chunk;
+    }
+    usize p = cast<usize>(_str_pool_ptr);
+    _str_pool_ptr = _str_pool_ptr + need;
+    return p;
+}
+
+int _rt_strlen(usize s) {
+    if (s == cast<usize>(0)) { return 0; }
+    int n = 0;
+    while (true) {
+        uint8 c;
+        unsafe { *uint8 bp = cast<*uint8>(s + cast<usize>(n)); c = *bp; }
+        if (cast<int>(c) == 0) { return n; }
+        n = n + 1;
+    }
+    return n;
+}
+
+// hylian_str_concat: new string a + b. nil counts as "".
+usize hylian_str_concat(usize a, usize b) {
+    int la = _rt_strlen(a);
+    int lb = _rt_strlen(b);
+    usize out = hylian_str_alloc(la + lb + 1);
+    int i = 0;
+    while (i < la) {
+        uint8 c;
+        unsafe {
+            *uint8 sp = cast<*uint8>(a + cast<usize>(i)); c = *sp;
+            *uint8 dp = cast<*uint8>(out + cast<usize>(i)); *dp = c;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < lb) {
+        uint8 c;
+        unsafe {
+            *uint8 sp = cast<*uint8>(b + cast<usize>(i)); c = *sp;
+            *uint8 dp = cast<*uint8>(out + cast<usize>(la + i)); *dp = c;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+usize hylian_str_from_int(int v) {
+    usize out = hylian_str_alloc(32);
+    int n = hylian_int_to_str(v, out, 31);
+    unsafe { *uint8 tp = cast<*uint8>(out + cast<usize>(n)); *tp = cast<uint8>(0); }
+    return out;
+}
+
+usize hylian_str_from_bool(int v) {
+    if (v != 0) { return cast<usize>("true"); }
+    return cast<usize>("false");
+}
+
+void _rt_put(usize buf, int pos, int c) {
+    unsafe { *uint8 p = cast<*uint8>(buf + cast<usize>(pos)); *p = cast<uint8>(c); }
+}
+
+// hylian_float_to_str: render x into buf (buflen >= 40) as plain decimal with
+// up to 6 fractional digits and trailing zeros trimmed to at least one
+// ("2.0", "3.14159"); values >= 1e15 switch to "d.dddddde+N"; "nan"/"inf"/
+// "-inf" as expected. Returns the byte count (no NUL is written).
+int hylian_float_to_str(float x, usize buf, int buflen) {
+    if (buflen < 40) { return 0; }
+    int pos = 0;
+    if (x != x) {
+        _rt_put(buf, 0, 110); _rt_put(buf, 1, 97); _rt_put(buf, 2, 110);
+        return 3;
+    }
+    if (x < 0.0) {
+        _rt_put(buf, pos, 45);
+        pos = pos + 1;
+        x = 0.0 - x;
+    }
+    if (x > 1.0e308) {
+        _rt_put(buf, pos, 105); _rt_put(buf, pos + 1, 110); _rt_put(buf, pos + 2, 102);
+        return pos + 3;
+    }
+    int exp10 = 0;
+    if (x >= 1.0e15) {
+        // scientific notation: normalise the mantissa into [1, 10)
+        while (x >= 10.0) {
+            x = x / 10.0;
+            exp10 = exp10 + 1;
+        }
+    }
+    int ip = cast<int>(x);
+    float frac = x - cast<float>(ip);
+    int scaled = cast<int>(frac * 1000000.0 + 0.5);
+    if (scaled >= 1000000) {
+        ip = ip + 1;
+        scaled = scaled - 1000000;
+    }
+    pos = pos + hylian_int_to_str(ip, buf + cast<usize>(pos), buflen - pos);
+    _rt_put(buf, pos, 46);
+    pos = pos + 1;
+    // up to six fractional digits, trailing zeros dropped but at least one
+    // digit kept: strip zeros arithmetically, then print what's left
+    // zero-padded on the left to its digit count
+    int nd = 6;
+    int tz = scaled;
+    while (nd > 1 && tz % 10 == 0) {
+        tz = tz / 10;
+        nd = nd - 1;
+    }
+    int div = 1;
+    int k = 1;
+    while (k < nd) {
+        div = div * 10;
+        k = k + 1;
+    }
+    while (div > 0) {
+        int digit = tz / div;
+        tz = tz - digit * div;
+        _rt_put(buf, pos, 48 + digit);
+        pos = pos + 1;
+        div = div / 10;
+    }
+    if (exp10 > 0) {
+        _rt_put(buf, pos, 101);
+        _rt_put(buf, pos + 1, 43);
+        pos = pos + 2;
+        pos = pos + hylian_int_to_str(exp10, buf + cast<usize>(pos), buflen - pos);
+    }
+    return pos;
+}
+
+usize hylian_str_from_float(float x) {
+    usize out = hylian_str_alloc(48);
+    int n = hylian_float_to_str(x, out, 47);
+    _rt_put(out, n, 0);
+    return out;
+}
+
+// hylian_panic: what `panic("msg")` compiles to. Writes "panic: msg" plus a
+// newline to stderr and terminates the process with exit status 1 (no
+// unwinding, no cleanup - like abort() with a message). Always linked.
+void hylian_panic(usize msg) {
+    int n = _rt_strlen(msg);
+    usize prefix = cast<usize>("panic: ");
+    syscall(1, 2, cast<int>(prefix), 7);
+    if (n > 0) { syscall(1, 2, cast<int>(msg), n); }
+    usize newline = cast<usize>(10);
+    usize newline_addr = cast<usize>(&newline);
+    syscall(1, 2, cast<int>(newline_addr), 1);
+    syscall(231, 1);
+}

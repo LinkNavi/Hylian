@@ -54,6 +54,7 @@ void enc_shift_cl(X64Buf *b, ShiftKind kind, X64Reg reg); /* reg = reg SHIFT cl 
 typedef enum {
     CC_E = 0x4, CC_NE = 0x5, CC_L = 0xC, CC_LE = 0xE, CC_G = 0xF, CC_GE = 0xD,
     CC_B = 0x2, CC_BE = 0x6, CC_A = 0x7, CC_AE = 0x3, /* unsigned variants */
+    CC_P = 0xA, CC_NP = 0xB, /* parity: set by ucomis* when an operand is NaN (unordered) */
 } CondCode;
 void enc_setcc(X64Buf *b, CondCode cc, X64Reg dst8); /* dst8 = cc ? 1 : 0, full reg zero-extended by caller's movzx */
 void enc_movzx_r64_r8(X64Buf *b, X64Reg dst, X64Reg src);

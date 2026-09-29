@@ -170,6 +170,31 @@ static int load_operand_f(LowerCtx *ctx, MIRValue v, int scratch_xmm) {
     }
 }
 
+/* Value -> GPR as raw bits. For a float value this moves the bit pattern
+   across (movq) instead of converting, which is how floats travel through
+   the integer paths: stored to memory slots, passed as call arguments and
+   returned. Hylian-to-Hylian calls pass floats this way (in the integer
+   argument registers) - NOT the SysV xmm convention - so a Hylian `float`
+   function can't be called from C or vice versa. For non-floats it's exactly
+   load_operand. */
+static X64Reg load_operand_bits(LowerCtx *ctx, MIRValue v, X64Reg scratch) {
+    if (!mir_type_is_float(v.type)) return load_operand(ctx, v, scratch);
+    if (v.kind == MIRV_IMM_FLOAT) {
+        if (v.type == MIR_F32) {
+            float f = (float)v.imm_float;
+            uint32_t bits; memcpy(&bits, &f, 4);
+            enc_mov_ri64(ctx->code, scratch, (int64_t)(uint64_t)bits);
+        } else {
+            uint64_t bits; memcpy(&bits, &v.imm_float, 8);
+            enc_mov_ri64(ctx->code, scratch, (int64_t)bits);
+        }
+        return scratch;
+    }
+    int x = load_operand_f(ctx, v, X64_XMM_SCRATCH_A);
+    enc_movq_xmm_to_gpr(ctx->code, scratch, x);
+    return scratch;
+}
+
 static void store_result_f(LowerCtx *ctx, MIRValue dest, int from_xmm) {
     if (dest.kind != MIRV_VREG) return;
     MCLoc loc = ctx->ra->vreg_locs[dest.vreg];
@@ -239,12 +264,32 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
            its local slot right away. Anything beyond 6 needs stack-passed
            args, which isn't supported yet - same limitation already flagged
            for calls, just visible from the other side of the call here. */
-        int nparams = fn->param_count < X64_SYSV_ARG_REG_COUNT ? fn->param_count : X64_SYSV_ARG_REG_COUNT;
-        for (int i = 0; i < nparams; i++)
-            enc_mov_store(out_code, X64_RBP, local_offset(i), x64_sysv_arg_regs[i]);
-        if (fn->param_count > X64_SYSV_ARG_REG_COUNT)
-            fprintf(stderr, "[lower_x64] function '%s' has >6 params, stack-passed params "
-                    "not supported yet\n", fn->name);
+        /* SysV: integer-class parameters come in rdi, rsi, rdx, rcx, r8, r9
+           and float-class ones in xmm0-xmm7, each class counted separately
+           (so `f(int a, double b, int c)` is rdi, xmm0, rsi). Whatever
+           doesn't fit spills to the caller's stack in argument order: after
+           `push rbp; mov rbp, rsp` the first stack argument is at [rbp+16],
+           the next at [rbp+24], ... Every parameter is copied into its own
+           local slot straight away. */
+        {
+            int ii = 0, fi = 0, si = 0;
+            for (int i = 0; i < fn->param_count; i++) {
+                int isf = fn->param_types && mir_type_is_float(fn->param_types[i]);
+                int is32 = isf && fn->param_types[i] == MIR_F32;
+                if (isf && fi < 8) {
+                    if (is32) enc_movss_store(out_code, X64_RBP, local_offset(i), fi);
+                    else      enc_movsd_store(out_code, X64_RBP, local_offset(i), fi);
+                    fi++;
+                } else if (!isf && ii < X64_SYSV_ARG_REG_COUNT) {
+                    enc_mov_store(out_code, X64_RBP, local_offset(i), x64_sysv_arg_regs[ii]);
+                    ii++;
+                } else {
+                    enc_mov_load(out_code, X64_RAX, X64_RBP, 16 + 8 * si);
+                    enc_mov_store(out_code, X64_RBP, local_offset(i), X64_RAX);
+                    si++;
+                }
+            }
+        }
 
         /* Save the callee-saved registers regalloc handed out. Without this,
            a callee scribbling on rbx/r12-r15 would silently destroy a value
@@ -385,25 +430,41 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
 
         case MIR_FCMP_LT: case MIR_FCMP_LE: case MIR_FCMP_GT: case MIR_FCMP_GE:
         case MIR_FCMP_EQ: case MIR_FCMP_NE: {
-            /* NOTE: uses the flags straight off ucomisd/ucomiss without the
-               extra PF (unordered/NaN) check real IEEE-correct comparisons
-               need - a NaN operand will give a plausible-looking but not
-               spec-correct result here. Flagged, not silently "correct". */
+            /* ucomis* reports "unordered" (either operand NaN) as ZF=PF=CF=1.
+               So ordering compares are done as "above"/"above-or-equal" with
+               the operands arranged so that an unordered result is false
+               (a < b  is  b > a), and ==/!= also consult the parity flag:
+               NaN == anything is false, NaN != anything is true. */
             int a = load_operand_f(&ctx, ins->src1, X64_XMM_SCRATCH_A);
             int b = load_operand_f(&ctx, ins->src2, X64_XMM_SCRATCH_B);
             int is32 = (ins->src1.type == MIR_F32);
-            if (is32) enc_ucomiss(out_code, a, b); else enc_ucomisd(out_code, a, b);
-            CondCode cc;
+            int swap = (ins->op == MIR_FCMP_LT || ins->op == MIR_FCMP_LE);
+            int x = swap ? b : a, y = swap ? a : b;
+            if (is32) enc_ucomiss(out_code, x, y); else enc_ucomisd(out_code, x, y);
             switch (ins->op) {
-                case MIR_FCMP_LT: cc = CC_B; break;
-                case MIR_FCMP_LE: cc = CC_BE; break;
-                case MIR_FCMP_GT: cc = CC_A; break;
-                case MIR_FCMP_GE: cc = CC_AE; break;
-                case MIR_FCMP_EQ: cc = CC_E; break;
-                default: cc = CC_NE; break;
+                case MIR_FCMP_LT: case MIR_FCMP_GT:
+                    enc_setcc(out_code, CC_A, X64_RAX);
+                    enc_movzx_r64_r8(out_code, X64_RAX, X64_RAX);
+                    break;
+                case MIR_FCMP_LE: case MIR_FCMP_GE:
+                    enc_setcc(out_code, CC_AE, X64_RAX);
+                    enc_movzx_r64_r8(out_code, X64_RAX, X64_RAX);
+                    break;
+                case MIR_FCMP_EQ:
+                    enc_setcc(out_code, CC_E, X64_RAX);
+                    enc_setcc(out_code, CC_NP, X64_R11);
+                    enc_movzx_r64_r8(out_code, X64_RAX, X64_RAX);
+                    enc_movzx_r64_r8(out_code, X64_R11, X64_R11);
+                    enc_alu_rr(out_code, ALU_AND, X64_RAX, X64_R11);
+                    break;
+                default: /* MIR_FCMP_NE */
+                    enc_setcc(out_code, CC_NE, X64_RAX);
+                    enc_setcc(out_code, CC_P, X64_R11);
+                    enc_movzx_r64_r8(out_code, X64_RAX, X64_RAX);
+                    enc_movzx_r64_r8(out_code, X64_R11, X64_R11);
+                    enc_alu_rr(out_code, ALU_OR, X64_RAX, X64_R11);
+                    break;
             }
-            enc_setcc(out_code, cc, X64_RAX);
-            enc_movzx_r64_r8(out_code, X64_RAX, X64_RAX);
             store_result(&ctx, ins->dest, X64_RAX); /* comparison result is always int/bool */
             break;
         }
@@ -527,12 +588,18 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
                                 mir_type_size(ins->dest.type),
                                 !mir_type_is_unsigned(ins->dest.type));
             }
-            store_result(&ctx, ins->dest, X64_RAX);
+            if (mir_type_is_float(ins->dest.type)) {
+                /* memory holds the bit pattern; move it into an xmm register */
+                enc_movq_gpr_to_xmm(out_code, X64_XMM_SCRATCH_A, X64_RAX);
+                store_result_f(&ctx, ins->dest, X64_XMM_SCRATCH_A);
+            } else {
+                store_result(&ctx, ins->dest, X64_RAX);
+            }
             break;
         }
 
         case MIR_STORE: {
-            X64Reg val = load_operand(&ctx, ins->src1, X64_RAX);
+            X64Reg val = load_operand_bits(&ctx, ins->src1, X64_RAX);
             if (ins->dest.kind == MIRV_GLOBAL) {
                 size_t off = enc_mov_store_rip(out_code, val);
                 x64_reloc_add(out_relocs, off, ins->dest.global_name, X64_RELOC_RIP32);
@@ -574,22 +641,76 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
                are popped again before `call` executes, so rsp is back to
                its pre-call value and the call's own return-address push
                isn't affected. */
-            int n = ins->arg_count < X64_SYSV_ARG_REG_COUNT ? ins->arg_count : X64_SYSV_ARG_REG_COUNT;
-            for (int a = 0; a < n; a++) {
-                X64Reg r = load_operand(&ctx, ins->args[a], X64_RAX);
+            /* SysV classification: integer-class arguments take rdi, rsi, rdx,
+               rcx, r8, r9 and float-class ones take xmm0-xmm7, counted
+               separately; the overflow of either class goes on the stack, in
+               argument order. Class comes from the argument's MIR type, so
+               `sin(x)` puts x in xmm0 exactly as a C compiler would.
+               Every argument is materialised and pushed BEFORE any argument
+               register is written (a source vreg may live in a register we're
+               about to overwrite): stack arguments first (last one first, so
+               the first ends up lowest), then the register arguments, which
+               are popped straight into place in reverse. rsp must be 16-byte
+               aligned at the call, so an odd number of stack arguments gets a
+               dummy slot pushed first. `al` carries the number of xmm
+               registers used, which variadic C functions (printf) require. */
+            int nargs = ins->arg_count;
+            int reg_of[64], isf_of[64];
+            if (nargs > 64) nargs = 64;
+            int ii = 0, fi = 0, nstack = 0;
+            for (int a = 0; a < nargs; a++) {
+                int isf = mir_type_is_float(ins->args[a].type);
+                isf_of[a] = isf;
+                if (isf && fi < 8)                          reg_of[a] = fi++;
+                else if (!isf && ii < X64_SYSV_ARG_REG_COUNT) reg_of[a] = ii++;
+                else { reg_of[a] = -1; nstack++; }
+            }
+            int pad = nstack & 1;
+            if (pad) enc_push(out_code, X64_RAX);
+            for (int a = nargs - 1; a >= 0; a--) {
+                if (reg_of[a] >= 0) continue;
+                X64Reg r = load_operand_bits(&ctx, ins->args[a], X64_RAX);
                 enc_push(out_code, r);
             }
-            for (int a = n - 1; a >= 0; a--)
-                enc_pop(out_code, x64_sysv_arg_regs[a]);
-            if (ins->arg_count > X64_SYSV_ARG_REG_COUNT)
-                fprintf(stderr, "[lower_x64] call with >6 args not yet supported (stack args)\n");
+            for (int a = 0; a < nargs; a++) {
+                if (reg_of[a] < 0) continue;
+                X64Reg r = load_operand_bits(&ctx, ins->args[a], X64_RAX);
+                enc_push(out_code, r);
+            }
+            for (int a = nargs - 1; a >= 0; a--) {
+                if (reg_of[a] < 0) continue;
+                if (isf_of[a]) {
+                    enc_pop(out_code, X64_RAX);
+                    enc_movq_gpr_to_xmm(out_code, reg_of[a], X64_RAX);
+                } else {
+                    enc_pop(out_code, x64_sysv_arg_regs[reg_of[a]]);
+                }
+            }
+            enc_mov_ri64(out_code, X64_RAX, fi);
             if (ins->callee) {
                 size_t off = enc_call_rel32(out_code);
                 x64_reloc_add(out_relocs, off, ins->callee, X64_RELOC_REL32);
             } else {
                 fprintf(stderr, "[lower_x64] indirect calls not yet supported\n");
             }
-            store_result(&ctx, ins->dest, X64_RAX);
+            if (nstack + pad > 0) {
+                /* drop the stack arguments (add rsp, imm32) */
+                x64_buf_push(out_code, x64_rex(1, 0, X64_RSP));
+                x64_buf_push(out_code, 0x81);
+                x64_buf_push(out_code, x64_modrm(3, 0, X64_RSP));
+                x64_buf_write32(out_code, (uint32_t)(8 * (nstack + pad)));
+            }
+            if (ins->dest.kind == MIRV_VREG && mir_type_is_float(ins->dest.type)) {
+                store_result_f(&ctx, ins->dest, 0); /* float results come back in xmm0 */
+            } else {
+                /* a narrow integer result (C `int` etc.) only defines the low
+                   bytes of rax - extend to the full register */
+                if (ins->dest.kind == MIRV_VREG && mir_type_size(ins->dest.type) < 8 &&
+                    ins->dest.type != MIR_PTR)
+                    enc_ext_rr(out_code, X64_RAX, X64_RAX, mir_type_size(ins->dest.type),
+                               !mir_type_is_unsigned(ins->dest.type));
+                store_result(&ctx, ins->dest, X64_RAX);
+            }
             break;
         }
 
@@ -597,7 +718,14 @@ void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
             /* Return value into rax BEFORE restoring, since a restored
                register could otherwise overwrite it... and restore before
                `leave`, since leave drops the frame the saves live in. */
-            load_operand(&ctx, ins->src1, X64_RAX);
+            if (mir_type_is_float(ins->src1.type)) {
+                /* float return value goes in xmm0 (SysV) */
+                int rx = load_operand_f(&ctx, ins->src1, X64_XMM_SCRATCH_A);
+                if (ins->src1.type == MIR_F32) enc_movss_xx(out_code, 0, rx);
+                else                           enc_movsd_xx(out_code, 0, rx);
+            } else {
+                load_operand(&ctx, ins->src1, X64_RAX);
+            }
             if (!fn->is_naked) {
                 for (int cs = 0; cs < ra->callee_saved_int_used; cs++)
                     enc_mov_load(out_code, x64_int_reg_pool[cs], X64_RBP,

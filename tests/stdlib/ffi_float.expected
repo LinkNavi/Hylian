@@ -1,0 +1,9 @@
+sqrt=1.414214 pow=1024.0 floor=-3.0 fabs=7.25
+int args promoted: 4.0 32.0
+ldexp=24.0 hypot=5.0
+float32: 6.5
+c_mix=172.25
+callback=1014.5
+3.142/42
+c ints: -5 7 0 2.5
+sum sqrt = 6.146264

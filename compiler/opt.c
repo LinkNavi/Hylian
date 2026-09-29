@@ -125,23 +125,9 @@ int opt_constant_fold(IRModule *mod) {
             continue;
         }
 
-        /* strength reduction: mul by power-of-two -> shift (safe for both signs) */
-        if (ins->op == IR_MUL) {
-            int shift;
-            long other;
-            if (op_is_int_const(&ins->src2, &rv) && ins->src1.kind != IROP_CONST_INT &&
-                is_pow2(rv, &shift)) {
-                ins->op = IR_SHL; ins->src2 = irop_const_int(shift);
-                changes++; continue;
-            }
-            if (op_is_int_const(&ins->src1, &lv) && ins->src2.kind != IROP_CONST_INT &&
-                is_pow2(lv, &shift)) {
-                other = 0; (void)other;
-                IROperand base = ins->src2;
-                ins->op = IR_SHL; ins->src1 = base; ins->src2 = irop_const_int(shift);
-                changes++; continue;
-            }
-        }
+        /* (strength reduction of mul-by-power-of-two lives in ir_to_mir.c: the
+           IR has no types, so rewriting `f * 2` to a shift here also hit
+           floats) */
 
         /* binary float constants */
         double lf, rf;
@@ -153,7 +139,9 @@ int opt_constant_fold(IRModule *mod) {
             case IR_ADD: fresult = lf + rf; break;
             case IR_SUB: fresult = lf - rf; break;
             case IR_MUL: fresult = lf * rf; break;
-            case IR_DIV: fresult = rf != 0.0 ? lf / rf : 0.0; break;
+            case IR_DIV:
+                if (rf == 0.0) { ffold = 0; break; } /* leave x/0.0 to the hardware: inf / nan, not 0 */
+                fresult = lf / rf; break;
             default: ffold = 0; break;
             }
             if (ffold) {
@@ -179,6 +167,15 @@ int opt_constant_fold(IRModule *mod) {
         /* binary int constants: arithmetic, compare, bitwise */
         if (!op_is_int_const(&ins->src1, &lv)) continue;
         if (!op_is_int_const(&ins->src2, &rv)) continue;
+
+        /* The IR carries no signedness, so a constant with the top bit set
+           (a negative long) might be a huge unsigned value. Folding division,
+           modulo, >> and ordering compares as signed would get uint64 math
+           wrong, so leave those for the backend, which knows the type. */
+        if ((lv < 0 || rv < 0) &&
+            (ins->op == IR_DIV || ins->op == IR_MOD || ins->op == IR_SHR ||
+             ins->op == IR_LT || ins->op == IR_LE || ins->op == IR_GT || ins->op == IR_GE))
+            continue;
 
         long result = 0;
         int  fold   = 1;
@@ -259,6 +256,43 @@ static void vc_set(VarCacheEntry **vc, int *n, int *cap, const char *name, IROpe
     (*n)++;
 }
 
+/* Declared-type awareness for store->load forwarding. The optimizer treats
+   every value as a 64-bit int, so forwarding a value through a variable of a
+   narrower type (uint8, int32, ...) must reproduce the truncation a real
+   store+load would perform, or `uint8 c = 250; c = c + 10;` reads back 260.
+   Returns bit width (8/16/32) and signedness for a narrow int type name, or 0
+   for anything else. */
+static int narrow_int_bits(const char *tn, int *is_signed) {
+    if (!tn) return 0;
+    if (strcmp(tn, "uint8")  == 0) { *is_signed = 0; return 8; }
+    if (strcmp(tn, "int8")   == 0) { *is_signed = 1; return 8; }
+    if (strcmp(tn, "uint16") == 0) { *is_signed = 0; return 16; }
+    if (strcmp(tn, "int16")  == 0) { *is_signed = 1; return 16; }
+    if (strcmp(tn, "uint32") == 0) { *is_signed = 0; return 32; }
+    if (strcmp(tn, "int32")  == 0) { *is_signed = 1; return 32; }
+    return 0;
+}
+
+static long wrap_to_bits(long v, int bits, int is_signed) {
+    unsigned long mask = (1UL << bits) - 1;
+    unsigned long u = (unsigned long)v & mask;
+    if (is_signed && (u & (1UL << (bits - 1)))) u |= ~mask;
+    return (long)u;
+}
+
+typedef struct { const char *name; const char *type; } VarDecl;
+
+static const char *decl_type(const VarDecl *d, int n, const char *name) {
+    for (int i = n - 1; i >= 0; i--)
+        if (strcmp(d[i].name, name) == 0) return d[i].type;
+    return NULL;
+}
+
+static void vc_forget(VarCacheEntry *vc, int *n, const char *name) {
+    int idx = vc_find(vc, *n, name);
+    if (idx >= 0) { vc[idx] = vc[*n - 1]; (*n)--; }
+}
+
 int opt_constant_prop(IRModule *mod) {
     int max_temp = compute_max_temp(mod);
     TempState *ts = calloc(max_temp, sizeof(TempState));
@@ -278,13 +312,30 @@ int opt_constant_prop(IRModule *mod) {
     VarCacheEntry *vc = NULL;
     int vc_n = 0, vc_cap = 0;
 
+    /* declared types of statics (whole program) and, per function, locals */
+    VarDecl *decls = NULL;
+    int decl_n = 0, decl_cap = 0, static_decl_n = 0;
+    for (int i = 0; i < mod->instr_count; i++) {
+        IRInstr *ins = &mod->instrs[i];
+        if (ins->op == IR_STATIC_VAR && ins->str_extra && ins->str_extra2) {
+            if (decl_n == decl_cap) { decl_cap = decl_cap ? decl_cap * 2 : 32; decls = realloc(decls, decl_cap * sizeof(VarDecl)); }
+            decls[decl_n].name = ins->str_extra; decls[decl_n].type = ins->str_extra2; decl_n++;
+        }
+    }
+    static_decl_n = decl_n;
+
     for (int i = 0; i < mod->instr_count; i++) {
         IRInstr *ins = &mod->instrs[i];
 
         if (ins->op == IR_FUNC_BEGIN) {
             memset(ts, 0, max_temp * sizeof(TempState));
             vc_n = 0;
+            decl_n = static_decl_n;
             continue;
+        }
+        if (ins->op == IR_ALLOCA && ins->str_extra && ins->str_extra2) {
+            if (decl_n == decl_cap) { decl_cap = decl_cap ? decl_cap * 2 : 32; decls = realloc(decls, decl_cap * sizeof(VarDecl)); }
+            decls[decl_n].name = ins->str_extra; decls[decl_n].type = ins->str_extra2; decl_n++;
         }
         if (ins->op == IR_FUNC_END) continue;
         if (ins->op == IR_LABEL)    { vc_n = 0; continue; } /* conservative: control-flow join */
@@ -297,8 +348,34 @@ int opt_constant_prop(IRModule *mod) {
 
         /* store/load forwarding for variables never address-taken */
         if (ins->op == IR_STORE_VAR && ins->str_extra) {
-            if (!var_is_addr_taken(addr_taken, addr_n, ins->str_extra))
-                vc_set(&vc, &vc_n, &vc_cap, ins->str_extra, ins->src1);
+            if (!var_is_addr_taken(addr_taken, addr_n, ins->str_extra)) {
+                IROperand stored = ins->src1;
+                int forward = 1;
+                const char *tn = decl_type(decls, decl_n, ins->str_extra);
+                int sgn = 0, bits = narrow_int_bits(tn, &sgn);
+                long cv;
+                if (bits) {
+                    /* narrow var: a constant is wrapped to the var's width; a
+                       non-constant temp can't be forwarded (its upper bits are
+                       unknown), so make the later load a real load */
+                    if (op_is_int_const(&stored, &cv) && stored.kind == IROP_CONST_INT)
+                        stored = irop_const_int(wrap_to_bits(cv, bits, sgn));
+                    else
+                        forward = 0;
+                } else if (tn && (strcmp(tn, "float") == 0 || strcmp(tn, "double") == 0 ||
+                                  strcmp(tn, "float64") == 0 || strcmp(tn, "float32") == 0)) {
+                    if (stored.kind == IROP_CONST_INT) stored = irop_const_float((double)stored.int_val);
+                    else if (stored.kind != IROP_CONST_FLOAT) forward = 0;
+                }
+                /* An unsigned 64-bit value with the top bit set shows up here
+                   as a negative constant with no type attached; forwarding it
+                   would make later uses look signed. Keep it in the variable. */
+                if (tn && (strcmp(tn, "uint64") == 0 || strcmp(tn, "usize") == 0) &&
+                    op_is_int_const(&stored, &cv) && cv < 0)
+                    forward = 0;
+                if (forward) vc_set(&vc, &vc_n, &vc_cap, ins->str_extra, stored);
+                else vc_forget(vc, &vc_n, ins->str_extra);
+            }
         } else if (ins->op == IR_LOAD_VAR && ins->str_extra) {
             if (!var_is_addr_taken(addr_taken, addr_n, ins->str_extra)) {
                 int idx = vc_find(vc, vc_n, ins->str_extra);
@@ -372,6 +449,7 @@ int opt_constant_prop(IRModule *mod) {
     }
 
     free(vc);
+    free(decls);
     free(addr_taken);
     free(ts);
     return changes;

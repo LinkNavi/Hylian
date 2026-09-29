@@ -28,6 +28,8 @@
 - [string](stdlib/string.md) — string manipulation
 - [mem](stdlib/mem.md) — the arena allocator backing `new` (always linked)
 - [runtime](stdlib/runtime.md) — builtins behind the `print`/`println` syntax (always linked)
+- [math](stdlib/math.md) — integer and float math
+- [assert](stdlib/assert.md) — runtime assertions
 - [bytes](stdlib/bytes.md) — binary-safe byte buffers
 - [map](stdlib/map.md) — string-keyed hash map
 - [net](stdlib/net.md) — raw IPv4 TCP/UDP sockets

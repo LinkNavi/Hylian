@@ -11,6 +11,28 @@ The vendor system lets you wrap native shared libraries and distribute pure-Hyli
 
 ---
 
+## Calling C: types and the ABI
+
+Function declarations keep their parameter types, and calls follow the SysV x86-64 ABI, so
+C functions taking or returning `float`/`double` work:
+
+```
+fn sqrt(x: float) -> float             // C double
+fn fmaf(x: float32, y: float32, z: float32) -> float32   // C float
+fn snprintf(buf: str, n: int, fmt: str, x: float, y: int) -> int   // variadic is fine
+```
+
+- Arguments are converted to the declared parameter type at the call: `sqrt(16)` passes
+  `16.0`, a `float` given to an `int32` parameter is truncated, and so on.
+- Use the exact C width in a declaration: `int32` for C `int` (its result is sign-extended
+  from 32 bits), `uint32`, `int64` for `long`, `float32` for C `float`, `float` for
+  `double`. Zora's generator maps by the canonical C type, so `Uint32`, `size_t` and enums
+  come out right automatically.
+- Not supported: structs by value, and function pointers as callbacks.
+- Both directions work: a Hylian `float f(float a, int n)` can be called from C as
+  `double f(double, int)`. See `tests/stdlib/ffi_float.*` for a runnable example that calls
+  libm and has C call back into Hylian.
+
 ## Project Layout
 
 ```

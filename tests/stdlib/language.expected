@@ -1,0 +1,30 @@
+for: 4010
+range: 606
+ternary: 10 2 three
+do-while: 3 1
+literals: 97 10 65 255 10 15 1000
+sizeof: 8 1 1 16
+compound: 3 12 12 15
+nested: 1
+globals: 15 75 0 5 6 7
+defaults: 106 103 6 hello bob hi bob
+strings: 101 Jello abc
+arrays: 15 4 6
+wrap: 4 254 0 0 -128 -2147483648 188 255
+u64: 7 5 1
+fnv: 1956368136
+floats: 5.25 2.5 5.0 1.0 525 3.14159 1.5e+20 -2.5
+5.25
+0.333333
+manyargs: 140 47.5
+nan: false true false false nan inf -inf true
+  defer: big branch
+  defer: block
+  defer: outer
+defer: 20
+  defer: body
+  defer: block
+  defer: outer
+defer: 1
+errors: empty/42 too long/0 true
+interp: world 7 true 5

@@ -9,7 +9,7 @@ pointer to [Known Limitations](known-limitations.md) rather than a silent omissi
 
 A `.hy` file is a flat sequence of top-level items: an optional `include { ... }`
 block, any number of `ccpinclude` lines, and any number of `class`, `enum`, `module`,
-function, or `static`/`const` variable declarations, in any order. There's no required
+function, `typedef`, or `static`/`const`/plain global variable declarations, in any order. There's no required
 entry point name at the parser level, but the toolchain's convention is a function
 named `main`.
 
@@ -30,40 +30,60 @@ int main() {
 
 ## Comments
 
-Only single-line comments are supported, starting with `//` and running to end of
-line. There is no block-comment syntax (`/* ... */` is not recognized).
+`//` runs to end of line, and `/* ... */` comments may span lines (they do not nest).
 
 ## String and Character Literals
 
-A string literal is `"..."` with no escape-sequence processing at all: the lexer
-matches `\"([^\\\"]|\\.)*\"` (so a backslash lets you include a literal `"` without
-ending the string), but nothing later in the compiler interprets `\n`, `\t`, `\\`, etc.
-`"\n"` is the two raw bytes `\` and `n`, not a newline byte. `stdlib/runtime.hy`'s
-implementation of the `println` builtin works around this by storing byte value `10`
-in a local and writing it directly, rather than relying on a `"\n"` literal — that's
-the idiomatic way to emit a newline byte from source today. There is no separate
-character-literal syntax; single bytes are written as small integers cast to `uint8`.
+A string literal is `"..."` with C-style escapes decoded by the lexer: `\n \t \r \0 \a \b \f \v \e`
+(ESC, for ANSI colours), `\\ \' \"`, and `\xNN` (one or two hex digits). An unrecognised escape
+is left as-is, backslash included, so typos stay visible.
+
+A character literal is `'a'`, `'\n'`, `'\x41'`, `'\''` — it is an **`int`** holding the
+byte value (`'a'` is `97`), usable anywhere an integer is:
+
+```hylian
+int c = 'a';
+if (s[0] == 'J') { ... }
+```
+
+## Strings
+
+`str` values are pointers to NUL-terminated bytes. The language has a few operations
+built in, with no `include` needed:
+
+```hylian
+str a = "foo" + "bar";     // concatenation (both sides str)
+a += "!";                  // append (makes a new string; strings are immutable)
+int b = a[1];              // byte at index 1 (0-255), unchecked
+buf[0] = 'J';              // store a byte into a writable buffer
+if (a == "foo!") { ... }   // content comparison (needs `include { string }`)
+```
+
+Strings built at runtime come from a never-freed pool, so they are safe to return from
+functions.
 
 ## String Interpolation
 
-A string literal containing `{{...}}` anywhere is lexed as a distinct interpolated
-string rather than a plain literal, and split into alternating literal/expression
-segments. As of today, only the **literal** segments make it into the compiled result —
-each `{{expr}}` segment is handed from `lower.c` to the codegen backend as raw,
-unparsed source text with no evaluator on the receiving end, so it's dropped (with a
-diagnostic naming the segment) rather than evaluated. See
-[Known Limitations](known-limitations.md) for the current status, including that
-passing an interpolated string straight to `print`/`println` doesn't work at all yet
-(only assigning it to a variable partially works, keeping just the literal text).
+`{{expr}}` inside a string literal evaluates any expression and splices its text in:
+
+```hylian
+int n = 5;
+str who = "world";
+println("n={{n}}, next={{n + 1}}, hello {{who}}!");
+println("{{ok ? \"yes\" : \"no\"}}");        // quotes inside {{ }} are escaped
+```
+
+Each expression is converted by its type — `str` as-is, `bool` as `true`/`false`,
+floats with up to six fractional digits, everything else as a decimal integer — and the
+pieces are concatenated. The lexer rewrites the literal into an internal
+`__interp(...)` call, so the expression is parsed by the normal expression grammar.
+A literal `{{` can't be written inside a string that also needs interpolation.
 
 ## Numeric Literals
 
-- Decimal integers: `42`, with optional `_` digit separators anywhere (`1_000_000`).
-- Hexadecimal integers: `0x` or `0X` followed by hex digits, also with optional `_`
-  separators (`0xFF_FF`).
-- Floats: `[0-9]+.[0-9]+` only — a digit on both sides of the dot. There is no
-  exponent notation (`1e10`) and no bare leading/trailing dot (`.5` or `5.` are not
-  recognized as floats).
+- Decimal integers: `42`, with optional `_` digit separators (`1_000_000`).
+- Hexadecimal: `0xFF`; binary: `0b1010_0101`; octal: `0o755` — all allow `_` separators.
+- Floats: `3.14`, `1_000.5`, and exponents: `1.5e3`, `2.0e-2`, `1e10`. (No bare `.5` / `5.`.)
 - Booleans: `true`, `false`.
 - Null: both `nil` and `null` are accepted and produce the same literal.
 
@@ -72,12 +92,14 @@ passing an interpolated string straight to `print`/`println` doesn't work at all
 | Category | Syntax | Notes |
 |---|---|---|
 | Integer | `int` | Signed, general-purpose integer. |
-| Sized integers | `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64` | Recognized by the typechecker as primitives (`typecheck.c`'s `is_known_primitive`), spelled as ordinary identifiers — the lexer has no dedicated tokens for these, so they parse via the generic `IDENTIFIER` type rule. |
+| Sized integers | `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64` | Arithmetic **wraps at the type's width** like C (`uint8 c = 250; c = c + 10;` gives `4`), unsigned types divide, shift and compare as unsigned, and stores convert to the variable's declared type. Spelled as ordinary identifiers (the lexer has no dedicated tokens), so they parse via the generic `IDENTIFIER` type rule. |
 | String | `str` | A pointer to a nul-terminated byte buffer; `str` values are raw pointers under the hood. |
 | Boolean | `bool` | `true` / `false`. |
 | Void | `void` | Function/method return type only. |
 | Error | `Error` | See [Error Handling](error-handling.md). |
-| Float | `float`, `float32`, `float64` | Recognized as primitives; arithmetic/printing support is limited today — see [Known Limitations](known-limitations.md). |
+| Float | `float` (= `double` = `float64`), `float32` | Scalar floating point (SSE2): `+ - * / < > ==`, unary `-`, mixed int/float arithmetic (`f * 2` converts the int), `cast<int>(f)` / `cast<float>(i)`, float globals, `float` parameters and return values, and `println(f)` / interpolation. `float32` widens to `float` when mixed with one. Floats follow the SysV ABI (xmm registers), so they can be passed to and returned from C functions and Hylian functions can be called from C. |
+| C-style aliases | `char` `byte` `u8` `u16` `u32` `u64` `i8` `i16` `i32` `i64` `short` `ushort` `uint` `long` `ulong` `size_t` `ssize_t` | Built-in spellings of the sized types above (`char` = `uint8`, `uint` = `uint64`, `long` = `int64`, ...). |
+| User alias | `typedef T Name;` | Top-level only. `typedef uint8 octet;` then `octet o = 7;` — resolved at parse time. |
 | Pointer-sized | `usize`, `isize` | Unsigned/signed pointer-sized integers, used throughout the stdlib for raw addresses. |
 | Auto | *(no keyword)* | Only reachable via `name := expr;` — there is no explicit `auto` type you can write in a signature. |
 | Class / enum name | any `IDENTIFIER` | A user-defined class or enum used as a type. |
@@ -85,13 +107,11 @@ passing an interpolated string straight to `print`/`println` doesn't work at all
 | Raw pointer | `*T` | `TYPE_RAWPTR` — e.g. `*uint8`. |
 | Nullable | `T?` | A `?` suffix after any base type marks it nullable (allows `nil`). Valid on `var_decl` and on function/method return types (`Error? main()`). |
 | Fixed array | `array<T, N>` | Heap-backed, fixed capacity `N`. |
-| Growable array | `array<T>` | Heap-backed, flexible capacity. |
+| Growable array | `array<T>` | Heap-backed, flexible capacity. Nested generics close with `>>`: `array<array<int>>`. |
 | Tagged union | `multi<A \| B \| ...>` | Optionally `multi<A \| B \| ..., N>` for a fixed backing size. |
 | `any` union | `multi<any>` | Optionally `multi<any, N>`. |
 
-Arrays and `multi` are described further in [Arrays and Tagged Unions](#arrays-and-tagged-unions-multi)
-below — both parse and typecheck, but currently fail to *link* (see
-[Known Limitations](known-limitations.md)).
+Arrays and `multi` are described further in [Arrays and Tagged Unions](#arrays-and-tagged-unions-multi) below.
 
 ## Variables
 
@@ -105,6 +125,20 @@ x := 10;                // `:=` — type inferred as `auto`, must have an initia
 
 `:=` only works with a bare identifier on the left (no type annotation) and always
 requires an initializer.
+
+A **fixed-size local array** is declared `T name[N];` (N any expression). It is a
+zero-filled `array<T>` whose length is already N, so `.len`, indexing and `for`-`in` all
+work:
+
+```hylian
+int buf[16];
+buf[0] = 1;
+buf[3] += 4;
+int n = buf.len;        // 16
+```
+
+At the top level a plain `int counter = 0;` is a global variable (the same as
+`static int counter = 0;`).
 
 ### `static` and `const`
 
@@ -133,7 +167,8 @@ From lowest to highest precedence, exactly as declared in `parser.y`:
 
 | Level (low → high) | Operators | Associativity |
 |---|---|---|
-| 1 | `=` `+=` `-=` `*=` `/=` `%=` | right |
+| 1 | `=` `+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `\|=` `^=` | right |
+| 1.5 | `? :` (ternary) | right |
 | 2 | `\|\|` | left |
 | 3 | `&&` | left |
 | 4 | `\|` (bitwise or) | left |
@@ -155,15 +190,18 @@ than `==`/`!=` and the relational operators — the same famously-surprising rul
 `a & b == c` parses as `a & (b == c)`, not `(a & b) == c`. Parenthesize bitwise
 expressions mixed with comparisons.
 
-Compound assignment (`+=` etc.) and plain declare-assign (`:=`) only target a bare
-identifier — there's no `arr[i] += 1` or `obj.field += 1` form in the grammar. Plain
-`=` assignment does additionally support a member target (`obj.field = expr;`) and an
-index target (`arr[i] = expr;`), just not the compound forms.
+**Ternary:** `cond ? a : b` evaluates only the chosen arm and nests to the right
+(`a ? x : b ? y : z`). As a bare *statement* the parser reads `Foo ? x` as a nullable
+declaration, so use it inside an expression (`int m = a > b ? a : b;`).
 
-Increment/decrement (`++x`, `x++`, `--x`, `x--`) parse in both prefix and postfix,
-expression and statement position — but see
-[Known Limitations](known-limitations.md): the current backend doesn't actually
-perform the mutation.
+**Compound assignment** (`+= -= *= /= %= <<= >>= &= |= ^=`) works on a variable, a field,
+an element, and a dereference: `x += 1; p.x *= 3; a[i] <<= 2; *ptr |= 4;`. The field /
+element / pointer forms are rewritten to `target = target op value`, so keep side effects
+out of the target expression (`a[f()] += 1` would call `f` twice). `:=` only targets a
+bare identifier.
+
+Increment/decrement (`++x`, `x++`, `--x`, `x--`) work in prefix and postfix, in
+expression and statement position, and as a `for` post-clause.
 
 ## Functions
 
@@ -199,8 +237,20 @@ register the value was sitting in. This is the most impactful item in
 [Known Limitations](known-limitations.md); read it before writing anything beyond a
 toy example.
 
-Parameters are a comma-separated `type IDENTIFIER` list; there's no default-argument
-syntax and no variadic parameters.
+Parameters are a comma-separated `type IDENTIFIER` list, optionally with defaults on the
+trailing ones; there are no variadic parameters.
+
+```hylian
+int add(int a, int b = 5, int c = 100) { return a + b + c; }
+str greet(str who, str greeting = "hello") { return greeting + " " + who; }
+
+add(1);         // 106
+add(1, 2);      // 103
+greet("bob");   // "hello bob"
+```
+
+A default is filled in at the call site, so it should be a literal or constant (it is
+evaluated in the *caller's* scope). Defaults work for plain functions, not methods.
 
 ## Control Flow
 
@@ -226,31 +276,36 @@ while (i < 10) {
 
 ### `for`
 
-Three-clause C-style, plus a separate `for`-`in` form.
+C-style three-clause, a range form, and a `for`-`in` over arrays.
 
 ```hylian
-for (int i = 0; i < 5; i = i + 1) {
-    ...
-}
+for (int i = 0; i < 5; i++) { ... }
+for (int j = 10; j > 0; j -= 3) { ... }
 
-for (n in nums) {           // by value
-    ...
-}
+for (i in 0..5) { ... }       // i = 0, 1, 2, 3, 4  (end exclusive)
+for (i in 1..=3) { ... }      // i = 1, 2, 3        (end inclusive)
 
-for (&n in nums) {          // by reference — n is effectively a pointer to the element
+for (n in nums) { ... }       // by value
+for (&n in nums) {            // by reference - n is effectively a pointer to the element
     *n = *n * 2;
 }
 ```
 
-The init- and post-clauses share one grammar rule (`for_init`) that only accepts
-`type IDENT = expr`, `type IDENT`, `IDENT = expr`, or nothing at all. **`for (int i = 0; i < 5; i++)`
-is a syntax error** — `i++` isn't a valid post-clause. Use `i = i + 1`. The init- and
-post-clauses may each be omitted; the middle (condition) clause has no "empty"
-alternative in the grammar, so write an explicit `true` for an infinite loop:
-`for (; true ;) { ... }`.
+The init- and post-clauses accept a declaration or assignment, `i++` / `i--` / `++i` /
+`--i`, and compound assignment (`i += 2`); either may be omitted. The condition has no
+"empty" form, so write `true` for an infinite loop: `for (; true ;) { ... }`.
+A range loop's end expression is re-evaluated each iteration (it's a plain `for` underneath).
 
-`for`-`in`'s collection is expected to be an `array<T>` — see
-[Known Limitations](known-limitations.md) for the current state of `array<T>`.
+### `do` / `while`
+
+```hylian
+do {
+    n += 1;
+} while (n < 10);
+```
+
+The body runs at least once. `continue` jumps to the condition test and `break` leaves
+the loop, as in C.
 
 ### `switch`
 
@@ -275,6 +330,30 @@ is optional and may appear anywhere among the arms.
 ### `break` / `continue`
 
 Standard loop control, valid inside `while`/`for`/`for`-`in` bodies.
+
+### `defer`
+
+`defer` schedules code to run when the enclosing function returns — the tidy way to pair
+an acquire with its release:
+
+```hylian
+int process(str path) {
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) { return -1; }
+    defer close(fd);                    // runs on every way out of the function
+    defer { println("done with {{path}}"); }
+
+    if (bad(fd)) { return -2; }         // close(fd) still happens
+    return 0;
+}
+```
+
+- The operand is an expression (usually a call) or a `{ ... }` block of statements.
+- Deferred code runs in **reverse** order of the `defer` statements, after a `return`'s value
+  has been computed and before the function's locals go away, so it can use them.
+- A `defer` only runs if control actually passed through it (one in an untaken `if` branch
+  is skipped), and one inside a loop runs once, at function exit — not once per iteration.
+- It does not run if the process exits or `panic`s.
 
 ## Classes
 
@@ -353,20 +432,16 @@ enum Flags {
 }
 ```
 
-A variant with no explicit value gets its **zero-based position in the declaration**
-as its value — not one more than the previous variant's value. This differs from C:
+A variant with no explicit value gets **one more than the previous variant** (the first is
+`0`), exactly as in C:
 
 ```hylian
 enum E { A, B = 10, C }
-// A = 0 (position 0)
-// B = 10 (explicit)
-// C = 2 (position 2 — NOT 11)
+// A = 0, B = 10 (explicit), C = 11
 ```
 
-Enums are `public` or private-to-file, same rule as classes. Member access
-(`Status.Ok`) parses and typechecks but doesn't currently link — see
-[Known Limitations](known-limitations.md); comparing/switching on a variant's raw
-integer value works today.
+Enums are `public` or private-to-file, same rule as classes. Variants are plain
+integers: `Status.Ok` works in expressions, interpolation and `switch` cases.
 
 ## Arrays and Tagged Unions (`multi`)
 
@@ -415,11 +490,9 @@ int v = volatile *ptr;       // volatile read
 - `volatile` before a `*`-dereference (read or write position) marks that specific
   load/store as volatile, both as a statement (`volatile *lhs = rhs;`) and as an
   expression (`volatile *ptr`).
-- `size_of(Name)` takes a bare identifier — because it's grammared as
-  `SIZE_OF LPAREN IDENTIFIER RPAREN`, and built-in primitive type keywords like `int`
-  and `str` are their own tokens (not `IDENTIFIER`), `size_of(int)` is a **syntax
-  error**. `size_of` only accepts a user-defined class/enum name, e.g.
-  `size_of(Player)`.
+- `size_of(T)` / `sizeof(T)` gives the byte size of any type: builtins (`sizeof(int)` is 8,
+  `sizeof(uint8)` is 1, `sizeof(char)` is 1), aliases, and struct/class layouts
+  (`sizeof(Header)`).
 - `addrof_fn(name)` (also spelled `adrof_fn(name)` — both lex to the same token) takes
   the address of a named function.
 

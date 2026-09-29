@@ -1,6 +1,9 @@
 #!/bin/bash
-# Tests for the pure-Hylian stdlib modules that need no C runtime: string
-# extensions, map, os.fs list_dir, inflate/gzip, tar, dns, http, https/tls.
+# Tests for the language features and the pure-Hylian stdlib modules that need
+# no C runtime: language.hy exercises the syntax/type-system additions (ternary,
+# do-while, ranges, default args, sized-int wrapping, floats, interpolation, ...);
+# then string extensions, math/assert, map, os.fs list_dir, inflate/gzip, tar,
+# dns, http, https/tls.
 #
 # Each tests/stdlib/<name>.hy is compiled with ./hylian (--src-dir stdlib),
 # linked against the always-linked runtime modules, run inside a scratch
@@ -77,11 +80,20 @@ sleep 1
 run() {
     local name="$1"; shift
     local libs="$1"; shift
-    if ! "$HY" "$SRC/$name.hy" --src-dir "$ROOT/stdlib" -o "$WORK/$name.o" >"$WORK/$name.cerr" 2>&1 \
+    # a test may point --src-dir elsewhere (<name>.srcdir, relative to tests/stdlib,
+    # e.g. so it can carry its own vendors/ .hyi) and ship a C helper (<name>.c)
+    local srcdir="$ROOT/stdlib"
+    [ -f "$SRC/$name.srcdir" ] && srcdir="$SRC/$(cat "$SRC/$name.srcdir")"
+    local extra=""
+    if [ -f "$SRC/$name.c" ]; then
+        gcc -c "$SRC/$name.c" -o "$WORK/$name.c.o" || { echo "  ✗ FAIL  $name (C helper)"; FAIL=$((FAIL+1)); return; }
+        extra="$WORK/$name.c.o"
+    fi
+    if ! "$HY" "$SRC/$name.hy" --src-dir "$srcdir" -o "$WORK/$name.o" >"$WORK/$name.cerr" 2>&1 \
        || grep -q "error" "$WORK/$name.cerr"; then
         echo "  ✗ FAIL  $name (compile): $(grep error "$WORK/$name.cerr" | head -3)"; FAIL=$((FAIL+1)); return
     fi
-    if ! gcc "$WORK/$name.o" "$WORK"/mem.o "$WORK"/runtime.o "$WORK"/array.o -o "$WORK/$name.bin" -no-pie $libs 2>"$WORK/$name.lerr"; then
+    if ! gcc "$WORK/$name.o" $extra "$WORK"/mem.o "$WORK"/runtime.o "$WORK"/array.o -o "$WORK/$name.bin" -no-pie $libs 2>"$WORK/$name.lerr"; then
         echo "  ✗ FAIL  $name (link): $(head -3 "$WORK/$name.lerr")"; FAIL=$((FAIL+1)); return
     fi
     local actual
@@ -93,6 +105,10 @@ run() {
     fi
 }
 
+run language ""
+run ffi_float "-lm"
+run math ""
+run assert_fail ""
 run string_ext ""
 run map ""
 run fs_list ""

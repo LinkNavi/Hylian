@@ -387,7 +387,13 @@ static Type infer_expr(ASTNode *node) {
         infer_expr(fc->args[i]);
     }
     /* Special built-ins that are not registered in the func table */
-    if (fc->name && strcmp(fc->name, "Err") == 0) {
+    if (fc->name && strcmp(fc->name, "hylian_array_zeros") == 0) {
+      /* the parser's rewrite of `T name[N];` - the declared type carries the array type */
+      result = unknown_type();
+    } else if (fc->name && strcmp(fc->name, "__interp") == 0) {
+      /* the lexer's rewrite of a "...{{expr}}..." string - see lexer.l */
+      result = make_simple_type("str", 0);
+    } else if (fc->name && strcmp(fc->name, "Err") == 0) {
 
       result = make_simple_type("Error", 0);
     } else if (fc->name && strcmp(fc->name, "panic") == 0) {
@@ -552,6 +558,9 @@ static Type infer_expr(ASTNode *node) {
     if (obj_type.name && strcmp(obj_type.name, "Error") == 0 && mc->method &&
         strcmp(mc->method, "message") == 0) {
       result = make_simple_type("str", 0);
+    } else if (obj_type.name && strcmp(obj_type.name, "Error") == 0 && mc->method &&
+               strcmp(mc->method, "code") == 0) {
+      result = make_simple_type("int", 0);
     } else if (obj_type.name && mc->method) {
       /* Look for mangled name ClassName__method */
       char mangled[256];
@@ -676,6 +685,8 @@ static Type infer_expr(ASTNode *node) {
     infer_expr(in_node->index);
     if (obj_type.kind == TYPE_ARRAY && obj_type.elem_type_count > 0)
       result = obj_type.elem_types[0];
+    else if (obj_type.kind == TYPE_SIMPLE && obj_type.name && strcmp(obj_type.name, "str") == 0)
+      result = make_simple_type("uint8", 0); /* s[i] is the byte at i */
     break;
   }
 
@@ -693,6 +704,17 @@ static Type infer_expr(ASTNode *node) {
   case NODE_COMPOUND_ASSIGN: {
     CompoundAssignNode *ca = (CompoundAssignNode *)node;
     result = infer_expr(ca->value);
+    break;
+  }
+
+  case NODE_TERNARY: {
+    /* c ? a : b - the value has the type of whichever arm has a real type
+       (a bare `nil` arm has no name of its own, so prefer the other one). */
+    TernaryNode *tn = (TernaryNode *)node;
+    infer_expr(tn->cond);
+    Type tt = infer_expr(tn->then_expr);
+    Type et = infer_expr(tn->else_expr);
+    result = (tt.name || tt.kind != TYPE_SIMPLE) ? tt : et;
     break;
   }
 
@@ -752,6 +774,15 @@ static void infer_stmt(ASTNode *node) {
     ReturnNode *ret = (ReturnNode *)node;
     if (ret->value)
       infer_expr(ret->value);
+    break;
+  }
+
+  case NODE_DEFER: {
+    DeferNode *dn = (DeferNode *)node;
+    scope_push();
+    for (int i = 0; i < dn->body_count; i++)
+      infer_stmt(dn->body[i]);
+    scope_pop();
     break;
   }
 
@@ -940,6 +971,41 @@ int tc_func_return_is_bool(const char *name) {
   return fi->return_type.kind == TYPE_SIMPLE &&
          fi->return_type.name &&
          strcmp(fi->return_type.name, "bool") == 0;
+}
+
+/* Return-type flags for a call's IR_CALL.extra_int: 1 = bool, 2 = float
+   (64-bit), 4 = float32, (1..6)<<3 = narrow integer (see below). Lets ir_to_mir type the call's result register. */
+int tc_func_return_flags(const char *name) {
+  if (!name) return 0;
+  FuncInfo *fi = func_lookup(name);
+  if (!fi || fi->return_type.kind != TYPE_SIMPLE || !fi->return_type.name) return 0;
+  const char *n = fi->return_type.name;
+  if (strcmp(n, "bool") == 0) return 1;
+  if (strcmp(n, "float") == 0 || strcmp(n, "double") == 0 || strcmp(n, "float64") == 0) return 2;
+  if (strcmp(n, "float32") == 0) return 4;
+  /* narrow integers: (kind << 3), kind 1..6 = int8 uint8 int16 uint16 int32 uint32.
+     A C function returning `int` leaves the upper half of rax undefined, so the
+     caller has to sign/zero-extend it. */
+  static const char *narrow[] = {"int8", "uint8", "int16", "uint16", "int32", "uint32"};
+  for (int k = 0; k < 6; k++)
+    if (strcmp(n, narrow[k]) == 0) return (k + 1) << 3;
+  return 0;
+}
+
+/* Kind of the i-th declared parameter of `name`, for call-site conversion:
+   0 = unknown / no such parameter, 1 = integer-like, 2 = float (64-bit),
+   4 = float32. */
+int tc_func_param_kind(const char *name, int i) {
+  if (!name || i < 0) return 0;
+  FuncInfo *fi = func_lookup(name);
+  if (!fi || i >= fi->param_count) return 0;
+  const Type *t = &fi->param_types[i];
+  if (t->kind != TYPE_SIMPLE || !t->name) return 0;
+  const char *n = t->name;
+  if (strcmp(n, "float") == 0 || strcmp(n, "double") == 0 || strcmp(n, "float64") == 0) return 2;
+  if (strcmp(n, "float32") == 0) return 4;
+  if (strcmp(n, "unknown") == 0 || strcmp(n, "auto") == 0) return 0;
+  return 1;
 }
 
 int tc_func_is_external_decl(const char *name) {

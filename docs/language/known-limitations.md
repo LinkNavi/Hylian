@@ -1,228 +1,100 @@
 # Known Limitations
 
-Hylian's grammar and standard library are moving faster than the codegen backend that
-executes them. This page lists gaps that were confirmed by hand against the current
-compiler (`compiler/parser.y`, `compiler/typecheck.c`, `compiler/lower.c`,
-`compiler/ir_to_mir.c`) and the current `stdlib/` tree, so the rest of the reference can
-describe the language honestly instead of aspirationally. Everything below was
-reproduced with a real `./hylian ... -o out.o` + `gcc out.o ... -o bin` + run cycle.
+This page lists the gaps that remain in the language and toolchain, each confirmed by
+hand against the current compiler with a real `./hylian ... -o out.o` + `gcc` + run
+cycle. If something here has since been fixed, trust the compiler over this page.
 
-If something here has since been fixed, trust the compiler over this page — this is a
-snapshot, not a promise.
+Earlier versions of this page described a much longer list — register clobbering across
+calls, `i++` doing nothing, `for` post-clauses, class fields, `Err`/`panic`, arrays,
+`EnumName.Variant`, printing computed strings, string interpolation. All of those work
+now; the regression tests for them live in `tests/stdlib/language.hy`.
 
-### A function call's result does not reliably survive a *later* call in the same function
+## Language
 
-This is the single biggest gap found in this pass, and it's not specific to any one
-stdlib function — it's a register-allocation bug that affects ordinary function calls
-in general. Minimal reproduction:
+### Nested generics, other than `array<array<T>>`, need a space
 
-```hylian
-int seven() {
-    return 7;
-}
-int main() {
-    int a = seven();
-    if (a == 7) {
-        return 1;    // this branch IS taken — using `a` right away works
-    }
-    return 0;
-}
-```
+`array<array<int>>` and `cast<array<T>>(x)` parse, but the lexer reads `>>` as a shift
+operator everywhere else. Write `multi<int | array<int> >` with a space.
 
-versus:
+### A bare ternary *statement* is read as a nullable declaration
 
-```hylian
-int seven() {
-    return 7;
-}
-int main() {
-    int a = seven();
-    return a;        // returns garbage (observed: 104), not 7
-}
-```
+`Foo ? x : y;` at the start of a statement parses as the start of a `Foo? x` declaration
+(bison reports this as 2 reduce/reduce conflicts and picks the declaration). A ternary is
+fine anywhere inside an expression, which is the only place it's useful.
 
-The difference is what happens between capturing the call's result and using it.
-Every non-`naked` function — `main` here included — gets an automatically-inserted
-call to `arena_free` right before it actually returns (part of the compiler-managed
-arena lifecycle described in [`mem`](../stdlib/mem.md)). `arena_free`'s own generated
-body reuses the same small set of scratch registers (`r11`–`r15`) that the caller was
-using to hold `a` — confirmed by disassembling the linked binary: `a` sits in `r14`
-after the call to `seven()`, and `arena_free`'s body unconditionally overwrites `r14`
-several times before `main` reads it back out for the `return`. Nothing preserves it
-across that call. The same thing happens with any other intervening call, not just
-`arena_free` — two `naked` functions (no auto-inserted arena calls at all) calling each
-other and both returning values works fine; it's specifically a live value in a
-scratch register crossing *any* subsequent call, and `arena_free` is simply the call
-that unconditionally exists at the end of every non-`naked` function, so it's the one
-that bites almost everyone.
+### Class values are stored inline
 
-**Practical effect:** using a function's return value immediately (the same statement
-or the next one, before any further call happens) is reliable. Storing it and using it
-later — especially returning it, or passing it to another function, or printing it —
-is not, once *any* further call has happened in between. This includes calling
-stdlib functions from ordinary (non-`naked`) code and expecting to use what they hand
-back — `int n = length(s); return n;` is exactly the broken shape above. Declaring the
-caller `naked` sidesteps it (no `arena_free` call is inserted), at the cost of losing
-the implicit arena for any `new` in that function.
+A `class` local holds its object directly rather than a pointer to a heap block, so
+`cast<MyClass>(raw_alloc(n))` does not give you a heap object that survives being returned
+from a function. `new` objects are fine; the stdlib modules that need a heap-allocated
+handle (`map`, `bytes` buffers, `http` responses) use an opaque `usize` pointing at a raw
+word block instead.
 
-Every worked example elsewhere in this documentation set that shows "call a function,
-then do something with the result later" should be read with this in mind — it
-describes the intended, sensible-looking code, not a guarantee that today's backend
-gets the value from the call site to wherever it's used next.
+### Compound assignment on fields / elements evaluates its target twice
 
-### `i++`, `++i`, `i--`, `--i` do not change the variable
+`a[f()] += 1` is rewritten to `a[f()] = a[f()] + 1`, so `f` runs twice. Keep side effects
+out of the target (plain `x += 1`, `p.x += 1`, `a[i] += 1` are exact).
 
-The postfix/prefix forms parse and typecheck, but the current backend does not lower
-`IR_UNARY_OP`'s `++`/`--` cases into an actual read-modify-write — the statement is
-effectively a no-op. A `while` loop that relies on `i++` to make progress will spin
-forever. Use `i = i + 1` / `i = i - 1` instead until this is fixed.
+### A range loop's end is re-evaluated each iteration
 
-### The `for` loop's post-clause can't be `i++` or `i += 1`
+`for (i in 0..n)` is a plain `for (int i = 0; i < n; i += 1)`, so changing `n` inside the
+body changes the loop bound.
 
-`compiler/parser.y`'s `for_init` rule (reused for both the init- and post-clause) only
-accepts `type IDENT = expr`, `type IDENT`, `IDENT = expr`, or nothing — not an arbitrary
-statement. So:
+### Default arguments are filled in at the call site
 
-```hylian
-for (int i = 0; i < 5; i++) { ... }   // syntax error: unexpected INC
-```
+`int f(int a, int b = 5)` inserts the default expression into each call that omits it, in
+the *caller's* scope — use literals and constants. Not supported for methods.
 
-is a parse error, not just dead code from the point above. Write the post-clause as a
-plain assignment:
+### Fixed-size local arrays are word arrays
 
-```hylian
-for (int i = 0; i < 5; i = i + 1) { ... }
-```
+`int buf[16];` is a zero-filled `array<int>` of length 16; every element is one 8-byte word
+regardless of the declared element type (so `uint8 b[64]` uses 512 bytes). For a packed byte
+buffer use `static uint8 buf[64];` or `bytes_alloc`.
 
-### Class fields don't work yet — implicit or explicit
+### Keywords added
 
-Verified with both patterns:
+`do`, `defer`, `typedef` and `sizeof` are now reserved words (as are `in`, `size_of`,
+`cast`, `as`, ...). A variable named `in`, `do`, `defer` or `typedef` won't parse.
 
-```hylian
-public class Player {
-    public int health;
-    Player(int h) { health = h; }       // implicit self-field write
-    int get_health() { return health; } // implicit self-field read
-}
-```
+### Interpolation quirks
 
-fails typecheck outright (`undefined variable 'health'`) — `typecheck.c`'s
-`infer_function` binds `self` into scope but never the class's fields. And:
+Quotes inside `{{ }}` must be escaped (`"{{ok ? \"y\" : \"n\"}}"`), and a string that uses
+interpolation can't also contain a literal `{{`.
 
-```hylian
-Point p = new Point();
-p.x = 5;        // explicit member access
-return p.x;
-```
+### String equality needs `include { string }`
 
-compiles, but fails at *link* time: `lower.c` lowers `obj.field` reads/writes to calls
-named `<Class>_get_<field>`/`<Class>_set_<field>`, and nothing in the compiler ever
-generates those functions. `nm` on the resulting object shows them as pure `U`ndefined
-symbols.
+`a == b` between two `str` values compares contents, but it is compiled as a call to
+`equals` from `stdlib/string.hy`, so the module must be included. (`+`, `+=`, `s[i]` and
+interpolation need nothing.)
 
-Only zero-field classes (`new Empty()`) reliably work end to end today. Anything with
-fields — the canonical `Player`/`BankAccount` kind of example — will not link.
+### No multi-return / tuples, no function pointers
 
-### `Err(...)`, `panic(...)`, and `Error.message()`/`.code()` don't link
+Functions return exactly one value. `addrof_fn(f)` yields an address, but there is no
+indirect-call syntax to use it with.
 
-`Err()` and `panic()` are compiler builtins (special-cased in `typecheck.c`/`lower.c`,
-not real stdlib functions), lowering to calls named `hylian_make_err` and
-`hylian_panic`. Neither exists anywhere in `stdlib/`. The old C runtime
-(`runtime/std/errors.o`) does define `hylian_panic`, `Error_message`, and `Error_code` —
-but its error-*constructor* symbol is spelled `hylian_make_error` (with the `e`), one
-letter off from what the current compiler calls, and even if you patch that mismatch,
-`errors.o` itself depends on `hy_alloc`/`hy_write`/`hy_exit`, which aren't provided by
-anything in the current toolchain either. Net effect: any program that calls `Err()`,
-`panic()`, or `.message()`/`.code()` fails to link today. `Error?` as a return *type*
-(just returning `nil` for success, never constructing an actual error) works fine.
+## Floating point
 
-### `array<T>` and `multi<A | B>` don't link
+- Calls follow the SysV x86-64 ABI, so `float` / `double` / `float32` arguments and results
+  travel in `xmm` registers and mix freely with C. Not yet handled: structs passed **by
+  value** (raylib's `Vector2` / `Color`, SDL's `SDL_Rect`) and `long double`.
+- Only scalar arithmetic and comparisons exist, and `math.hy`'s transcendental functions are
+  ~1e-12 accurate, not libm-exact (call libm through an FFI declaration when you need it).
+- `array<float>` stores each element as a raw word: writing works, but reading an element
+  back yields the integer bit pattern, so convert with `cast` from a `float` variable that
+  you assign through memory instead of indexing directly.
+- The IR optimizer knows no types: it will not fold `x / 0.0` (left to the hardware, giving
+  `inf`/`nan`) and skips folding integer division, modulo, `>>` and ordering compares when a
+  constant is negative, because that could be a large unsigned value. Both only forgo an
+  optimisation.
 
-Array literals, `.push()`/`.pop()`/`.len`/`.cap`/indexing, and `multi<...>`
-construction/`.tag`/`.value` all lower to runtime helper calls
-(`hylian_array_alloc`, `hylian_array_push`, `hylian_array_get`, `hylian_multi_alloc`,
-etc.) that are not defined anywhere in the codebase — not in `stdlib/`, not in the old
-`runtime/` tree. Any program that uses `array<T>` or `multi<...>` fails to link with
-undefined-reference errors.
+## Toolchain
 
-### `EnumName.Variant` doesn't link
-
-`compiler/lower.c` marks enum declarations as "metadata only — no IR instructions
-needed," but `EnumName.Variant` member access still lowers to a `LEA` of a global named
-`<Enum>_<Variant>`, which is never emitted. `switch`/`case` on a variant's plain integer
-*value* works fine (`enum Color { Red, Green, Blue }` then `switch (c) { case 0: ... }`);
-it's specifically writing `Color.Red` in source that produces a dangling symbol
-reference at link time.
-
-### `print`/`println` only reliably handle string literals
-
-`ir_to_mir.c`'s print/println dispatch has four cases: a string literal (works — interned
-directly), a `str`-typed variable (works via `strlen`, *when* the pointer traces back to
-a literal), a bare `int` (attempted via `hylian_int_to_str` + a `MIR_ALLOCA_LOCAL` — but
-`hylian_int_to_str` isn't defined anywhere in the current stdlib, and `MIR_ALLOCA_LOCAL`
-is emitted by `ir_to_mir.c` but never consumed by the x64 backend, so this path fails at
-both compile time and link time), and everything else — floats, interpolated strings —
-which the code explicitly documents as unhandled and turns into a no-op with a stderr
-warning ("not lowered yet: PRINTLN").
-
-Beyond that: printing a string that was *computed at runtime* (the return value of
-`stdlib/string.hy`'s `slice`, `concat`, `to_upper`, `to_lower`, `trim*`, or
-`stdlib/io.hy`'s `int_to_str`) was observed to segfault in this pass — consistent with
-[the register-clobbering issue above](#a-function-calls-result-does-not-reliably-survive-a-later-call-in-the-same-function):
-the string pointer returned by `slice`/`int_to_str`/etc. sits in a scratch register
-that a later call (printing it, which itself involves further calls, or even just the
-enclosing function's own cleanup) can clobber before it's actually used. The same
-functions were observed to work correctly when their result is used immediately
-(e.g. measured with `length()` right away) rather than carried further. Treat any
-example that prints a computed string as unverified until the root cause above is
-fixed.
-
-### String interpolation (`"...{{expr}}..."`) only keeps the literal parts
-
-`ast.c`'s `make_interp_string` splits an interpolated string into literal and
-expression segments correctly, but `lower.c` hands each `{{expr}}` segment to
-`ir_to_mir.c` as **raw, unparsed source text** — `ir_to_mir.c` has no expression
-evaluator available to it (that's `lower.c`'s job, and it doesn't do it), so every
-expression segment is silently dropped from the result (with a stderr diagnostic naming
-the segment), leaving only the literal text. And as noted above, even that computed
-string currently can't be passed straight to `print`/`println` — only to a variable.
-
-### There is no tuple / multi-return type
-
-Tuples were removed entirely: the tuple `Type` kind is gone from `ast.h`, there is no
-tuple rule in `compiler/parser.y`, and `tuple_type`/`tuple_expr` have been removed from
-the tree-sitter grammar too (they used to linger there, so editors happily highlighted
-tuple syntax that the compiler rejects outright). `(int, int) divmod(...)` style
-multi-return syntax does not exist — functions return exactly one `type`.
-
----
-
-**What this leaves as solid ground today:** primitive scalar types and arithmetic on
-local variables, `if`/`else`/`while`/`for` (C-style, with the post-clause caveat
-above)/`for`-`in`, `switch`/`case`/`default`, `unsafe` blocks, `naked` functions used
-to sidestep the register-clobbering issue above, pointers (`&`/`*`/`cast<T>`/`as`),
-`include`/`module`, zero-field classes, enums compared by integer value, and printing
-string literals — *plus* calling a function and using its result **immediately**
-(same or next statement, no further call in between). Using a function's result any
-later than that — across a further call, or by returning it — hits the
-register-clobbering issue described first on this page, which cuts across nearly
-everything else, including most stdlib functions called from ordinary (non-`naked`)
-code. Most of the rest of this reference describes what the *grammar* supports even
-where a note above says the backend isn't there yet — that's the point of this page:
-read the feature docs for the design, read this page for what's actually load-bearing
-right now.
-
----
-
-### Notes found while building the networking stack
-
-- **Nested generics need a space:** `cast<array<str>>(x)` fails to parse because `>>` lexes
-  as a shift operator. Write `cast<array<str> >(x)`.
-- **Class values are stored inline, not by pointer.** `cast<MyClass>(raw_alloc(n))` doesn't
-  give you a heap object that survives being returned from a function. The stdlib modules
-  that need a heap-allocated handle (`map`, `bytes` buffers, `http` responses) use an
-  opaque `usize` pointing at a raw word block instead.
-- **`in` is a reserved word** (for-in loops) — it can't be used as a variable name.
-- **Zora:** `zora` links `mem`, `runtime` and `array` automatically, but stdlib modules
-  written in Hylian are found via `include { std.<module> }` (from `$HYLIAN_LIB` or the
-  installed `/usr/local/lib/hylian/std`), so re-run `devInstall.sh` after changing `stdlib/`.
+- **Static library code must be re-installed after edits.** Zora compiles stdlib modules
+  from `$HYLIAN_LIB` or `/usr/local/lib/hylian/std`; run `./devInstall.sh` after changing
+  `stdlib/`, and delete a project's `zora-build/.hylian-cache` if a stale object is linked.
+- **The kernel syscall round trip** (`syscall` -> LSTAR handler -> `sysret()` executed from
+  ring 0) is not verified; a real one needs a ring-3 jump and TSS. The MSR/builtin setup
+  itself is verified.
+- `tree-sitter-hylian/` (the packaged copy under `lsp/`) is not kept in step with
+  `lsp/grammar/grammar.js`; `tests/grammar_drift.sh` checks the compiler, the LSP and
+  `lsp/grammar`.

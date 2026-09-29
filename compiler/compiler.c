@@ -112,6 +112,58 @@ static char *trim(char *s) {
     return s;
 }
 
+/* A type as written in a .hyi declaration: `int`, `float`, `str`, `*void`,
+   `**uint8`, a struct name... */
+static Type hyi_parse_type(const char *text) {
+    char buf[128];
+    strncpy(buf, text, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *t = trim(buf);
+    if (*t == '*') return make_rawptr_type(hyi_parse_type(t + 1));
+    return make_simple_type(strdup(t), 0);
+}
+
+/* Parse the `name: type, name: type` list between the parentheses of a .hyi
+   `fn` line into VarDeclNode parameters. They used to be discarded, which is
+   why the compiler couldn't tell a C function's float arguments from its
+   integer ones (SysV passes them in different registers). A parameter with no
+   `name:` prefix is accepted as a bare type. */
+static void hyi_parse_params(const char *open_paren, ASTNode ***out_params, int *out_count) {
+    *out_params = NULL;
+    *out_count = 0;
+    const char *p = open_paren + 1;
+    const char *end = NULL;
+    int depth = 1;
+    for (const char *q = p; *q; q++) {
+        if (*q == '(') depth++;
+        else if (*q == ')' && --depth == 0) { end = q; break; }
+    }
+    if (!end) return;
+    char list[1024];
+    size_t len = (size_t)(end - p);
+    if (len >= sizeof(list)) len = sizeof(list) - 1;
+    memcpy(list, p, len);
+    list[len] = '\0';
+    char *save = NULL;
+    for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *item = trim(tok);
+        if (!*item) continue;
+        char *colon = strchr(item, ':');
+        char pname[64];
+        const char *tname = item;
+        if (colon) {
+            *colon = '\0';
+            snprintf(pname, sizeof(pname), "%s", trim(item));
+            tname = colon + 1;
+        } else {
+            snprintf(pname, sizeof(pname), "arg%d", *out_count);
+        }
+        Type ty = hyi_parse_type(tname);
+        *out_params = realloc(*out_params, (*out_count + 1) * sizeof(ASTNode *));
+        (*out_params)[(*out_count)++] = (ASTNode *)make_var_decl(ty, strdup(pname), NULL);
+    }
+}
+
 /* Parse a .hyi file into a synthetic ProgramNode.
    Also writes the first "link" library name into *out_link (heap-allocated),
    and collects all "pkg" directive names into out_pkgs / out_pkg_count.
@@ -352,7 +404,7 @@ static ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link
                 strncpy(ret_str, arrow + 2, sizeof(ret_str) - 1);
                 ret_str[sizeof(ret_str) - 1] = '\0';
                 char *trimmed_ret = trim(ret_str);
-                ret_type = make_simple_type(strdup(trimmed_ret), 0);
+                ret_type = hyi_parse_type(trimmed_ret);
             } else {
                 ret_type = make_simple_type(strdup("void"), 0);
             }
@@ -363,7 +415,7 @@ static ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link
                         current_class->name);
             } else if (current_class) {
                 MethodNode *m = make_method(ret_type, strdup(fn_name));
-                m->param_count = 0;
+                hyi_parse_params(paren, &m->params, &m->param_count);
                 m->body_count  = 0;
                 current_class->methods = realloc(
                     current_class->methods,
@@ -372,7 +424,7 @@ static ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link
                 current_class->methods[current_class->method_count++] = m;
             } else {
                 FuncNode *fn = make_func(ret_type, strdup(fn_name));
-                fn->param_count = 0;
+                hyi_parse_params(paren, &fn->params, &fn->param_count);
                 fn->body_count  = 0;
                 prog->declarations = realloc(
                     prog->declarations,

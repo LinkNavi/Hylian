@@ -51,6 +51,7 @@ what's on disk:
 | `mem` | `stdlib/mem.hy` | The arena allocator backing `new` (`arena_init`/`arena_alloc`/`arena_free`) — always linked, not something you `include` directly. |
 | `runtime` | `stdlib/runtime.hy` | `hylian_print`/`hylian_println`, the builtins the `print`/`println` *syntax* itself compiles down to — always linked regardless of what you `include`. |
 | `net` | `stdlib/net.hy` | Raw IPv4 TCP/UDP sockets: `tcp_socket`, `udp_socket`, `connect`, `bind`, `listen`, `accept`, `send`, `recv`, `sendto`, `recvfrom`, `close`, `shutdown`, `set_timeout` |
+| `math` / `assert` | `stdlib/math.hy`, `assert.hy` | `min`, `max`, `sqrt`, `sin`, `pow`, ...; `assert`, `assert_eq` |
 | `bytes` | `stdlib/bytes.hy` | Binary-safe byte buffers (`get8`/`set8`, `bytes_copy`, growable `buf_*`) |
 | `map` | `stdlib/map.hy` | String-keyed hash map (`map_new`, `map_put`, `map_get`, …) |
 | `dns` | `stdlib/dns.hy` | `dns_resolve` (`/etc/hosts` + UDP DNS) |

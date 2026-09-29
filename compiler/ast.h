@@ -40,6 +40,8 @@ typedef enum {
     NODE_STATIC_VAR, /* static type name = expr; top-level mutable global */
     NODE_STRUCT_LITERAL, /* ClassName { field: value, ... } stack-allocated struct */
     NODE_MODULE,      /* module Name { ... } */
+    NODE_TERNARY,     /* cond ? then : else */
+    NODE_DEFER,       /* defer stmt;  /  defer { ... } - runs when the function returns */
 } NodeType;
 
 typedef enum {
@@ -170,6 +172,13 @@ typedef struct {
 
 typedef struct {
     ASTNode base;
+    ASTNode *cond;
+    ASTNode *then_expr;
+    ASTNode *else_expr;
+} TernaryNode;
+
+typedef struct {
+    ASTNode base;
     char *op;
     ASTNode *left;
     ASTNode *right;
@@ -297,6 +306,13 @@ typedef struct {
 } UnsafeBlockNode;
 
 typedef struct {
+    ASTNode   base;
+    ASTNode **body;
+    int       body_count;
+    char      flag[48];   /* hidden "this defer was reached" local, set by lower.c */
+} DeferNode;
+
+typedef struct {
     ASTNode base;
     Type var_type;
     char *var_name;
@@ -355,6 +371,7 @@ ForInNode *make_for_in(char *var_name, int use_ref, ASTNode *collection);
 VarDeclNode *make_var_decl(Type type, char *name, ASTNode *init);
 AssignNode *make_assign(char *name, ASTNode *value);
 CompoundAssignNode *make_compound_assign(char *op, char *name, ASTNode *value);
+TernaryNode *make_ternary(ASTNode *cond, ASTNode *then_expr, ASTNode *else_expr);
 BinaryOpNode *make_binary_op(char *op, ASTNode *left, ASTNode *right);
 UnaryOpNode *make_unary_op(char *op, ASTNode *operand, int postfix);
 CppIncludeNode *make_cpp_include(char *header);
@@ -367,6 +384,7 @@ InterpStringNode *make_interp_string(const char *raw); /* raw = full string with
 BreakNode *make_break();
 ContinueNode *make_continue();
 UnsafeBlockNode *make_unsafe_block(ASTNode **body, int body_count);
+DeferNode *make_defer(ASTNode **body, int body_count);
 
 typedef struct {
     ASTNode base;

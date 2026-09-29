@@ -167,6 +167,9 @@ typedef struct {
                                 in declaration order - backend's prologue uses this to know
                                 how many SysV arg registers to spill into local slots */
     int       is_naked;     /* skip prologue/epilogue, e.g. syscall wrappers/ISR */
+    MIRType  *param_types;  /* declared type of each incoming param (param_count entries, or NULL
+                               = all integer-class); the backend needs them to know which params
+                               arrive in xmm registers (SysV passes floats there) */
 } MIRFunc;
 
 typedef struct {

@@ -75,6 +75,12 @@ typedef struct {
        not take the address of the slot holding it. */
     const char *struct_param_names[32];
     int         struct_param_count;
+    /* `defer` statements found in the function being lowered (see
+       collect_defers), and whether their bodies are being emitted right now
+       (so a `return` inside a deferred block doesn't re-run them) */
+    DeferNode  *defers[32];
+    int         defer_count;
+    int         defer_emitting;
 } LowerState;
 
 
@@ -172,7 +178,10 @@ static int classify_print_arg(ASTNode *arg) {
         return PRINT_ARG_FLOAT;
     /* Check resolved type for float */
     if (arg->resolved_type.kind == TYPE_SIMPLE && arg->resolved_type.name &&
-        strcmp(arg->resolved_type.name, "float") == 0)
+        (strcmp(arg->resolved_type.name, "float") == 0 ||
+         strcmp(arg->resolved_type.name, "double") == 0 ||
+         strcmp(arg->resolved_type.name, "float64") == 0 ||
+         strcmp(arg->resolved_type.name, "float32") == 0))
         return PRINT_ARG_FLOAT;
     /* Check resolved type for str pointer */
     if (arg->resolved_type.kind == TYPE_SIMPLE && arg->resolved_type.name &&
@@ -632,6 +641,117 @@ static int lower_c_call_arg(ASTNode *arg, LowerState *s) {
 }
 
 /* Emit code for `node`; return the temp ID that holds the result. */
+/* ── defer ────────────────────────────────────────────────────────────────────
+   `defer stmt;` / `defer { ... }` registers code to run when the enclosing
+   function returns, in reverse order of registration, if control actually
+   passed through the defer statement. Each one gets a hidden bool local that
+   is cleared at function entry and set where the `defer` statement sits;
+   every exit (each `return`, and falling off the end) tests the flags and runs
+   the bodies of the ones that are set. A defer inside a loop still runs just
+   once, at function exit. Deferred code runs before the function's locals go
+   away, so it can use them. It does not run if the process exits or panics. */
+
+static void collect_defers(ASTNode *n, LowerState *s);
+
+static void collect_defers_list(ASTNode **list, int count, LowerState *s) {
+    for (int i = 0; i < count; i++) collect_defers(list[i], s);
+}
+
+static void collect_defers(ASTNode *n, LowerState *s) {
+    if (!n) return;
+    switch (n->type) {
+    case NODE_DEFER: {
+        DeferNode *d = (DeferNode *)n;
+        if (s->defer_count < 32) {
+            snprintf(d->flag, sizeof(d->flag), "__defer_flag_%d", s->defer_count);
+            s->defers[s->defer_count++] = d;
+        }
+        break;
+    }
+    case NODE_IF: {
+        IfNode *x = (IfNode *)n;
+        collect_defers_list(x->then_body, x->then_count, s);
+        collect_defers_list(x->else_body, x->else_count, s);
+        break;
+    }
+    case NODE_WHILE:  { WhileNode *x = (WhileNode *)n;   collect_defers_list(x->body, x->body_count, s); break; }
+    case NODE_FOR:    { ForNode *x = (ForNode *)n;       collect_defers_list(x->body, x->body_count, s); break; }
+    case NODE_FOR_IN: { ForInNode *x = (ForInNode *)n;   collect_defers_list(x->body, x->body_count, s); break; }
+    case NODE_UNSAFE: { UnsafeBlockNode *x = (UnsafeBlockNode *)n; collect_defers_list(x->body, x->body_count, s); break; }
+    case NODE_SWITCH: {
+        SwitchNode *x = (SwitchNode *)n;
+        for (int i = 0; i < x->case_count; i++)
+            collect_defers_list(x->cases[i]->body, x->cases[i]->body_count, s);
+        break;
+    }
+    default: break;
+    }
+}
+
+/* Emit the bodies of every registered defer whose flag is set, newest first. */
+static void emit_defers(LowerState *s) {
+    if (s->defer_count == 0 || s->defer_emitting) return;
+    s->defer_emitting = 1;
+    for (int i = s->defer_count - 1; i >= 0; i--) {
+        DeferNode *d = s->defers[i];
+        int lbl_skip = alloc_label(s);
+        int tf = alloc_temp(s);
+        { IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR); lv->dest = irop_temp(tf); lv->str_extra = strdup(d->flag); }
+        { IRInstr *j = ir_emit(s->mod, IR_JUMP_UNLESS); j->src1 = irop_temp(tf); j->src2 = irop_label(lbl_skip); }
+        lower_stmts(d->body, d->body_count, s);
+        { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_skip); }
+    }
+    s->defer_emitting = 0;
+}
+
+/* arena_free(&__arena__) for the current function. Emitted before EVERY
+   return, not just the last one: an early `return` inside an `if` used to skip
+   it, leaking the function's arena block on each such call. */
+static void emit_arena_free(LowerState *s) {
+    int t_aptr = alloc_temp(s);
+    IRInstr *addrof = ir_emit(s->mod, IR_ADDROF);
+    addrof->dest      = irop_temp(t_aptr);
+    addrof->str_extra = strdup("__arena__");
+    IRInstr *free_call = ir_emit(s->mod, IR_CALL);
+    free_call->str_extra = strdup("arena_free");
+    free_call->dest      = irop_temp(alloc_temp(s));
+    free_call->args      = malloc(sizeof(IROperand));
+    free_call->args[0]   = irop_temp(t_aptr);
+    free_call->arg_count = 1;
+}
+
+/* The program being lowered, so a call site can look its callee up and fill
+   in default argument values (see lower_find_func / the general call path). */
+static ProgramNode *g_lower_prog = NULL;
+
+static FuncNode *lower_find_func(const char *name) {
+    if (!g_lower_prog || !name) return NULL;
+    for (int i = 0; i < g_lower_prog->decl_count; i++) {
+        ASTNode *d = g_lower_prog->declarations[i];
+        if (d && d->type == NODE_FUNC && ((FuncNode *)d)->name &&
+            strcmp(((FuncNode *)d)->name, name) == 0)
+            return (FuncNode *)d;
+    }
+    return NULL;
+}
+
+/* IR opcode for a compound-assignment operator ("+=", "<<=", ...).
+   `%=` and the bitwise/shift forms used to fall through to IR_ADD, silently
+   compiling `x %= 4` as `x += 4`. */
+static IROpcode compound_assign_opcode(const char *op) {
+    if (strcmp(op, "+=")  == 0) return IR_ADD;
+    if (strcmp(op, "-=")  == 0) return IR_SUB;
+    if (strcmp(op, "*=")  == 0) return IR_MUL;
+    if (strcmp(op, "/=")  == 0) return IR_DIV;
+    if (strcmp(op, "%=")  == 0) return IR_MOD;
+    if (strcmp(op, "&=")  == 0) return IR_BITAND;
+    if (strcmp(op, "|=")  == 0) return IR_BITOR;
+    if (strcmp(op, "^=")  == 0) return IR_BITXOR;
+    if (strcmp(op, "<<=") == 0) return IR_SHL;
+    if (strcmp(op, ">>=") == 0) return IR_SHR;
+    return IR_ADD;
+}
+
 static int lower_expr(ASTNode *node, LowerState *s) {
     if (!node) {
         int t = alloc_temp(s);
@@ -702,6 +822,32 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         IRInstr *ins  = ir_emit(s->mod, IR_LOAD_VAR);
         ins->dest     = irop_temp(t);
         ins->str_extra = strdup(resolved_name);
+        return t;
+    }
+
+    case NODE_TERNARY: {
+        /* cond ? a : b - only the chosen arm is evaluated. Both arms store
+           into a synthesised local (same merge trick as && / ||). */
+        TernaryNode *tn = (TernaryNode *)node;
+        int lbl_else = alloc_label(s);
+        int lbl_end  = alloc_label(s);
+        char nm[32]; snprintf(nm, sizeof(nm), "__tern_%d", lbl_end);
+        const char *tname = NULL;
+        if (tn->base.resolved_type.kind == TYPE_SIMPLE && tn->base.resolved_type.name &&
+            strcmp(tn->base.resolved_type.name, "void") != 0)
+            tname = tn->base.resolved_type.name;
+        emit_alloca(s, nm, tname, TYPE_SIMPLE);
+        int tc = lower_expr(tn->cond, s);
+        { IRInstr *j = ir_emit(s->mod, IR_JUMP_UNLESS); j->src1 = irop_temp(tc); j->src2 = irop_label(lbl_else); }
+        int ta = lower_expr(tn->then_expr, s);
+        { IRInstr *sv = ir_emit(s->mod, IR_STORE_VAR); sv->str_extra = strdup(nm); sv->src1 = irop_temp(ta); }
+        { IRInstr *j = ir_emit(s->mod, IR_JUMP); j->src1 = irop_label(lbl_end); }
+        { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_else); }
+        int tb = lower_expr(tn->else_expr, s);
+        { IRInstr *sv = ir_emit(s->mod, IR_STORE_VAR); sv->str_extra = strdup(nm); sv->src1 = irop_temp(tb); }
+        { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_end); }
+        int t = alloc_temp(s);
+        { IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR); lv->dest = irop_temp(t); lv->str_extra = strdup(nm); }
         return t;
     }
 
@@ -844,7 +990,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                 arg_ops[1] = irop_temp(tr2);
                 IRInstr *ins = ir_emit(s->mod, IR_CALL);
                 ins->dest      = irop_temp(t2);
-                ins->str_extra = strdup("concat");
+                ins->str_extra = strdup("hylian_str_concat");
                 ins->args      = arg_ops;
                 ins->arg_count = 2;
                 return t2;
@@ -1024,9 +1170,14 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     err_src1 = irop_temp(ta);
                 }
             }
+            /* optional second argument: an integer error code */
+            IROperand err_code = irop_const_int(0);
+            if (call->arg_count >= 2)
+                err_code = irop_temp(lower_expr(call->args[1], s));
             IRInstr *ins = ir_emit(s->mod, IR_ERR);
             ins->dest = irop_temp(t);
             ins->src1 = err_src1;
+            ins->src2 = err_code;
             return t;
         }
 
@@ -1354,6 +1505,61 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             return t;
         }
 
+        /* ── __interp(a, b, ...) - string interpolation ────────────────────
+           The lexer rewrites "x = {{x}}!" into __interp("x = ", (x), "!").
+           Each argument is turned into a string according to its type and the
+           pieces are concatenated left to right. */
+        if (strcmp(call->name, "__interp") == 0) {
+            int acc = -1;
+            for (int i = 0; i < call->arg_count; i++) {
+                ASTNode *arg = call->args[i];
+                int ta = lower_expr(arg, s);
+                const char *tn = (arg->resolved_type.kind == TYPE_SIMPLE) ? arg->resolved_type.name : NULL;
+                const char *conv = NULL;
+                int is_f32 = 0;
+                if (arg->type == NODE_LITERAL && ((LiteralNode *)arg)->lit_type == LIT_STRING) conv = NULL;
+                else if (arg->type == NODE_LITERAL && ((LiteralNode *)arg)->lit_type == LIT_FLOAT) conv = "hylian_str_from_float";
+                else if (tn && strcmp(tn, "str") == 0) conv = NULL;
+                else if (tn && (strcmp(tn, "float") == 0 || strcmp(tn, "double") == 0 || strcmp(tn, "float64") == 0)) conv = "hylian_str_from_float";
+                else if (tn && strcmp(tn, "float32") == 0) { conv = "hylian_str_from_float"; is_f32 = 1; }
+                else if (tn && strcmp(tn, "bool") == 0) conv = "hylian_str_from_bool";
+                else conv = "hylian_str_from_int";
+                if (is_f32) {
+                    int wide = alloc_temp(s);
+                    IRInstr *c = ir_emit(s->mod, IR_CAST);
+                    c->dest = irop_temp(wide); c->src1 = irop_temp(ta); c->str_extra = strdup("float");
+                    ta = wide;
+                }
+                if (conv) {
+                    int ts = alloc_temp(s);
+                    IRInstr *ci = ir_emit(s->mod, IR_CALL);
+                    ci->dest = irop_temp(ts);
+                    ci->str_extra = strdup(conv);
+                    ci->args = malloc(sizeof(IROperand));
+                    ci->args[0] = irop_temp(ta);
+                    ci->arg_count = 1;
+                    ta = ts;
+                }
+                if (acc < 0) { acc = ta; continue; }
+                int tc = alloc_temp(s);
+                IRInstr *cc = ir_emit(s->mod, IR_CALL);
+                cc->dest = irop_temp(tc);
+                cc->str_extra = strdup("hylian_str_concat");
+                cc->args = malloc(2 * sizeof(IROperand));
+                cc->args[0] = irop_temp(acc);
+                cc->args[1] = irop_temp(ta);
+                cc->arg_count = 2;
+                acc = tc;
+            }
+            if (acc < 0) {
+                acc = alloc_temp(s);
+                IRInstr *e = ir_emit(s->mod, IR_CONST_STR);
+                e->dest = irop_temp(acc);
+                e->src1 = irop_const_str(strdup(""));
+            }
+            return acc;
+        }
+
         /* ── General function call ─────────────────────────────────────── */
         {
             int t = alloc_temp(s);
@@ -1374,13 +1580,61 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                 }
             }
             int use_c_abi_args = tc_func_is_external_decl(resolved_name);
+            /* Default parameter values: `int f(int a, int b = 5)` called as
+               f(1) gets the callee's default for each missing trailing
+               argument. The default expression is lowered here, at the call
+               site, so it should be a literal or constant. */
+            ASTNode **call_args = call->args;
+            FuncNode *callee = lower_find_func(call->name);
+            if (callee && nargs < callee->param_count) {
+                int total = callee->param_count;
+                ASTNode **ext = malloc(total * sizeof(ASTNode *));
+                for (int i = 0; i < nargs; i++) ext[i] = call->args[i];
+                int filled = nargs;
+                while (filled < total) {
+                    VarDeclNode *p = (VarDeclNode *)callee->params[filled];
+                    if (!p || !p->initializer) break;
+                    ext[filled++] = p->initializer;
+                }
+                call_args = ext;
+                nargs = filled;
+            }
             IROperand *arg_ops = NULL;
             if (nargs > 0) {
                 arg_ops = malloc(nargs * sizeof(IROperand));
                 for (int i = 0; i < nargs; i++) {
                     int ta = use_c_abi_args
-                           ? lower_c_call_arg(call->args[i], s)
-                           : lower_call_arg(call->args[i], s);
+                           ? lower_c_call_arg(call_args[i], s)
+                           : lower_call_arg(call_args[i], s);
+                    /* Convert the argument to the declared parameter type when
+                       one side is a float: `sqrt(2)` passes 2.0, a `double`
+                       given to a `float32` parameter is narrowed, and a float
+                       given to an int parameter is truncated - the same
+                       implicit conversions C does at a call. (This matters for
+                       correctness now, not just convenience: float parameters
+                       travel in xmm registers, so an int value arriving where
+                       a float is expected would be read from the wrong place.) */
+                    int pk = tc_func_param_kind(call->name, i);
+                    const char *an = call_args[i]->resolved_type.kind == TYPE_SIMPLE
+                                         ? call_args[i]->resolved_type.name : NULL;
+                    int ak = 0; /* 0 unknown, 1 int-like, 2 float64, 4 float32 */
+                    if (an) {
+                        if (!strcmp(an, "float") || !strcmp(an, "double") || !strcmp(an, "float64")) ak = 2;
+                        else if (!strcmp(an, "float32")) ak = 4;
+                        else if (strcmp(an, "unknown") && strcmp(an, "auto") && strcmp(an, "str") &&
+                                 strcmp(an, "void") && strcmp(an, "Error")) ak = 1;
+                    }
+                    if (call_args[i]->type == NODE_LITERAL && ((LiteralNode *)call_args[i])->lit_type == LIT_FLOAT) ak = 2;
+                    const char *conv = NULL;
+                    if (pk == 2 && ak != 2 && ak != 0) conv = "float";
+                    else if (pk == 4 && ak != 4 && ak != 0) conv = "float32";
+                    else if (pk == 1 && (ak == 2 || ak == 4)) conv = "int";
+                    if (conv) {
+                        int tc = alloc_temp(s);
+                        IRInstr *c = ir_emit(s->mod, IR_CAST);
+                        c->dest = irop_temp(tc); c->src1 = irop_temp(ta); c->str_extra = strdup(conv);
+                        ta = tc;
+                    }
                     arg_ops[i] = irop_temp(ta);
                 }
             }
@@ -1389,7 +1643,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->str_extra = strdup(resolved_name);
             ins->args      = arg_ops;
             ins->arg_count = nargs;
-            ins->extra_int = tc_func_return_is_bool(resolved_name);
+            ins->extra_int = tc_func_return_flags(resolved_name);
             return t;
         }
     }
@@ -1458,7 +1712,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     ins2->str_extra = mname2;
                     ins2->args      = arg_ops2;
                     ins2->arg_count = nargs2;
-                    ins2->extra_int = tc_func_return_is_bool(mname2);
+                    ins2->extra_int = tc_func_return_flags(mname2);
                     return t2;
                 }
             }
@@ -1498,7 +1752,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->str_extra = mname;
             ins->args      = arg_ops;
             ins->arg_count = total;
-            ins->extra_int = tc_func_return_is_bool(mname);
+            ins->extra_int = tc_func_return_flags(mname);
             return t;
         }
     }
@@ -1654,6 +1908,20 @@ static int lower_expr(ASTNode *node, LowerState *s) {
 
     case NODE_INDEX: {
         IndexNode *ix = (IndexNode *)node;
+        /* s[i] on a str: the byte at offset i (0-255), no bounds check */
+        if (ix->object->resolved_type.kind == TYPE_SIMPLE && ix->object->resolved_type.name &&
+            strcmp(ix->object->resolved_type.name, "str") == 0) {
+            int tstr = lower_expr(ix->object, s);
+            int tidx = lower_expr(ix->index, s);
+            int taddr = alloc_temp(s);
+            IRInstr *add = ir_emit(s->mod, IR_ADD);
+            add->dest = irop_temp(taddr); add->src1 = irop_temp(tstr); add->src2 = irop_temp(tidx);
+            int tb = alloc_temp(s);
+            IRInstr *ld = ir_emit(s->mod, IR_LOAD_PTR);
+            ld->dest = irop_temp(tb); ld->src1 = irop_temp(taddr);
+            ld->str_extra = strdup("uint8");
+            return tb;
+        }
         int tobj;
         int is_flat = 0;
         const char *flat_elem_type = NULL;
@@ -1764,6 +2032,15 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 
     switch (node->type) {
 
+    case NODE_DEFER: {
+        /* reaching the statement arms the defer; the code itself runs at exit */
+        DeferNode *d = (DeferNode *)node;
+        IRInstr *sv = ir_emit(s->mod, IR_STORE_VAR);
+        sv->str_extra = strdup(d->flag);
+        sv->src1 = irop_const_bool(1);
+        break;
+    }
+
     case NODE_UNSAFE: {
         UnsafeBlockNode *ub = (UnsafeBlockNode *)node;
         int prev = s->in_unsafe;
@@ -1854,11 +2131,7 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
             int tcur = lower_load_self_field(s, ca->var_name);
             int trhs = lower_expr(ca->value, s);
             int tres = alloc_temp(s);
-            IROpcode cop =
-                strcmp(ca->op, "+=") == 0 ? IR_ADD :
-                strcmp(ca->op, "-=") == 0 ? IR_SUB :
-                strcmp(ca->op, "*=") == 0 ? IR_MUL :
-                strcmp(ca->op, "/=") == 0 ? IR_DIV : IR_ADD;
+            IROpcode cop = compound_assign_opcode(ca->op);
             IRInstr *op_ins = ir_emit(s->mod, cop);
             op_ins->dest = irop_temp(tres);
             op_ins->src1 = irop_temp(tcur);
@@ -1874,11 +2147,20 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         { IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR); lv->dest = irop_temp(tcur); lv->str_extra = strdup(_ca_name); }
         int trhs = lower_expr(ca->value, s);
         int tres = alloc_temp(s);
-        IROpcode irop =
-            strcmp(ca->op, "+=") == 0 ? IR_ADD :
-            strcmp(ca->op, "-=") == 0 ? IR_SUB :
-            strcmp(ca->op, "*=") == 0 ? IR_MUL :
-            strcmp(ca->op, "/=") == 0 ? IR_DIV : IR_ADD;
+        if (strcmp(ca->op, "+=") == 0 && ca->value->resolved_type.kind == TYPE_SIMPLE &&
+            ca->value->resolved_type.name && strcmp(ca->value->resolved_type.name, "str") == 0) {
+            /* `s += "x"` on a string appends (a new string; strings are immutable) */
+            IROperand *cargs = malloc(2 * sizeof(IROperand));
+            cargs[0] = irop_temp(tcur); cargs[1] = irop_temp(trhs);
+            IRInstr *cc = ir_emit(s->mod, IR_CALL);
+            cc->dest = irop_temp(tres); cc->str_extra = strdup("hylian_str_concat");
+            cc->args = cargs; cc->arg_count = 2;
+            IRInstr *svs = ir_emit(s->mod, IR_STORE_VAR);
+            svs->str_extra = strdup(_ca_name);
+            svs->src1 = irop_temp(tres);
+            break;
+        }
+        IROpcode irop = compound_assign_opcode(ca->op);
         IRInstr *op_ins = ir_emit(s->mod, irop);
         op_ins->dest = irop_temp(tres);
         op_ins->src1 = irop_temp(tcur);
@@ -1917,6 +2199,20 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 
     case NODE_INDEX_ASSIGN: {
         IndexAssignNode *ia = (IndexAssignNode *)node;
+        /* s[i] = c on a str buffer: store one byte */
+        if (ia->object->resolved_type.kind == TYPE_SIMPLE && ia->object->resolved_type.name &&
+            strcmp(ia->object->resolved_type.name, "str") == 0) {
+            int tstr = lower_expr(ia->object, s);
+            int tidx = lower_expr(ia->index, s);
+            int tval = lower_expr(ia->value, s);
+            int taddr = alloc_temp(s);
+            IRInstr *add = ir_emit(s->mod, IR_ADD);
+            add->dest = irop_temp(taddr); add->src1 = irop_temp(tstr); add->src2 = irop_temp(tidx);
+            IRInstr *st = ir_emit(s->mod, IR_STORE_PTR);
+            st->src1 = irop_temp(taddr); st->src2 = irop_temp(tval);
+            st->str_extra = strdup("uint8");
+            break;
+        }
         int tobj;
         int is_flat_store = 0;
         const char *flat_store_elem_type = NULL;
@@ -1971,6 +2267,8 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         IROperand ret_src = {.kind = IROP_NONE};
         if (ret->value)
             ret_src = irop_temp(lower_expr(ret->value, s));
+        emit_defers(s); /* after the value is computed, before leaving */
+        if (s->has_arena) emit_arena_free(s);
         IRInstr *ins = ir_emit(s->mod, IR_RETURN);
         ins->src1 = ret_src;
         break;
@@ -2275,12 +2573,15 @@ static int is_arena_bootstrap_fn(const char *name) {
     static const char *names[] = {
         "arena_init", "arena_alloc", "arena_free", "_arena_new_block",
         "_mem_raw_alloc", "_mem_raw_free",
-        "hylian_multi_alloc", "hylian_make_err", "Error_message",
+        "hylian_multi_alloc", "hylian_make_err", "Error_message", "Error_code",
         "_arr_raw_alloc", "_arr_raw_free", "_arr_load", "_arr_store",
-        "hylian_array_alloc", "hylian_array_free", "_arr_grow",
+        "hylian_array_alloc", "hylian_array_free", "_arr_grow", "hylian_array_zeros",
         "hylian_array_push", "hylian_array_pop",
         "hylian_array_get", "hylian_array_set",
         "hylian_print", "hylian_println", "hylian_int_to_str",
+        "hylian_str_alloc", "_rt_strlen", "hylian_str_concat", "hylian_str_from_int",
+        "hylian_str_from_bool", "_rt_put", "hylian_float_to_str", "hylian_str_from_float",
+        "hylian_panic",
         NULL
     };
     for (int i = 0; names[i]; i++)
@@ -2321,7 +2622,11 @@ static void lower_func_body(
     begin->extra_int = is_main | (is_naked << 1);
 
     /* Build param list (self first if method/ctor) */
-    int nparams = param_count > (has_self ? 5 : 6) ? (has_self ? 5 : 6) : param_count;
+    /* Parameters past the sixth are passed on the stack (SysV); the backend's
+       prologue copies them into their local slots. A generous cap, not a
+       register limit. */
+    int max_params = has_self ? 31 : 32;
+    int nparams = param_count > max_params ? max_params : param_count;
     int total_params = has_self ? nparams + 1 : nparams;
     if (total_params > 0) {
         begin->params     = calloc(total_params, sizeof(IRParam));
@@ -2388,58 +2693,33 @@ static void lower_func_body(
         init_call->arg_count = 1;
     }
 
+    /* defer: find them, clear their flags, then lower the body and run the
+       armed ones if the function falls off its end */
+    s->defer_count = 0;
+    s->defer_emitting = 0;
+    collect_defers_list(body, body_count, s);
+    for (int i = 0; i < s->defer_count; i++) {
+        emit_alloca(s, s->defers[i]->flag, "bool", TYPE_SIMPLE);
+        IRInstr *z = ir_emit(s->mod, IR_STORE_VAR);
+        z->str_extra = strdup(s->defers[i]->flag);
+        z->src1 = irop_const_bool(0);
+    }
+
     /* Lower body statements */
     lower_stmts(body, body_count, s);
+    if (s->defer_count > 0 &&
+        (s->mod->instr_count == 0 || s->mod->instrs[s->mod->instr_count - 1].op != IR_RETURN))
+        emit_defers(s);
+    s->defer_count = 0;
 
-    /* Emit arena_free(&__arena__) before function end.
-       If the body already ends with an explicit IR_RETURN we must insert
-       arena_free BEFORE that return (dead code after a ret confuses the MIR
-       verifier which requires the last instruction to be a terminator).
-       For void functions that fall off the end we emit arena_free then a
-       void return so the verifier is always satisfied. */
-    if (s->has_arena) {
-        /* Check whether the last emitted instruction is an IR_RETURN */
-        int last_is_ret = 0;
-        IRInstr *saved_ret = NULL;
-        if (s->mod->instr_count > 0) {
-            IRInstr *last = &s->mod->instrs[s->mod->instr_count - 1];
-            if (last->op == IR_RETURN) {
-                last_is_ret = 1;
-                /* Temporarily steal the return instruction out of the stream */
-                saved_ret = malloc(sizeof(IRInstr));
-                *saved_ret = *last;
-                s->mod->instr_count--; /* remove it */
-            }
-        }
-
-        int t_aptr2 = alloc_temp(s);
-        IRInstr *addrof2 = ir_emit(s->mod, IR_ADDROF);
-        addrof2->dest      = irop_temp(t_aptr2);
-        addrof2->str_extra = strdup("__arena__");
-
-        IRInstr *free_call = ir_emit(s->mod, IR_CALL);
-        free_call->str_extra = strdup("arena_free");
-        free_call->dest      = irop_temp(alloc_temp(s));
-        free_call->args      = malloc(sizeof(IROperand));
-        free_call->args[0]   = irop_temp(t_aptr2);
-        free_call->arg_count = 1;
-
-        if (last_is_ret && saved_ret) {
-            /* Re-emit the return after the arena_free */
-            IRInstr *re_ret = ir_emit(s->mod, IR_RETURN);
-            re_ret->src1 = saved_ret->src1;
-            free(saved_ret);
-        } else {
-            /* Void fall-through: emit an implicit void return */
-            ir_emit(s->mod, IR_RETURN);
-        }
-    } else {
-        /* No arena — still need a terminator if the body fell off the end
-           without an explicit return (e.g. void functions). */
-        if (s->mod->instr_count == 0 ||
-            s->mod->instrs[s->mod->instr_count - 1].op != IR_RETURN) {
-            ir_emit(s->mod, IR_RETURN);
-        }
+    /* Every explicit `return` already freed the arena (see NODE_RETURN). A
+       function that can fall off its end additionally needs the arena freed
+       and a return supplied, so the last instruction is always a terminator
+       (mir_verify requires it). */
+    if (s->mod->instr_count == 0 ||
+        s->mod->instrs[s->mod->instr_count - 1].op != IR_RETURN) {
+        if (s->has_arena) emit_arena_free(s);
+        ir_emit(s->mod, IR_RETURN);
     }
 
     ir_emit(s->mod, IR_FUNC_END);
@@ -2590,6 +2870,7 @@ static unsigned char *fold_struct_literal_to_bytes(StructLiteralNode *sl, LowerS
 
 
 IRModule *lower_program(ProgramNode *prog) {
+    g_lower_prog = prog;
     IRModule  *mod = ir_module_new();
     LowerState s   = { .mod = mod, .next_temp = 0, .next_label = 0, .loop_top = 0 };
 

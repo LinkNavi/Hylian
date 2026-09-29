@@ -13,6 +13,8 @@ void typecheck(ProgramNode *program, const char *filename);
    0 otherwise.  Used by lower.c to stamp IR_CALL.extra_int so that codegen
    can emit `movzx rax, al` after calls that return a C _Bool / bool. */
 int tc_func_return_is_bool(const char *name);
+int tc_func_return_flags(const char *name);
+int tc_func_param_kind(const char *name, int i);
 
 /* Returns 1 when the named function is a bodyless declaration that came from
    an include file. Generated .hyi declarations for C libraries have this

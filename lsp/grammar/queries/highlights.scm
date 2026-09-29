@@ -4,6 +4,8 @@
   "if"
   "else"
   "while"
+  "do"
+  "typedef"
   "for"
   "in"
   "return"
