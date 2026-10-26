@@ -69,6 +69,7 @@ void enc_ret(X64Buf *b);
 void enc_leave(X64Buf *b); /* mov rsp,rbp; pop rbp in one byte */
 
 size_t enc_call_rel32(X64Buf *b); /* returns offset of the disp32 to relocate */
+void enc_call_r(X64Buf *b, X64Reg r);
 size_t enc_jmp_rel32(X64Buf *b);
 size_t enc_jcc_rel32(X64Buf *b, CondCode cc);
 
@@ -127,5 +128,36 @@ void enc_cvtss2sd(X64Buf *b, int dst_xmm, int src_xmm); /* float -> double */
    plumbed into this layer yet) and for BITCAST between same-width int/float */
 void enc_movq_gpr_to_xmm(X64Buf *b, int dst_xmm, X64Reg src_gpr);
 void enc_movq_xmm_to_gpr(X64Buf *b, X64Reg dst_gpr, int src_xmm);
+
+/* ---- general memory operands  [base + idx*scale + disp] ---- */
+typedef struct { X64Reg base; int idx; /* -1 = none */ int scale; int32_t disp; } X64Mem;
+X64Mem x64_mem(X64Reg base, int32_t disp);
+X64Mem x64_mem_idx(X64Reg base, X64Reg idx, int scale, int32_t disp);
+void enc_load_mem(X64Buf *b, X64Reg dst, X64Mem m, int size, int is_signed);
+void enc_store_mem(X64Buf *b, X64Mem m, X64Reg src, int size);
+void enc_store_imm_mem(X64Buf *b, X64Mem m, int32_t imm, int size);
+void enc_lea_m(X64Buf *b, X64Reg dst, X64Mem m);
+void enc_alu_rm(X64Buf *b, AluOp op, X64Reg dst, X64Mem m);
+void enc_alu_mi(X64Buf *b, AluOp op, X64Mem m, int32_t imm);
+void enc_alu_ri(X64Buf *b, AluOp op, X64Reg dst, int32_t imm);
+void enc_test_rr(X64Buf *b, X64Reg a, X64Reg c);
+void enc_xchg_rr(X64Buf *b, X64Reg a, X64Reg c);
+void enc_imul_rm(X64Buf *b, X64Reg dst, X64Mem m);
+void enc_imul_rri(X64Buf *b, X64Reg dst, X64Reg src, int32_t imm);
+void enc_imul_rmi(X64Buf *b, X64Reg dst, X64Mem m, int32_t imm);
+void enc_shift_ri(X64Buf *b, ShiftKind kind, X64Reg reg, int imm);
+void enc_mov_ri(X64Buf *b, X64Reg dst, int64_t imm);
+void enc_movaps_xx(X64Buf *b, int dst_xmm, int src_xmm);
+void enc_sse_rm(X64Buf *b, int prefix, int opcode, int xmm, X64Mem m);
+size_t enc_sse_rip(X64Buf *b, int prefix, int opcode, int xmm);
+void enc_xorps_xx(X64Buf *b, int dst_xmm, int src_xmm);
+
+/* float constant pool (hyx64.c) */
+X64ConstPool *x64_get_const_pool(void);
+const char *x64_const_label(uint64_t bits, int size);
+void enc_mul1_r(X64Buf *b, X64Reg reg, int is_signed);
+void enc_test_ri(X64Buf *b, X64Reg reg, int32_t imm);
+void enc_cmovcc_rr(X64Buf *b, CondCode cc, X64Reg dst, X64Reg src);
+void enc_cmovcc_rm(X64Buf *b, CondCode cc, X64Reg dst, X64Mem m);
 
 #endif

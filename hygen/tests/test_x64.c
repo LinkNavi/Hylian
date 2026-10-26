@@ -27,11 +27,9 @@ static void test_trivial(void) {
     X64RelocList relocs; x64_reloc_list_init(&relocs);
     x64_lower_func(fn, &ra, &code, &relocs);
 
+    /* a function with no stack slots is frameless: no push rbp / leave */
     uint8_t expected[] = {
-        0x55,
-        0x48, 0x89, 0xE5,
-        0x48, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0xC9,
+        0xB8, 0x2A, 0x00, 0x00, 0x00,          /* mov eax, 42 (shortest encoding) */
         0xC3,
     };
     if (code.len != sizeof(expected)) {

@@ -1,0 +1,13 @@
+[project]
+name = "app"
+version = "0.1.0"
+
+[target.app]
+type = "bin"
+sources = ["src/main.hy"]
+
+[[target.app.deps]]
+system = "gfx"
+
+[[target.app.deps]]
+system = "audio"

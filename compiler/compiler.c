@@ -9,6 +9,8 @@
 #include "lower.h"
 #include "opt.h"
 #include "typecheck.h"
+#include "loader.h"
+#include "diag.h"
 
 
 extern int  yyparse(void);
@@ -36,408 +38,6 @@ static int already_visited(const char *path) {
 static void mark_visited(const char *path) {
     if (visited_count < MAX_VISITED)
         visited[visited_count++] = strdup(path);
-}
-
-
-/* Given "/some/dir/file.hy" return "/some/dir" (heap-allocated).
-   If there is no slash, returns "." */
-static char *dir_of(const char *path) {
-    const char *last = strrchr(path, '/');
-    if (!last) return strdup(".");
-    int len = (int)(last - path);
-    char *dir = malloc(len + 1);
-    strncpy(dir, path, len);
-    dir[len] = '\0';
-    return dir;
-}
-
-/* Convert a dot-separated module path to a file path relative to src_dir.
-   e.g. src_dir="src", module="Game.Player"  ->  "src/Game/Player.hy" */
-static char *module_to_filepath(const char *src_dir, const char *module) {
-    int mlen = strlen(module);
-    char *rel = malloc(mlen + 4); /* +4 for ".hy\0" */
-    for (int i = 0; i < mlen; i++)
-        rel[i] = (module[i] == '.') ? '/' : module[i];
-    strcpy(rel + mlen, ".hy");
-    int total = strlen(src_dir) + 1 + strlen(rel) + 1;
-    char *full = malloc(total);
-    snprintf(full, total, "%s/%s", src_dir, rel);
-    free(rel);
-    return full;
-}
-
-/* Resolve a dotted local include like "modules.cat.Cat" to a real .hy file
-   under `dir`. Tries the full dotted path first (module_to_filepath's
-   normal every-dot-is-a-slash behaviour, for a genuinely nested file
-   layout), then progressively drops trailing components and retries -
-   "modules/cat/Cat.hy" (doesn't exist), then "modules/cat.hy" (does).
-   This is what lets `include { modules.cat.Cat }` work: callers now have to
-   qualify calls into a module block as `Cat.catFunc(...)` (see lower.c /
-   typecheck.c), so writing the include path the same way - naming the file
-   *and* the module you want out of it - is the natural thing to type, even
-   though the module name isn't actually part of the filesystem path.
-   Returns a heap path (caller frees) that fopen'd successfully, or NULL if
-   nothing along the chain exists. */
-static char *resolve_dotted_include(const char *dir, const char *module) {
-    char *dep_path = module_to_filepath(dir, module);
-    FILE *probe = fopen(dep_path, "r");
-    if (probe) { fclose(probe); return dep_path; }
-    free(dep_path);
-
-    char *trimmed = strdup(module);
-    char *last_dot;
-    while ((last_dot = strrchr(trimmed, '.')) != NULL) {
-        *last_dot = '\0';
-        dep_path = module_to_filepath(dir, trimmed);
-        probe = fopen(dep_path, "r");
-        if (probe) { fclose(probe); free(trimmed); return dep_path; }
-        free(dep_path);
-    }
-    free(trimmed);
-    return NULL;
-}
-
-
-static ProgramNode *compile_file(const char *filepath, const char *src_dir);
-
-
-/* Trim leading and trailing whitespace in-place, returning pointer to first
-   non-space character (the string is also NUL-terminated after the last
-   non-space character). */
-static char *trim(char *s) {
-    while (*s && isspace((unsigned char)*s)) s++;
-    char *end = s + strlen(s);
-    while (end > s && isspace((unsigned char)*(end - 1))) end--;
-    *end = '\0';
-    return s;
-}
-
-/* A type as written in a .hyi declaration: `int`, `float`, `str`, `*void`,
-   `**uint8`, a struct name... */
-static Type hyi_parse_type(const char *text) {
-    char buf[128];
-    strncpy(buf, text, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    char *t = trim(buf);
-    if (*t == '*') return make_rawptr_type(hyi_parse_type(t + 1));
-    return make_simple_type(strdup(t), 0);
-}
-
-/* Parse the `name: type, name: type` list between the parentheses of a .hyi
-   `fn` line into VarDeclNode parameters. They used to be discarded, which is
-   why the compiler couldn't tell a C function's float arguments from its
-   integer ones (SysV passes them in different registers). A parameter with no
-   `name:` prefix is accepted as a bare type. */
-static void hyi_parse_params(const char *open_paren, ASTNode ***out_params, int *out_count) {
-    *out_params = NULL;
-    *out_count = 0;
-    const char *p = open_paren + 1;
-    const char *end = NULL;
-    int depth = 1;
-    for (const char *q = p; *q; q++) {
-        if (*q == '(') depth++;
-        else if (*q == ')' && --depth == 0) { end = q; break; }
-    }
-    if (!end) return;
-    char list[1024];
-    size_t len = (size_t)(end - p);
-    if (len >= sizeof(list)) len = sizeof(list) - 1;
-    memcpy(list, p, len);
-    list[len] = '\0';
-    char *save = NULL;
-    for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        char *item = trim(tok);
-        if (!*item) continue;
-        char *colon = strchr(item, ':');
-        char pname[64];
-        const char *tname = item;
-        if (colon) {
-            *colon = '\0';
-            snprintf(pname, sizeof(pname), "%s", trim(item));
-            tname = colon + 1;
-        } else {
-            snprintf(pname, sizeof(pname), "arg%d", *out_count);
-        }
-        Type ty = hyi_parse_type(tname);
-        *out_params = realloc(*out_params, (*out_count + 1) * sizeof(ASTNode *));
-        (*out_params)[(*out_count)++] = (ASTNode *)make_var_decl(ty, strdup(pname), NULL);
-    }
-}
-
-/* Parse a .hyi file into a synthetic ProgramNode.
-   Also writes the first "link" library name into *out_link (heap-allocated),
-   and collects all "pkg" directive names into out_pkgs / out_pkg_count.
-   Callers must free *out_link and each out_pkgs[i] entry. */
-static ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link,
-                                            char ***out_pkgs, int *out_pkg_count) {
-    *out_link      = NULL;
-    *out_pkgs      = NULL;
-    *out_pkg_count = 0;
-
-    FILE *f = fopen(filepath, "r");
-    if (!f) return NULL;
-
-    ProgramNode *prog = make_program();
-
-    char line[1024];
-    ClassNode *current_class = NULL;
-    enum { NO_BLOCK, CLASS_BLOCK, STRUCT_BLOCK, UNION_BLOCK } block_type = NO_BLOCK;
-
-    while (fgets(line, sizeof(line), f)) {
-        char *s = trim(line);
-        if (*s == '\0') continue;
-        if (strncmp(s, "module ", 7) == 0) continue;
-        if (strncmp(s, "link ", 5) == 0) {
-            if (*out_link == NULL) {
-                char *q = strchr(s + 5, '"');
-                if (q) {
-                    q++; /* skip opening quote */
-                    char *end = strchr(q, '"');
-                    if (end) {
-                        int len = (int)(end - q);
-                        *out_link = malloc(len + 1);
-                        strncpy(*out_link, q, len);
-                        (*out_link)[len] = '\0';
-                    }
-                }
-            }
-            continue;
-        }
-        if (strncmp(s, "pkg ", 4) == 0) {
-            char *q = strchr(s + 4, '"');
-            if (q) {
-                q++; /* skip opening quote */
-                char *end = strchr(q, '"');
-                if (end) {
-                    int len = (int)(end - q);
-                    char *pkg_name = malloc(len + 1);
-                    strncpy(pkg_name, q, len);
-                    pkg_name[len] = '\0';
-                    *out_pkgs = realloc(*out_pkgs, (*out_pkg_count + 1) * sizeof(char *));
-                    (*out_pkgs)[(*out_pkg_count)++] = pkg_name;
-                }
-            }
-            continue;
-        }
-
-        /* const NAME = VALUE  — bindgen emits these for enum values */
-        if (strncmp(s, "const ", 6) == 0) {
-            char const_name[256];
-            long  const_val = 0;
-            char *eq = strchr(s + 6, '=');
-            if (eq) {
-                int name_len = (int)(eq - (s + 6));
-                if (name_len > 0 && name_len < (int)sizeof(const_name)) {
-                    strncpy(const_name, s + 6, name_len);
-                    const_name[name_len] = '\0';
-                    char *trimmed_name = trim(const_name);
-                    char *val_str = trim(eq + 1);
-                    /* handle hex (0x…) and decimal */
-                    if (strncmp(val_str, "0x", 2) == 0 || strncmp(val_str, "0X", 2) == 0)
-                        const_val = strtol(val_str, NULL, 16);
-                    else
-                        const_val = strtol(val_str, NULL, 10);
-                    /* Register as a const static var so the typechecker and
-                       codegen know about it and can load it by name. */
-                    StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-                    memset(sv, 0, sizeof(*sv));
-                    sv->base.type = NODE_STATIC_VAR;
-                    sv->var_name  = strdup(trimmed_name);
-                    sv->var_type  = make_simple_type(strdup("int"), 0);
-                    sv->is_const  = 1;
-                    sv->array_size = 0;
-                    char val_buf[32];
-                    snprintf(val_buf, sizeof(val_buf), "%ld", const_val);
-                    LiteralNode *lit = make_literal(strdup(val_buf), LIT_INT);
-                    sv->initializer = (ASTNode *)lit;
-                    prog->declarations = realloc(
-                        prog->declarations,
-                        (prog->decl_count + 1) * sizeof(ASTNode *)
-                    );
-                    prog->declarations[prog->decl_count++] = (ASTNode *)sv;
-                }
-            }
-            continue;
-        }
-
-        /* closing brace — end of class/struct block */
-        if (strcmp(s, "}") == 0) {
-            if (current_class) {
-                prog->declarations = realloc(
-                    prog->declarations,
-                    (prog->decl_count + 1) * sizeof(ASTNode *)
-                );
-                prog->declarations[prog->decl_count++] = (ASTNode *)current_class;
-                current_class = NULL;
-                block_type = NO_BLOCK;
-            }
-            continue;
-        }
-
-        /* class Name {  or  class Name {}  (bindgen one-liner) */
-        if (strncmp(s, "class ", 6) == 0) {
-            char class_name[256];
-            if (sscanf(s + 6, "%255s", class_name) == 1) {
-                /* skip class names that start with "const" — these are
-                   artefacts from bindgen emitting "class const SDL_Rect {}"
-                   for const-pointer params; they are duplicates of the
-                   non-const version and are not valid Hylian identifiers. */
-                if (strncmp(class_name, "const", 5) == 0) continue;
-                /* strip trailing "{" or "{}" */
-                char *brace = strchr(class_name, '{');
-                if (brace) *brace = '\0';
-                char *trimmed_name = trim(class_name);
-                if (*trimmed_name == '\0') continue;
-                current_class = make_class(strdup(trimmed_name), 1);
-                block_type = CLASS_BLOCK;
-                /* one-liner: "class Name {}" — close immediately */
-                if (strstr(s + 6, "{}")) {
-                    prog->declarations = realloc(
-                        prog->declarations,
-                        (prog->decl_count + 1) * sizeof(ASTNode *)
-                    );
-                    prog->declarations[prog->decl_count++] = (ASTNode *)current_class;
-                    current_class = NULL;
-                    block_type = NO_BLOCK;
-                }
-            }
-            continue;
-        }
-
-        /* struct Name {  or  struct Name {}  (one-liner) */
-        if (strncmp(s, "struct ", 7) == 0) {
-            char struct_name[256];
-            if (sscanf(s + 7, "%255s", struct_name) == 1) {
-                char *brace = strchr(struct_name, '{');
-                if (brace) *brace = '\0';
-                char *trimmed_name = trim(struct_name);
-                if (*trimmed_name == '\0') continue;
-                current_class = make_class(strdup(trimmed_name), 0);
-                current_class->has_ctor = 0;
-                block_type = STRUCT_BLOCK;
-                /* one-liner empty struct */
-                if (strstr(s + 7, "{}")) {
-                    prog->declarations = realloc(
-                        prog->declarations,
-                        (prog->decl_count + 1) * sizeof(ASTNode *)
-                    );
-                    prog->declarations[prog->decl_count++] = (ASTNode *)current_class;
-                    current_class = NULL;
-                    block_type = NO_BLOCK;
-                }
-            }
-            continue;
-        }
-
-        /* union class Name {  or  union class Name {}  (one-liner) */
-        if (strncmp(s, "union class ", 12) == 0) {
-            char union_name[256];
-            if (sscanf(s + 12, "%255s", union_name) == 1) {
-                char *brace = strchr(union_name, '{');
-                if (brace) *brace = '\0';
-                char *trimmed_name = trim(union_name);
-                if (*trimmed_name == '\0') goto next_line_union;
-                current_class = make_class(strdup(trimmed_name), 0);
-                current_class->has_ctor = 0;
-                current_class->is_union = 1;
-                block_type = UNION_BLOCK;
-                /* one-liner empty union */
-                if (strstr(s + 12, "{}")) {
-                    prog->declarations = realloc(
-                        prog->declarations,
-                        (prog->decl_count + 1) * sizeof(ASTNode *)
-                    );
-                    prog->declarations[prog->decl_count++] = (ASTNode *)current_class;
-                    current_class = NULL;
-                    block_type = NO_BLOCK;
-                }
-            }
-            next_line_union:;
-            continue;
-        }
-
-        /* Inside a struct/union block: field lines are "fieldtype fieldname" */
-        if ((block_type == STRUCT_BLOCK || block_type == UNION_BLOCK) && current_class && strncmp(s, "fn ", 3) != 0) {
-            char fieldtype_str[256], fieldname_str[256];
-            if (sscanf(s, "%255s %255s", fieldtype_str, fieldname_str) == 2) {
-                /* Check for fixed-size array syntax: type[N] e.g. uint8[56] */
-                Type ft;
-                char *bracket = strchr(fieldtype_str, '[');
-                if (bracket) {
-                    int arr_size = 0;
-                    *bracket = '\0';
-                    sscanf(bracket + 1, "%d", &arr_size);
-                    Type elem = make_simple_type(strdup(fieldtype_str), 0);
-                    ft = make_array_type(elem, arr_size > 0 ? arr_size : 1);
-                } else {
-                    ft = make_simple_type(strdup(fieldtype_str), 0);
-                }
-                FieldNode *field_node = make_field(ft, fieldname_str, 1);
-                current_class->fields = realloc(
-                    current_class->fields,
-                    (current_class->field_count + 1) * sizeof(FieldNode *)
-                );
-                current_class->fields[current_class->field_count++] = field_node;
-            }
-            continue;
-        }
-
-        /* fn name(...) -> rettype  or  fn name(...) */
-        if (strncmp(s, "fn ", 3) == 0) {
-            char *rest = s + 3;
-
-            /* Extract function name (up to '(') */
-            char *paren = strchr(rest, '(');
-            if (!paren) continue;
-            int name_len = (int)(paren - rest);
-            char func_name[256];
-            if (name_len <= 0 || name_len >= (int)sizeof(func_name)) continue;
-            strncpy(func_name, rest, name_len);
-            func_name[name_len] = '\0';
-            char *fn_name = trim(func_name);
-
-            /* Extract return type after "->" if present */
-            Type ret_type;
-            char *arrow = strstr(paren, "->");
-            if (arrow) {
-                char ret_str[256];
-                strncpy(ret_str, arrow + 2, sizeof(ret_str) - 1);
-                ret_str[sizeof(ret_str) - 1] = '\0';
-                char *trimmed_ret = trim(ret_str);
-                ret_type = hyi_parse_type(trimmed_ret);
-            } else {
-                ret_type = make_simple_type(strdup("void"), 0);
-            }
-
-            if (current_class && block_type == STRUCT_BLOCK) {
-                /* fn inside a struct block → warn and ignore */
-                fprintf(stderr, "warning: 'fn' line ignored inside struct block '%s'\n",
-                        current_class->name);
-            } else if (current_class) {
-                MethodNode *m = make_method(ret_type, strdup(fn_name));
-                hyi_parse_params(paren, &m->params, &m->param_count);
-                m->body_count  = 0;
-                current_class->methods = realloc(
-                    current_class->methods,
-                    (current_class->method_count + 1) * sizeof(MethodNode *)
-                );
-                current_class->methods[current_class->method_count++] = m;
-            } else {
-                FuncNode *fn = make_func(ret_type, strdup(fn_name));
-                hyi_parse_params(paren, &fn->params, &fn->param_count);
-                fn->body_count  = 0;
-                prog->declarations = realloc(
-                    prog->declarations,
-                    (prog->decl_count + 1) * sizeof(ASTNode *)
-                );
-                prog->declarations[prog->decl_count++] = (ASTNode *)fn;
-            }
-            continue;
-        }
-    }
-
-    fclose(f);
-    return prog;
 }
 
 
@@ -522,87 +122,21 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
             orig_includes[i] = program->includes[i];
     }
 
-    /* Walk the snapshotted include list and resolve non-std paths */
+    /* Walk the snapshotted include list. Where each path lives is decided by
+       loader_resolve_include(), the same resolver the language server uses. */
     for (int i = 0; i < orig_include_count; i++) {
         const char *inc = orig_includes[i];
+        ResolvedInclude ri;
+        loader_resolve_include(inc, src_dir, file_dir, &ri);
 
-        /* std.* paths are resolved as .hyi interface files from runtime/std/
-           so the typecheck pass knows about their function signatures.
-           The codegen also handles them separately for linking. */
-        if (strncmp(inc, "std.", 4) == 0) {
-            const char *std_module = inc + 4;
-            int slen = strlen(std_module);
-            char *std_rel = malloc(slen + 1);
-            for (int j = 0; j < slen; j++)
-                std_rel[j] = (std_module[j] == '.') ? '/' : std_module[j];
-            std_rel[slen] = '\0';
+        if (ri.kind == INC_SKIP) { loader_free_resolved(&ri); continue; }
 
-            char *project_root = dir_of(src_dir);
-            int src_len = (int)strlen(src_dir);
-
-            /* Installed stdlib dir (set by linkle via HYLIAN_LIB, or the
-               default /usr/local/lib/hylian/std). This is where process.hy,
-               sys.hy, init.hy etc. live for an installed toolchain. */
-            const char *hylian_lib = getenv("HYLIAN_LIB");
-            char inst_std[1024] = "";
-            if (hylian_lib) {
-                snprintf(inst_std, sizeof(inst_std), "%s/std", hylian_lib);
-                /* If $HYLIAN_LIB/std doesn't exist, try $HYLIAN_LIB itself */
-                struct stat _ist;
-                if (stat(inst_std, &_ist) != 0 || !S_ISDIR(_ist.st_mode))
-                    snprintf(inst_std, sizeof(inst_std), "%s", hylian_lib);
-            } else {
-                strcpy(inst_std, "/usr/local/lib/hylian/std");
-            }
-            int inst_len = (int)strlen(inst_std);
-
-            /* Candidate paths for the .hyi interface file:
-               1. <project_root>/runtime/std/<rel>.hyi  (source-tree layout)
-               2. runtime/std/<rel>.hyi                 (relative)
-               3. <src_dir>/<rel>.hyi                   (installed layout:
-                                                        src_dir IS the std dir)
-               4. <src_dir>/<rel>.hyi via std/ subdir   (src_dir = runtime/ )
-               5. <inst_std>/<rel>.hyi                  (installed toolchain) */
-            char *hyi1 = malloc(strlen(project_root) + 14 + slen + 5);
-            sprintf(hyi1, "%s/runtime/std/%s.hyi", project_root, std_rel);
-            char *hyi2 = malloc(14 + slen + 5);
-            sprintf(hyi2, "runtime/std/%s.hyi", std_rel);
-            char *hyi3 = malloc(src_len + 2 + slen + 5);
-            sprintf(hyi3, "%s/%s.hyi", src_dir, std_rel);
-            char *hyi4 = malloc(src_len + 6 + slen + 5);
-            sprintf(hyi4, "%s/std/%s.hyi", src_dir, std_rel);
-            char *hyi5 = malloc(inst_len + 2 + slen + 5);
-            sprintf(hyi5, "%s/%s.hyi", inst_std, std_rel);
-
-            /* Same candidates for the .hy source file */
-            char *hy1 = malloc(strlen(project_root) + 14 + slen + 4);
-            sprintf(hy1, "%s/runtime/std/%s.hy", project_root, std_rel);
-            char *hy2 = malloc(14 + slen + 4);
-            sprintf(hy2, "runtime/std/%s.hy", std_rel);
-            char *hy3 = malloc(src_len + 2 + slen + 4);
-            sprintf(hy3, "%s/%s.hy", src_dir, std_rel);
-            char *hy4 = malloc(src_len + 6 + slen + 4);
-            sprintf(hy4, "%s/std/%s.hy", src_dir, std_rel);
-            char *hy5 = malloc(inst_len + 2 + slen + 4);
-            sprintf(hy5, "%s/%s.hy", inst_std, std_rel);
-
-            free(project_root);
-
-            char *hyi_path = NULL;
-            const char *hyi_cands[] = { hyi1, hyi2, hyi3, hyi4, hyi5, NULL };
-            for (int ci = 0; hyi_cands[ci]; ci++) {
-                FILE *probe = fopen(hyi_cands[ci], "r");
-                if (probe) { fclose(probe); hyi_path = strdup(hyi_cands[ci]); break; }
-            }
-            free(hyi1); free(hyi2); free(hyi3); free(hyi4); free(hyi5);
-
-            if (hyi_path && !already_visited(hyi_path)) {
-                mark_visited(hyi_path);
-                char *link_lib  = NULL;
-                char **pkg_names = NULL;
-                int    pkg_count = 0;
-                ProgramNode *dep = parse_hyi_into_program(hyi_path, &link_lib,
-                                                           &pkg_names, &pkg_count);
+        if (ri.kind == INC_STD) {
+            /* the interface file tells the typechecker each function's signature */
+            if (ri.hyi && !already_visited(ri.hyi)) {
+                mark_visited(ri.hyi);
+                char *link_lib = NULL; char **pkg_names = NULL; int pkg_count = 0;
+                ProgramNode *dep = parse_hyi_into_program(ri.hyi, &link_lib, &pkg_names, &pkg_count);
                 if (dep) {
                     dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
                     dep->includes[dep->include_count++] = strdup(inc);
@@ -612,189 +146,68 @@ static ProgramNode *compile_file(const char *filepath, const char *src_dir) {
                 for (int pi = 0; pi < pkg_count; pi++) free(pkg_names[pi]);
                 free(pkg_names);
             }
-            if (hyi_path) free(hyi_path);
-
-            /* If a .hy exists alongside the .hyi, compile it as pure-Hylian stdlib */
-            char *hy_path = NULL;
-            const char *hy_cands[] = { hy1, hy2, hy3, hy4, hy5, NULL };
-            for (int ci = 0; hy_cands[ci]; ci++) {
-                FILE *probe = fopen(hy_cands[ci], "r");
-                if (probe) { fclose(probe); hy_path = strdup(hy_cands[ci]); break; }
-            }
-            free(hy1); free(hy2); free(hy3); free(hy4); free(hy5);
-
-            if (hy_path && !already_visited(hy_path)) {
-                /* Pass the std ROOT (not hy_path's own directory) as src_dir,
-                   so sibling includes inside nested std modules (e.g.
-                   os/exec.hy's `include { platform.linux_x86_64, string }`)
-                   resolve relative to the std root instead of to os/. hy_path
-                   was built as "<root>/<std_rel>.hy", so strip that known
-                   suffix back off to recover <root>. */
-                size_t suffix_len = strlen(std_rel) + 4; /* "/" + std_rel + ".hy" */
-                size_t path_len = strlen(hy_path);
-                char *hy_root;
-                if (path_len > suffix_len) {
-                    hy_root = strndup(hy_path, path_len - suffix_len);
-                } else {
-                    hy_root = dir_of(hy_path); /* shouldn't happen, fallback */
-                }
-                ProgramNode *dep = compile_file(hy_path, hy_root);
-                free(hy_root);
+            /* a .hy next to it is pure-Hylian stdlib: compile it in */
+            if (ri.hy && !already_visited(ri.hy)) {
+                ProgramNode *dep = compile_file(ri.hy, ri.hy_root);
                 if (dep) merge_programs(program, dep);
             }
-            if (hy_path) free(hy_path);
-            free(std_rel);
-
+            loader_free_resolved(&ri);
             continue;
         }
 
-        /* link:* and pkg:* synthetic includes are codegen linker hints, not files */
-        if (strncmp(inc, "link:", 5) == 0) continue;
-        if (strncmp(inc, "pkg:",  4) == 0) continue;
-
-        /* `include { kernel }` - the bare-metal primitives it names (cli,
-           sti, hlt, outb, inb, lgdt, ..., the vga_ family, halt,
-           enable_interrupts, disable_interrupts - see
-           docs/language/kernel.md) are either compiler intrinsics resolved
-           purely by call name (lower.c) or ordinary calls resolved at LINK
-           time against whatever runtime object actually gets linked in
-           (runtime/platform/limine.o, kernel.o, ...) - there is no
-           kernel.hy for either of those to come from. Recognize the name so
-           it is a documented no-op instead of a "cannot open kernel.hy"
-           error. */
-        if (strcmp(inc, "kernel") == 0) continue;
-
-        /* vendors.* paths are resolved as .hyi interface files */
-        if (strncmp(inc, "vendors.", 8) == 0) {
-            const char *vendor_module = inc + 8; /* e.g. "vendors.vulkan" -> "vulkan" */
-            int vlen = strlen(vendor_module);
-            char *vendor_rel = malloc(vlen + 1);
-            for (int j = 0; j < vlen; j++)
-                vendor_rel[j] = (vendor_module[j] == '.') ? '/' : vendor_module[j];
-            vendor_rel[vlen] = '\0';
-
-            /* Get the last component (leaf name) for "vendors/foo/foo.hyi" layout */
-            const char *leaf = strrchr(vendor_rel, '/');
-            leaf = leaf ? leaf + 1 : vendor_rel;
-
-            /* The vendors/ directory lives at the project root, which is the
-               parent of src_dir (e.g. src_dir="myproj/src" -> root="myproj").
-               Try project-root-relative paths first, then src_dir-relative as
-               a fallback for projects where src == root. */
-            char *project_root = dir_of(src_dir);
-
-            /* Candidate paths (prefer project-root layout):
-               1. <project_root>/vendors/<vendor_rel>/<leaf>.hyi
-               2. <project_root>/vendors/<vendor_rel>.hyi
-               3. <src_dir>/vendors/<vendor_rel>/<leaf>.hyi
-               4. <src_dir>/vendors/<vendor_rel>.hyi */
-            int pr_len  = strlen(project_root);
-            int src_len = strlen(src_dir);
-
-            char *hyi_path1 = malloc(pr_len  + 10 + vlen + 1 + strlen(leaf) + 5);
-            sprintf(hyi_path1, "%s/vendors/%s/%s.hyi", project_root, vendor_rel, leaf);
-
-            char *hyi_path2 = malloc(pr_len  + 10 + vlen + 5);
-            sprintf(hyi_path2, "%s/vendors/%s.hyi", project_root, vendor_rel);
-
-            char *hyi_path3 = malloc(src_len + 10 + vlen + 1 + strlen(leaf) + 5);
-            sprintf(hyi_path3, "%s/vendors/%s/%s.hyi", src_dir, vendor_rel, leaf);
-
-            char *hyi_path4 = malloc(src_len + 10 + vlen + 5);
-            sprintf(hyi_path4, "%s/vendors/%s.hyi", src_dir, vendor_rel);
-
-            free(vendor_rel);
-            free(project_root);
-
-            /* Pick first candidate that exists */
-            char *hyi_path = NULL;
-            const char *candidates[] = { hyi_path1, hyi_path2, hyi_path3, hyi_path4, NULL };
-            for (int ci = 0; candidates[ci]; ci++) {
-                FILE *probe = fopen(candidates[ci], "r");
-                if (probe) {
-                    fclose(probe);
-                    hyi_path = strdup(candidates[ci]);
-                    break;
-                }
-            }
-            free(hyi_path1); free(hyi_path2); free(hyi_path3); free(hyi_path4);
-
-            if (already_visited(hyi_path)) { free(hyi_path); continue; }
-            mark_visited(hyi_path);
-
-            char *link_lib  = NULL;
-            char **pkg_names = NULL;
-            int    pkg_count = 0;
-            ProgramNode *dep = parse_hyi_into_program(hyi_path, &link_lib,
-                                                       &pkg_names, &pkg_count);
-
-            if (!dep) {
-                fprintf(stderr, "hylian: cannot open vendor interface '%s'\n", hyi_path);
-                free(hyi_path);
+        if (ri.kind == INC_VENDOR) {
+            if (!ri.hyi) {
+                fprintf(stderr, "hylian: cannot open vendor interface for '%s' "
+                                "(looked for vendors/<name>/<name>.hyi under the project root)\n", inc);
+                loader_free_resolved(&ri);
                 continue;
             }
-            free(hyi_path);
+            if (already_visited(ri.hyi)) { loader_free_resolved(&ri); continue; }
+            mark_visited(ri.hyi);
 
-            /* Surface the link directive as a synthetic include "link:<libname>"
-               so codegen can detect and emit the appropriate linker flag. */
+            char *link_lib = NULL; char **pkg_names = NULL; int pkg_count = 0;
+            ProgramNode *dep = parse_hyi_into_program(ri.hyi, &link_lib, &pkg_names, &pkg_count);
+            if (!dep) {
+                fprintf(stderr, "hylian: cannot open vendor interface '%s'\n", ri.hyi);
+                loader_free_resolved(&ri);
+                continue;
+            }
+
+            /* Surface the link directive as a synthetic include "link:<lib>"
+               so codegen can emit the linker flag. */
             if (link_lib) {
-                int link_inc_len = 5 + strlen(link_lib) + 1; /* "link:" + lib + NUL */
-                char *link_inc = malloc(link_inc_len);
-                snprintf(link_inc, link_inc_len, "link:%s", link_lib);
+                size_t n = 5 + strlen(link_lib) + 1;
+                char *link_inc = malloc(n);
+                snprintf(link_inc, n, "link:%s", link_lib);
                 free(link_lib);
-
-                /* Add to dep so it bubbles up through merge_programs */
                 dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
                 dep->includes[dep->include_count++] = link_inc;
             }
-
-            /* Surface each pkg directive as a synthetic include "pkg:<name>"
-               so codegen can emit it in the link hint comment. */
+            /* ...and each pkg directive as "pkg:<name>" */
             for (int pi = 0; pi < pkg_count; pi++) {
-                int pkg_inc_len = 4 + strlen(pkg_names[pi]) + 1; /* "pkg:" + name + NUL */
-                char *pkg_inc = malloc(pkg_inc_len);
-                snprintf(pkg_inc, pkg_inc_len, "pkg:%s", pkg_names[pi]);
+                size_t n = 4 + strlen(pkg_names[pi]) + 1;
+                char *pkg_inc = malloc(n);
+                snprintf(pkg_inc, n, "pkg:%s", pkg_names[pi]);
                 free(pkg_names[pi]);
                 dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
                 dep->includes[dep->include_count++] = pkg_inc;
             }
             free(pkg_names);
 
-            /* Also carry the original vendors.* include string forward so
-               codegen can see it in the final program's include list. */
+            /* carry the original vendors.* include forward for codegen */
             dep->includes = realloc(dep->includes, (dep->include_count + 1) * sizeof(char *));
             dep->includes[dep->include_count++] = strdup(inc);
 
             merge_programs(program, dep);
+            loader_free_resolved(&ri);
             continue;
         }
 
-        /* Resolve to a file path — try src_dir first (absolute module paths
-           like "boot.tss" or "mm.pmm"), then fall back to the file's own
-           directory (for legacy flat layouts). resolve_dotted_include also
-           handles a trailing module-name component that isn't part of the
-           filesystem path, e.g. "modules.cat.Cat" -> modules/cat.hy. */
-        char *dep_path = resolve_dotted_include(src_dir, inc);
-        if (!dep_path)
-            dep_path = resolve_dotted_include(file_dir, inc);
-        if (!dep_path)
-            /* Nothing matched even after stripping trailing components —
-               fall back to the original (longest, most literal) candidate
-               so the "cannot open" error below names a sensible path. */
-            dep_path = module_to_filepath(src_dir, inc);
-
-        /* Recursively compile the dependency, always passing src_dir so
-           transitive includes are resolved from the same root. */
-        ProgramNode *dep = compile_file(dep_path, src_dir);
-        free(dep_path);
-
+        /* a project module: compile it recursively, always passing src_dir so
+           transitive includes resolve from the same root */
+        ProgramNode *dep = compile_file(ri.hy, src_dir);
+        loader_free_resolved(&ri);
         if (!dep) continue; /* error already printed */
-
-        /* Merge dep into `program` in-place. Previously this built a new
-           `merged` ProgramNode and reassigned `program = merged`, but that
-           silently re-pointed the loop iterator at a different include list
-           (with dep's transitive includes prepended), causing duplicate
-           processing and lost decls on files with 2+ includes. */
         merge_programs(program, dep);
     }
 
@@ -863,8 +276,16 @@ int main(int argc, char **argv) {
 
     ProgramNode *program = compile_file(input_file, src_dir);
     if (!program) return 1;
+    /* The parser recovers from syntax errors so it can report several at
+       once - but a program with errors must not produce an object file. */
+    if (diag_error_count() > 0) return 1;
 
     typecheck(program, input_file);
+    if (diag_error_count() > 0) {
+        fprintf(stderr, "hylian: %d error%s, no output written\n",
+                diag_error_count(), diag_error_count() == 1 ? "" : "s");
+        return 1;
+    }
 
     IRModule *mod = lower_program(program);
     if (dump_ir) {

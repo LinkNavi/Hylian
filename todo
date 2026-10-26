@@ -10,5 +10,68 @@ Completely rewrite lsp_analysis.c to match current stdlib setup, class setup, an
 
 Optimize the language{
 move the compiler's opt.c to hygen so that optiization is backend sided (like llvm)
-Optimize language
+Optimize language {
+        Skip arena_init/arena_free in functions that never use new, or allocate the arena lazily. This takes fib from ~30s to the milliseconds range.
+Lower a[i] and a[i]=v directly to MIR (bounds check plus a load or store) instead of calling into array.hy. matmul and sieve should improve a lot.
+Add mem2reg.
+Fix the codegen: fuse compare and branch, use immediate operands, and move args straight into registers.
+Add cross-module inlining.
+    }
+
+    codegen improvements
 }
+
+
+first bench check (bench/run.py)
+
+fib done
+loop done
+sieve done
+mandel done
+collatz done
+matmul done
+
+Median wall time (s), 5 runs
+
+bench        hylian         c       c++      rust        go    python
+fib          40.716     0.005     0.005     0.008     0.012     0.238
+loop          0.203     0.203     0.203     0.211     0.204     4.313
+sieve         0.596     0.184     0.185     0.188     0.191     1.148
+mandel        0.108     0.027     0.028     0.028     0.029     1.466
+collatz       0.547     0.118     0.119     0.102     0.176     7.791
+matmul        0.357     0.011     0.011     0.009     0.014     1.426
+
+Slowdown vs C (x)
+
+bench        hylian         c       c++      rust        go    python
+fib          8700.6       1.0       1.1       1.7       2.5      50.9
+loop            1.0       1.0       1.0       1.0       1.0      21.3
+sieve           3.2       1.0       1.0       1.0       1.0       6.2
+mandel          4.0       1.0       1.0       1.0       1.1      53.7
+collatz         4.7       1.0       1.0       0.9       1.5      66.2
+matmul         33.9       1.0       1.1       0.8       1.3     135.2
+
+Output check (checksum per language)
+
+fib OK 2178309
+loop OK 629047
+sieve OK 664579
+mandel OK 10922908
+collatz OK 837799
+matmul OK 256640625
+
+
+---- optimization status (Sept 2026) ----
+DONE  optimizer moved to hygen (hygen/libhyopt, MIR level; compiler/opt.c per-instruction passes now off)
+DONE  skip arena_init/free in functions that never `new`; arena blocks lazily mapped + pooled (fib 40s -> 0.011s)
+DONE  a[i] / a[i]=v lowered inline (bounds check + load/store), header reads hoisted, bounds checks
+      removed in `for (i < a.len)` loops and for repeated identical checks
+DONE  SROA of struct locals, self-inlining of small recursive functions
+DONE  mem2reg, copy/const propagation, CSE (local + global), DCE, loop rotation, LICM, inlining (within a module)
+DONE  codegen: fused compare+branch/select/test, immediate + memory operands, lea/SIB addressing,
+      args/params through parallel moves, frameless functions, 12 int regs, float constants in rodata
+DONE  division/modulo by constants via multiply-high; if-conversion to cmov
+TODO  cross-module inlining of runtime.hy/array.hy/mem.hy (they are separate objects),
+      locals, induction-variable strength reduction, live-range splitting / shrink-wrapping
+bench (bench/run.py): fib 1.9x C, loop 1.0x, sieve 1.0x, mandel 1.1x, collatz 1.4x, matmul 1.7x
+tests: tests/opt_test.sh, tests/opt_fuzz.py (differential fuzzer), see hygen/docs/mir.md

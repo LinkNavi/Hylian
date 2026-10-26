@@ -59,7 +59,12 @@ typedef enum {
     X64_R12 = 12, X64_R13 = 13, X64_R14 = 14, X64_R15 = 15,
 } X64Reg;
 
-#define X64_NUM_ALLOCATABLE_INT_REGS 10
+#define X64_NUM_ALLOCATABLE_INT_REGS 12
+/* pool ids 0-9 are always allocatable; 10 (rdx) and 11 (rcx) are handed out only to
+   functions without inline asm / privileged instructions, which use them freely */
+#define X64_NUM_SAFE_INT_REGS 10
+#define X64_POOL_RDX 10
+#define X64_POOL_RCX 11
 /* The first this-many pool entries are SysV callee-saved (rbx, r12-r15) and
    therefore survive a call; the rest do not. regalloc relies on this split to
    decide what may stay in a register across a call, and x64_lower_func saves
@@ -91,11 +96,25 @@ extern const X64Reg x64_sysv_arg_regs[6];
 extern const X64Reg x64_syscall_arg_regs[6];
 #define X64_SYSCALL_ARG_REG_COUNT 6
 
+/* ---- module-wide pool of float constants (read-only data) ----
+   When a pool is installed, float immediates become `movsd xmm, [rip+label]`
+   (or a direct memory operand) instead of movabs+movq. The caller adds each
+   entry to the object as a rodata symbol once the module is lowered. */
+typedef struct { uint64_t bits; int size; char *label; } X64Const;
+typedef struct { X64Const *v; int n, cap; } X64ConstPool;
+void x64_set_const_pool(X64ConstPool *pool);   /* NULL = inline immediates */
+void x64_const_pool_free(X64ConstPool *pool);
+
 /* ---- top-level: lower one MIR function (post-regalloc) straight to bytes.
    Frame size (locals + int spills + float spills, 16-byte aligned) is
    computed internally from fn->local_count and ra's spill counts - the
    caller no longer supplies it, removing a footgun where a wrong external
    frame_size could silently corrupt local variables or spilled values. */
+/* registers (pool ids) an instruction overwrites beyond its operands: rdx for
+   divide / multiply-high, rcx for a variable shift. Pass as RegAllocTarget.clobber_mask. */
+unsigned x64_regalloc_clobbers(const MIRInstr *ins);
+int x64_func_needs_fixed_regs(const MIRFunc *fn);   /* asm / privileged ops: keep rdx and rcx reserved */
+
 void x64_lower_func(const MIRFunc *fn, const RegAllocResult *ra,
                     X64Buf *out_code, X64RelocList *out_relocs);
 

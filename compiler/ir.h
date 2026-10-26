@@ -202,6 +202,12 @@ typedef struct {
     /* Variable-arity argument list (CALL, NEW, ARRAY_INIT) */
     IROperand *args;
     int        arg_count;
+    /* IR_CALL to C with struct-by-value: arg_aggr[i] != 0 means args[i] is the
+       ADDRESS of a struct passed by value (descriptor from
+       ast_sysv_aggregate); ret_aggr != 0 means the call returns a struct,
+       written to the local named str_extra2 (dest = that local's address). */
+    int       *arg_aggr;
+    int        ret_aggr;
 
     /* Function parameters (IR_FUNC_BEGIN only) */
     IRParam   *params;

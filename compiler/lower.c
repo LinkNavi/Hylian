@@ -3,6 +3,7 @@
 #include "ast.h"
 #include "typecheck.h"
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -65,6 +66,14 @@ typedef struct {
     /* Arena / unsafe tracking */
     int         in_unsafe;          /* 1 when inside an unsafe { } block    */
     int         has_arena;          /* 1 when current function owns an arena */
+    const char *pending_sret;       /* struct type the NEXT lower_func_body returns by value */
+    const char *fn_sret;            /* ...and the one being lowered now (hidden __sret param) */
+    const Type *pending_ret;        /* declared return type of the NEXT lower_func_body */
+    const Type *fn_ret;             /* ...and of the one being lowered now */
+    int         arena_used;         /* 1 once the function emits an arena allocation */
+    int        *arena_glue;         /* indices of the arena_init/arena_free instrs */
+    int         arena_glue_count;
+    int         arena_glue_cap;
     /* Names ALLOCA'd in the function currently being lowered (params and
        locals). A bare identifier inside a method resolves to a field of the
        enclosing class only if no local of that name shadows it. */
@@ -277,6 +286,7 @@ static int lower_field_byte_width(LowerState *s, FieldNode *f) {
  * out_type_name is set to the type of the object at the point where the
  * chain bottoms out (i.e. the type whose field we'll finally read).
  */
+static int lower_is_struct_param(LowerState *s, const char *name);
 static int lower_stack_struct_addrof(ASTNode *node, LowerState *s,
                                      int *out_byte_offset,
                                      const char **out_type_name) {
@@ -299,10 +309,11 @@ static int lower_stack_struct_addrof(ASTNode *node, LowerState *s,
             }
         }
         if (!is_stack) return -1;
-        /* Emit IR_ADDROF for the named variable */
+        /* Emit IR_ADDROF for the named variable - or, for a by-value struct
+           PARAMETER, which holds a pointer to the caller's copy, load that pointer */
         const char *vname = ((IdentifierNode *)node)->name;
         int t = alloc_temp(s);
-        IRInstr *av   = ir_emit(s->mod, IR_ADDROF);
+        IRInstr *av   = ir_emit(s->mod, lower_is_struct_param(s, vname) ? IR_LOAD_VAR : IR_ADDROF);
         av->dest      = irop_temp(t);
         av->str_extra = strdup(vname);
         *out_byte_offset = 0;
@@ -622,6 +633,77 @@ static int lower_call_arg(ASTNode *arg, LowerState *s) {
     return tdst;
 }
 
+/* If the instruction just emitted is a C call returning a struct by value
+   (its value is the ADDRESS of a hidden buffer), copy that buffer into the
+   struct variable `var` and return 1. */
+static int lower_copy_struct_return(LowerState *s, const char *var, int taddr) {
+    if (s->mod->instr_count == 0) return 0;
+    IRInstr *last = &s->mod->instrs[s->mod->instr_count - 1];
+    if (last->op != IR_CALL || !last->ret_aggr || last->dest.temp_id != taddr) return 0;
+    int size = last->ret_aggr >> 2;
+    int tdst = alloc_temp(s);
+    IRInstr *af = ir_emit(s->mod, IR_ADDROF);
+    af->dest = irop_temp(tdst);
+    af->str_extra = strdup(var);
+    int tcount = alloc_temp(s);
+    IRInstr *cn = ir_emit(s->mod, IR_CONST_INT);
+    cn->dest = irop_temp(tcount);
+    cn->src1 = irop_const_int(size);
+    IRInstr *cp   = ir_emit(s->mod, IR_MEMCPY);
+    cp->dest      = irop_temp(alloc_temp(s));
+    cp->src1      = irop_temp(tdst);
+    cp->src2      = irop_temp(taddr);
+    cp->extra_src = irop_temp(tcount);
+    return 1;
+}
+
+/* "float" / "float32" when `t` is a float type (array elements are stored as raw
+   words, so reading one back has to reinterpret the bits), else NULL. */
+static const char *lower_float_type_name(const Type *t) {
+    if (!t || t->kind != TYPE_SIMPLE || !t->name) return NULL;
+    if (!strcmp(t->name, "float") || !strcmp(t->name, "double") || !strcmp(t->name, "float64")) return "float";
+    if (!strcmp(t->name, "float32")) return "float32";
+    return NULL;
+}
+static const char *lower_array_elem_float(const Type *arr) {
+    if (!arr || arr->kind != TYPE_ARRAY || arr->elem_type_count < 1) return NULL;
+    return lower_float_type_name(&arr->elem_types[0]);
+}
+
+/* Address of the struct that expression `e` evaluates to. A call returning a
+   struct, and `new`, already produce an address; a variable / field chain is
+   resolved with lower_object_base_ptr. */
+static int lower_struct_value_addr(ASTNode *e, LowerState *s) {
+    if (e->type == NODE_FUNC_CALL || e->type == NODE_NEW || e->type == NODE_METHOD_CALL)
+        return lower_expr(e, s);
+    return lower_object_base_ptr(e, s);
+}
+
+/* memcpy `size` bytes from the address in temp `tsrc` to the address in temp `tdst` */
+static void lower_emit_memcpy(LowerState *s, int tdst, int tsrc, int size) {
+    int tcount = alloc_temp(s);
+    IRInstr *cn = ir_emit(s->mod, IR_CONST_INT);
+    cn->dest = irop_temp(tcount);
+    cn->src1 = irop_const_int(size);
+    IRInstr *cp   = ir_emit(s->mod, IR_MEMCPY);
+    cp->dest      = irop_temp(alloc_temp(s));
+    cp->src1      = irop_temp(tdst);
+    cp->src2      = irop_temp(tsrc);
+    cp->extra_src = irop_temp(tcount);
+}
+
+/* `T var = expr;` / `var = expr;` for a by-value struct: copy ALL of it. (It used
+   to move a single 8-byte word - the first field - and drop the rest.) */
+static void lower_struct_assign_var(LowerState *s, const char *var, ASTNode *e) {
+    int size = ast_class_byte_size(s->mod->classes, s->mod->class_count, e->resolved_type.name);
+    int tsrc = lower_struct_value_addr(e, s);
+    int tdst = alloc_temp(s);
+    IRInstr *af = ir_emit(s->mod, IR_ADDROF);
+    af->dest = irop_temp(tdst);
+    af->str_extra = strdup(var);
+    lower_emit_memcpy(s, tdst, tsrc, size);
+}
+
 static int lower_c_call_arg(ASTNode *arg, LowerState *s) {
     if (!arg || !lower_is_value_struct(s, &arg->resolved_type))
         return lower_expr(arg, s);
@@ -707,7 +789,18 @@ static void emit_defers(LowerState *s) {
 /* arena_free(&__arena__) for the current function. Emitted before EVERY
    return, not just the last one: an early `return` inside an `if` used to skip
    it, leaking the function's arena block on each such call. */
+static void arena_glue_note(LowerState *s, int first_idx) {
+    for (int i = first_idx; i < s->mod->instr_count; i++) {
+        if (s->arena_glue_count == s->arena_glue_cap) {
+            s->arena_glue_cap = s->arena_glue_cap ? s->arena_glue_cap * 2 : 16;
+            s->arena_glue = realloc(s->arena_glue, s->arena_glue_cap * sizeof(int));
+        }
+        s->arena_glue[s->arena_glue_count++] = i;
+    }
+}
+
 static void emit_arena_free(LowerState *s) {
+    int glue_start = s->mod->instr_count;
     int t_aptr = alloc_temp(s);
     IRInstr *addrof = ir_emit(s->mod, IR_ADDROF);
     addrof->dest      = irop_temp(t_aptr);
@@ -718,6 +811,7 @@ static void emit_arena_free(LowerState *s) {
     free_call->args      = malloc(sizeof(IROperand));
     free_call->args[0]   = irop_temp(t_aptr);
     free_call->arg_count = 1;
+    arena_glue_note(s, glue_start);
 }
 
 /* The program being lowered, so a call site can look its callee up and fill
@@ -752,6 +846,95 @@ static IROpcode compound_assign_opcode(const char *op) {
     return IR_ADD;
 }
 
+/* Compound assignment through a field / element / pointer (`a[i] += e`,
+   `p.x -= e`, `*p |= e`) is parsed as a plain store of `target op e` where
+   the target's sub-expressions are the SAME AST nodes in the store and in the
+   read. Lowering both would evaluate them twice, so `a[i++] += 1` bumped i
+   twice and `a[next()] += 1` called next() twice. This evaluates each impure
+   sub-expression once into a temp and points both uses at it (restoring the
+   AST afterwards, in case it is lowered again).
+   Returns 1 and stores the statement's result temp when it handled `node`. */
+static int lower_expr_is_pure(ASTNode *n) {
+    if (!n) return 1;
+    switch (n->type) {
+    case NODE_LITERAL: case NODE_IDENTIFIER: case NODE_TEMP_REF: return 1;
+    case NODE_MEMBER_ACCESS: return lower_expr_is_pure(((MemberAccessNode *)n)->object);
+    case NODE_INDEX: return lower_expr_is_pure(((IndexNode *)n)->object) &&
+                            lower_expr_is_pure(((IndexNode *)n)->index);
+    case NODE_BINARY_OP: return lower_expr_is_pure(((BinaryOpNode *)n)->left) &&
+                                lower_expr_is_pure(((BinaryOpNode *)n)->right);
+    case NODE_UNARY_OP: {
+        UnaryOpNode *u = (UnaryOpNode *)n;
+        return strcmp(u->op, "++") && strcmp(u->op, "--") && lower_expr_is_pure(u->operand);
+    }
+    default: return 0;
+    }
+}
+
+static ASTNode *make_temp_ref(ASTNode *like, int temp) {
+    TempRefNode *r = calloc(1, sizeof(TempRefNode));
+    r->base.type = NODE_TEMP_REF;
+    r->base.line = like->line;
+    r->base.resolved_type = like->resolved_type;
+    r->temp = temp;
+    return (ASTNode *)r;
+}
+
+static int lower_hoist_compound(ASTNode *node, LowerState *s, int *result, int as_stmt) {
+    ASTNode **slots[2][2] = {{0}}; /* {use in the store, use in the read} */
+    int nslots = 0;
+    if (node->type == NODE_INDEX_ASSIGN) {
+        IndexAssignNode *ia = (IndexAssignNode *)node;
+        if (!ia->value || ia->value->type != NODE_BINARY_OP) return 0;
+        BinaryOpNode *bo = (BinaryOpNode *)ia->value;
+        if (!bo->left || bo->left->type != NODE_INDEX) return 0;
+        IndexNode *rd = (IndexNode *)bo->left;
+        if (rd->object != ia->object || rd->index != ia->index) return 0;
+        if (!lower_expr_is_pure(ia->index)) { slots[nslots][0] = &ia->index; slots[nslots++][1] = &rd->index; }
+        if (ia->object->type == NODE_FUNC_CALL || ia->object->type == NODE_METHOD_CALL) {
+            slots[nslots][0] = &ia->object; slots[nslots++][1] = &rd->object;
+        }
+    } else if (node->type == NODE_MEMBER_ASSIGN) {
+        MemberAssignNode *ma = (MemberAssignNode *)node;
+        if (!ma->object || !ma->value || ma->value->type != NODE_BINARY_OP) return 0;
+        BinaryOpNode *bo = (BinaryOpNode *)ma->value;
+        if (!bo->left || bo->left->type != NODE_MEMBER_ACCESS) return 0;
+        MemberAccessNode *rd = (MemberAccessNode *)bo->left;
+        if (rd->object != ma->object) return 0;
+        if (ma->object->type == NODE_FUNC_CALL || ma->object->type == NODE_METHOD_CALL) {
+            slots[nslots][0] = &ma->object; slots[nslots++][1] = &rd->object;
+        }
+    } else if (node->type == NODE_BINARY_OP && !strcmp(((BinaryOpNode *)node)->op, "deref_store")) {
+        BinaryOpNode *st = (BinaryOpNode *)node;
+        if (!st->right || st->right->type != NODE_BINARY_OP) return 0;
+        BinaryOpNode *bo = (BinaryOpNode *)st->right;
+        if (!bo->left || bo->left->type != NODE_UNARY_OP) return 0;
+        UnaryOpNode *rd = (UnaryOpNode *)bo->left;
+        if (strcmp(rd->op, "deref") || rd->operand != st->left) return 0;
+        if (!lower_expr_is_pure(st->left)) { slots[nslots][0] = &st->left; slots[nslots++][1] = &rd->operand; }
+    } else {
+        return 0;
+    }
+    if (nslots == 0) return 0;
+
+    ASTNode *orig[2];
+    for (int i = 0; i < nslots; i++) {
+        orig[i] = *slots[i][0];
+        int t = lower_expr(orig[i], s);
+        ASTNode *ref = make_temp_ref(orig[i], t);
+        *slots[i][0] = ref;
+        *slots[i][1] = ref;
+    }
+    if (as_stmt) lower_stmt(node, s);
+    else         *result = lower_expr(node, s);
+    for (int i = 0; i < nslots; i++) {
+        free(*slots[i][0]);
+        *slots[i][0] = orig[i];
+        *slots[i][1] = orig[i];
+    }
+    return 1;
+}
+
 static int lower_expr(ASTNode *node, LowerState *s) {
     if (!node) {
         int t = alloc_temp(s);
@@ -760,7 +943,15 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         return t;
     }
 
+    {
+        int hoisted;
+        if (lower_hoist_compound(node, s, &hoisted, 0)) return hoisted;
+    }
+
     switch (node->type) {
+
+    case NODE_TEMP_REF:
+        return ((TempRefNode *)node)->temp;
 
     case NODE_LITERAL: {
         LiteralNode *lit = (LiteralNode *)node;
@@ -1001,8 +1192,10 @@ static int lower_expr(ASTNode *node, LowerState *s) {
            pointer compare — two distinct heap allocations holding the same
            bytes (e.g. a runtime `args[1]` next to a `"cat"` literal) are
            never the same pointer, so `args[1] == "cat"` was always false no
-           matter what args[1] actually held. Route through stdlib/string.hy's
-           `equals(str,str)` (byte-for-byte compare), mirroring the `+`
+           matter what args[1] actually held. Route through the runtime's
+           `hylian_str_eq` (byte-for-byte compare, always linked - it used to
+           call std.string's `equals`, an undefined symbol unless the program
+           happened to include it), mirroring the `+`
            concat special case above. `!=` reuses the same call and negates
            the result with IR_NOT. */
         if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
@@ -1019,7 +1212,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                 arg_ops[1] = irop_temp(tr2);
                 IRInstr *ins = ir_emit(s->mod, IR_CALL);
                 ins->dest      = irop_temp(t2);
-                ins->str_extra = strdup("equals");
+                ins->str_extra = strdup("hylian_str_eq");
                 ins->args      = arg_ops;
                 ins->arg_count = 2;
                 if (strcmp(op, "==") == 0) return t2;
@@ -1560,6 +1753,25 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             return acc;
         }
 
+        /* ── Indirect call: fp(args) through a variable ───────────────── */
+        if (call->is_indirect) {
+            int t = alloc_temp(s);
+            IdentifierNode fp_id = {0};
+            fp_id.base.type = NODE_IDENTIFIER;
+            fp_id.name = call->name;
+            int tf = lower_expr((ASTNode *)&fp_id, s);
+            IROperand *arg_ops = call->arg_count > 0 ? malloc(call->arg_count * sizeof(IROperand)) : NULL;
+            for (int i = 0; i < call->arg_count; i++)
+                arg_ops[i] = irop_temp(lower_call_arg(call->args[i], s));
+            IRInstr *ins = ir_emit(s->mod, IR_CALL);
+            ins->dest      = irop_temp(t);
+            ins->src1      = irop_temp(tf);
+            ins->str_extra = NULL;
+            ins->args      = arg_ops;
+            ins->arg_count = call->arg_count;
+            return t;
+        }
+
         /* ── General function call ─────────────────────────────────────── */
         {
             int t = alloc_temp(s);
@@ -1600,9 +1812,27 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                 nargs = filled;
             }
             IROperand *arg_ops = NULL;
+            int *arg_aggr = NULL;
             if (nargs > 0) {
                 arg_ops = malloc(nargs * sizeof(IROperand));
                 for (int i = 0; i < nargs; i++) {
+                    /* A struct passed BY VALUE to C follows the SysV
+                       classification (registers per eightbyte, or the stack
+                       for big ones), so hand over its address plus a
+                       descriptor and let the backend do the loading. */
+                    if (use_c_abi_args && lower_is_value_struct(s, &call_args[i]->resolved_type)) {
+                        int desc = ast_sysv_aggregate(s->mod->classes, s->mod->class_count,
+                                                      call_args[i]->resolved_type.name);
+                        if (desc) {
+                            if (!arg_aggr) arg_aggr = calloc(nargs, sizeof(int));
+                            arg_aggr[i] = desc;
+                            arg_ops[i] = irop_temp(lower_object_base_ptr(call_args[i], s));
+                            continue;
+                        }
+                        fprintf(stderr, "[lower] struct '%s' can't be passed by value to C "
+                                        "(nested struct, array, union or padded layout)\n",
+                                call_args[i]->resolved_type.name);
+                    }
                     int ta = use_c_abi_args
                            ? lower_c_call_arg(call_args[i], s)
                            : lower_call_arg(call_args[i], s);
@@ -1638,12 +1868,52 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     arg_ops[i] = irop_temp(ta);
                 }
             }
+            /* A Hylian function returning a struct by value gets a hidden first
+               argument: the address of a buffer here in the caller's frame, which
+               is also the call's value. */
+            int sret_t = -1;
+            if (!use_c_abi_args && callee && callee->body_count > 0 &&
+                lower_is_value_struct(s, &callee->return_type)) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "__sret_%d", alloc_label(s));
+                emit_alloca(s, nm, callee->return_type.name, TYPE_SIMPLE);
+                sret_t = alloc_temp(s);
+                IRInstr *af = ir_emit(s->mod, IR_ADDROF);
+                af->dest = irop_temp(sret_t);
+                af->str_extra = strdup(nm);
+                IROperand *na = malloc((nargs + 1) * sizeof(IROperand));
+                na[0] = irop_temp(sret_t);
+                for (int i = 0; i < nargs; i++) na[i + 1] = arg_ops ? arg_ops[i] : na[0];
+                free(arg_ops);
+                arg_ops = na;
+                nargs++;
+                t = sret_t;      /* the call's value is the buffer's address */
+            }
+            /* A C function returning a struct by value: the backend writes it
+               into a hidden local and the call's value is that local's
+               ADDRESS - the same representation every other struct
+               expression has. The local must exist before the call. */
+            int ret_desc = 0;
+            char *ret_buf = NULL;
+            if (use_c_abi_args && lower_is_value_struct(s, &call->base.resolved_type)) {
+                ret_desc = ast_sysv_aggregate(s->mod->classes, s->mod->class_count,
+                                              call->base.resolved_type.name);
+                if (ret_desc) {
+                    char buf_name[64];
+                    snprintf(buf_name, sizeof(buf_name), "__ret_%d", alloc_label(s));
+                    ret_buf = strdup(buf_name);
+                    emit_alloca(s, ret_buf, call->base.resolved_type.name, TYPE_SIMPLE);
+                }
+            }
             IRInstr *ins = ir_emit(s->mod, IR_CALL);
             ins->dest      = irop_temp(t);
             ins->str_extra = strdup(resolved_name);
             ins->args      = arg_ops;
             ins->arg_count = nargs;
+            ins->arg_aggr  = arg_aggr;
             ins->extra_int = tc_func_return_flags(resolved_name);
+            ins->ret_aggr  = ret_desc;
+            ins->str_extra2 = ret_buf;
             return t;
         }
     }
@@ -1672,6 +1942,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             IRInstr *ins = ir_emit(s->mod, IR_ARRAY_POP);
             ins->dest = irop_temp(t);
             ins->src1 = irop_temp(tobj);
+            { const char *fl = lower_array_elem_float(&mc->object->resolved_type); if (fl) ins->str_extra2 = strdup(fl); }
             return t;
         }
         /* array.len()/array.cap() as a method call — typecheck.c already
@@ -1875,6 +2146,7 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->arg_count = nargs;
         } else {
             /* Normal path — allocate from the function's implicit arena */
+            s->arena_used = 1;
             int t_aptr = alloc_temp(s);
             IRInstr *addrof = ir_emit(s->mod, IR_ADDROF);
             addrof->dest      = irop_temp(t_aptr);
@@ -1968,6 +2240,11 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         ins->dest = irop_temp(t);
         ins->src1 = irop_temp(tobj);
         ins->src2 = irop_temp(tidx);
+        if (!is_flat) {
+            const char *fl = lower_array_elem_float(&ix->object->resolved_type);
+            if (!fl) fl = lower_float_type_name(&node->resolved_type);
+            if (fl) ins->str_extra2 = strdup(fl);
+        }
         if (is_flat) {
             ins->extra_int = 1;
             ins->str_extra = flat_elem_type ? strdup(flat_elem_type) : NULL;
@@ -2028,6 +2305,10 @@ static void lower_stmts(ASTNode **stmts, int count, LowerState *s) {
 }
 
 static void lower_stmt(ASTNode *node, LowerState *s) {
+    {
+        int unused;
+        if (lower_hoist_compound(node, s, &unused, 1)) return;
+    }
     if (!node) return;
 
     switch (node->type) {
@@ -2092,8 +2373,15 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
             IRInstr *sv = ir_emit(s->mod, IR_STORE_VAR);
             sv->str_extra = strdup(vd->var_name);
             sv->src1      = irop_temp(alloc_t);
+        } else if (vd->initializer && lower_is_value_struct(s, &vd->var_type) &&
+                   vd->initializer->resolved_type.kind == TYPE_SIMPLE && vd->initializer->resolved_type.name &&
+                   strcmp(vd->initializer->resolved_type.name, vd->var_type.name) == 0) {
+            lower_struct_assign_var(s, vd->var_name, vd->initializer);
         } else if (vd->initializer) {
             int ti = lower_expr(vd->initializer, s);
+            if (vd->initializer->type == NODE_FUNC_CALL &&
+                lower_copy_struct_return(s, vd->var_name, ti))
+                break;
             IRInstr *sv   = ir_emit(s->mod, IR_STORE_VAR);
             sv->str_extra = strdup(vd->var_name);
             sv->src1      = irop_temp(ti);
@@ -2107,7 +2395,14 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 
     case NODE_ASSIGN: {
         AssignNode *as = (AssignNode *)node;
+        if (lower_is_value_struct(s, &as->value->resolved_type) && !lower_is_self_field(s, as->var_name) &&
+            !lower_is_struct_param(s, as->var_name)) {
+            lower_struct_assign_var(s, as->var_name, as->value);
+            break;
+        }
         int tv = lower_expr(as->value, s);
+        if (as->value->type == NODE_FUNC_CALL && lower_copy_struct_return(s, as->var_name, tv))
+            break;
         /* `x = v;` inside a method, where x is a field: this means `self.x = v`.
            Without it the store went to a GLOBAL named x — the write half of the
            same implicit-receiver gap that broke bare field reads. */
@@ -2173,6 +2468,28 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 
     case NODE_MEMBER_ASSIGN: {
         MemberAssignNode *ma = (MemberAssignNode *)node;
+        if (lower_is_value_struct(s, &ma->value->resolved_type)) {
+            /* `o.field = structValue;` - copy the whole nested struct into the field */
+            const char *otype = (ma->object && ma->object->resolved_type.kind == TYPE_SIMPLE &&
+                                 ma->object->resolved_type.name) ? ma->object->resolved_type.name : s->class_name;
+            int width = 0; const char *ftype = NULL;
+            int off = otype ? ast_field_offset(s->mod->classes, s->mod->class_count, otype, ma->member, &width, &ftype) : -1;
+            if (off >= 0) {
+                int size = ast_class_byte_size(s->mod->classes, s->mod->class_count, ma->value->resolved_type.name);
+                int tsrc = lower_struct_value_addr(ma->value, s);
+                int tobj = lower_object_base_ptr(ma->object, s);
+                int tdst = tobj;
+                if (off > 0) {
+                    tdst = alloc_temp(s);
+                    IRInstr *add = ir_emit(s->mod, IR_ADD);
+                    add->dest = irop_temp(tdst);
+                    add->src1 = irop_temp(tobj);
+                    add->src2 = irop_const_int((long)off);
+                }
+                lower_emit_memcpy(s, tdst, tsrc, size);
+                break;
+            }
+        }
         /* Evaluate value and object BEFORE emitting IR_SET_FIELD */
         int tval = lower_expr(ma->value, s);
         /* Same base-address rule as the read path — see lower_object_base_ptr.
@@ -2265,8 +2582,36 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
     case NODE_RETURN: {
         ReturnNode *ret = (ReturnNode *)node;
         IROperand ret_src = {.kind = IROP_NONE};
-        if (ret->value)
-            ret_src = irop_temp(lower_expr(ret->value, s));
+        if (ret->value && s->fn_sret && lower_is_value_struct(s, &ret->value->resolved_type)) {
+            /* struct result: copy into the caller's buffer (hidden first parameter) */
+            int size = ast_class_byte_size(s->mod->classes, s->mod->class_count, s->fn_sret);
+            int tsrc = lower_struct_value_addr(ret->value, s);
+            int tdst = alloc_temp(s);
+            IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR);
+            lv->dest = irop_temp(tdst);
+            lv->str_extra = strdup("__sret");
+            lower_emit_memcpy(s, tdst, tsrc, size);
+            ret_src = irop_temp(tdst);
+        } else if (ret->value) {
+            int tr = lower_expr(ret->value, s);
+            /* convert to the declared float width / int-ness: `float32 f(float32 a) { return a * 2.0; }`
+               computes in float64 and must hand back a float32 */
+            const char *want = s->fn_ret ? lower_float_type_name(s->fn_ret) : NULL;
+            const char *have = lower_float_type_name(&ret->value->resolved_type);
+            int want_int = s->fn_ret && s->fn_ret->kind == TYPE_SIMPLE && s->fn_ret->name &&
+                           (!strcmp(s->fn_ret->name, "int") || !strcmp(s->fn_ret->name, "int64"));
+            const char *conv = NULL;
+            if (want) conv = want;      /* the front end's static type can disagree with the width MIR computed in */
+            (void)have;
+            if (!want && want_int && have) conv = "int";
+            if (conv) {
+                int tc = alloc_temp(s);
+                IRInstr *c = ir_emit(s->mod, IR_CAST);
+                c->dest = irop_temp(tc); c->src1 = irop_temp(tr); c->str_extra = strdup(conv);
+                tr = tc;
+            }
+            ret_src = irop_temp(tr);
+        }
         emit_defers(s); /* after the value is computed, before leaving */
         if (s->has_arena) emit_arena_free(s);
         IRInstr *ins = ir_emit(s->mod, IR_RETURN);
@@ -2392,7 +2737,8 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         int tidx2 = alloc_temp(s);
         { IRInstr *lv = ir_emit(s->mod, IR_LOAD_VAR); lv->dest = irop_temp(tidx2); lv->str_extra = strdup(idx_nm); }
         int telem = alloc_temp(s);
-        { IRInstr *al = ir_emit(s->mod, IR_ARRAY_LOAD); al->dest = irop_temp(telem); al->src1 = irop_temp(tarr2); al->src2 = irop_temp(tidx2); }
+        { IRInstr *al = ir_emit(s->mod, IR_ARRAY_LOAD); al->dest = irop_temp(telem); al->src1 = irop_temp(tarr2); al->src2 = irop_temp(tidx2);
+          const char *fl = lower_array_elem_float(&fi->collection->resolved_type); if (fl) al->str_extra2 = strdup(fl); }
         { IRInstr *sv = ir_emit(s->mod, IR_STORE_VAR); sv->str_extra = strdup(fi->var_name); sv->src1 = irop_temp(telem); }
 
         lower_stmts(fi->body, fi->body_count, s);
@@ -2579,7 +2925,7 @@ static int is_arena_bootstrap_fn(const char *name) {
         "hylian_array_push", "hylian_array_pop",
         "hylian_array_get", "hylian_array_set",
         "hylian_print", "hylian_println", "hylian_int_to_str",
-        "hylian_str_alloc", "_rt_strlen", "hylian_str_concat", "hylian_str_from_int",
+        "hylian_str_alloc", "_rt_strlen", "hylian_str_concat", "hylian_str_eq", "hylian_str_from_int",
         "hylian_str_from_bool", "_rt_put", "hylian_float_to_str", "hylian_str_from_float",
         "hylian_panic",
         NULL
@@ -2599,6 +2945,26 @@ static void lower_func_body(
     const char  *class_name,
     LowerState  *s)
 {
+    /* a function returning a struct by value takes a hidden first parameter: the
+       address of the caller's result buffer */
+    ASTNode *sret_params[40];
+    s->fn_sret = s->pending_sret;
+    s->pending_sret = NULL;
+    s->fn_ret = s->pending_ret;
+    s->pending_ret = NULL;
+    if (s->fn_sret && !has_self && param_count < 32) {
+        VarDeclNode *sp = calloc(1, sizeof(VarDeclNode));
+        sp->base.type = NODE_VAR_DECL;
+        sp->var_name = strdup("__sret");
+        sp->var_type.kind = TYPE_SIMPLE;
+        sp->var_type.name = strdup("int");
+        sret_params[0] = (ASTNode *)sp;
+        for (int i = 0; i < param_count; i++) sret_params[i + 1] = params[i];
+        params = sret_params;
+        param_count++;
+    } else {
+        s->fn_sret = NULL;
+    }
     s->next_temp   = 0;
     s->class_name  = class_name;
     s->local_name_count = 0;          /* fresh local-name table per function */
@@ -2609,6 +2975,8 @@ static void lower_func_body(
        primitives themselves, by name, to avoid recursing into their own
        auto-injected arena_init/arena_free calls (see is_arena_bootstrap_fn). */
     s->has_arena   = !is_naked && !is_arena_bootstrap_fn(name);
+    s->arena_used  = 0;
+    s->arena_glue_count = 0;
 
     /* IR_FUNC_BEGIN.
        ir_emit() may realloc() mod->instrs, which invalidates every IRInstr*
@@ -2680,6 +3048,7 @@ static void lower_func_body(
         emit_alloca(s, "__arena__", "Arena", TYPE_SIMPLE);
 
         /* arena_init(&__arena__) */
+        int glue_start = s->mod->instr_count;
         int t_aptr = alloc_temp(s);
         IRInstr *addrof = ir_emit(s->mod, IR_ADDROF);
         addrof->dest      = irop_temp(t_aptr);
@@ -2691,6 +3060,7 @@ static void lower_func_body(
         init_call->args      = malloc(sizeof(IROperand));
         init_call->args[0]   = irop_temp(t_aptr);
         init_call->arg_count = 1;
+        arena_glue_note(s, glue_start);
     }
 
     /* defer: find them, clear their flags, then lower the body and run the
@@ -2722,7 +3092,16 @@ static void lower_func_body(
         ir_emit(s->mod, IR_RETURN);
     }
 
+    /* A function that never allocates from its arena doesn't need one: drop
+       the arena_init/arena_free calls (an mmap + munmap per call otherwise). */
+    if (s->has_arena && !s->arena_used) {
+        for (int i = 0; i < s->arena_glue_count; i++)
+            s->mod->instrs[s->arena_glue[i]].op = IR_NOP;
+    }
+
     ir_emit(s->mod, IR_FUNC_END);
+    s->fn_sret = NULL;
+    s->fn_ret = NULL;
     s->class_name = NULL;
 }
 
@@ -2735,6 +3114,57 @@ static void lower_func_body(
    cast). Anything else (a variable, a function call, ...) isn't something
    this can know the value of before the program runs, so it fails rather
    than guessing 0 and silently laying out the wrong bytes. */
+
+/* Compile-time evaluation of a constant expression for a static initializer
+   (`int g = 3 * 4 + 1;`, `float f = 0.0 - 2.25;`). */
+typedef struct { int is_float; long i; double f; } CVal;
+static int fold_cexpr(ASTNode *n, CVal *o) {
+    if (!n) return 0;
+    if (n->type == NODE_LITERAL) {
+        LiteralNode *l = (LiteralNode *)n;
+        if (l->lit_type == LIT_INT)   { o->is_float = 0; o->i = atol(l->value); return 1; }
+        if (l->lit_type == LIT_FLOAT) { o->is_float = 1; o->f = atof(l->value); return 1; }
+        if (l->lit_type == LIT_BOOL)  { o->is_float = 0; o->i = strcmp(l->value, "true") == 0; return 1; }
+        if (l->lit_type == LIT_NIL)   { o->is_float = 0; o->i = 0; return 1; }
+        return 0;
+    }
+    if (n->type == NODE_UNARY_OP) {
+        UnaryOpNode *u = (UnaryOpNode *)n; CVal a;
+        if (u->postfix || !fold_cexpr(u->operand, &a)) return 0;
+        *o = a;
+        if (!strcmp(u->op, "-")) { if (a.is_float) o->f = -a.f; else o->i = (long)(0 - (unsigned long)a.i); return 1; }
+        if (!strcmp(u->op, "~") && !a.is_float) { o->i = ~a.i; return 1; }
+        if (!strcmp(u->op, "!") && !a.is_float) { o->i = !a.i; return 1; }
+        return 0;
+    }
+    if (n->type == NODE_BINARY_OP) {
+        BinaryOpNode *b = (BinaryOpNode *)n; CVal x, y;
+        if (!strcmp(b->op, "cast")) return 0;
+        if (!fold_cexpr(b->left, &x) || !fold_cexpr(b->right, &y)) return 0;
+        const char *op = b->op;
+        if (x.is_float || y.is_float) {
+            double a = x.is_float ? x.f : (double)x.i, c = y.is_float ? y.f : (double)y.i;
+            o->is_float = 1;
+            if (!strcmp(op, "+")) o->f = a + c; else if (!strcmp(op, "-")) o->f = a - c;
+            else if (!strcmp(op, "*")) o->f = a * c; else if (!strcmp(op, "/")) o->f = a / c;
+            else return 0;
+            return 1;
+        }
+        unsigned long ua = (unsigned long)x.i, uc = (unsigned long)y.i;
+        o->is_float = 0;
+        if (!strcmp(op, "+")) o->i = (long)(ua + uc); else if (!strcmp(op, "-")) o->i = (long)(ua - uc);
+        else if (!strcmp(op, "*")) o->i = (long)(ua * uc);
+        else if (!strcmp(op, "/")) { if (!y.i || (x.i == LONG_MIN && y.i == -1)) return 0; o->i = x.i / y.i; }
+        else if (!strcmp(op, "%")) { if (!y.i || (x.i == LONG_MIN && y.i == -1)) return 0; o->i = x.i % y.i; }
+        else if (!strcmp(op, "&")) o->i = x.i & y.i; else if (!strcmp(op, "|")) o->i = x.i | y.i;
+        else if (!strcmp(op, "^")) o->i = x.i ^ y.i;
+        else if (!strcmp(op, "<<")) o->i = (long)(ua << (uc & 63)); else if (!strcmp(op, ">>")) o->i = x.i >> (uc & 63);
+        else return 0;
+        return 1;
+    }
+    return 0;
+}
+
 static int fold_const_int(ASTNode *node, long *out) {
     if (!node) return 0;
     if (node->type == NODE_LITERAL) {
@@ -2975,7 +3405,21 @@ IRModule *lower_program(ProgramNode *prog) {
                     else
                         ins->src1 = irop_const_int(0);
                 } else {
+                    CVal cv;
+                    if (fold_cexpr(sv->initializer, &cv))
+                        ins->src1 = cv.is_float ? irop_const_float(cv.f) : irop_const_int(cv.i);
+                    else ins->src1 = irop_const_int(0);
+                }
+            } else if (sv->initializer && sv->initializer->type == NODE_BINARY_OP) {
+                CVal cv;
+                int fl = ins->str_extra2 && (!strcmp(ins->str_extra2, "float") || !strcmp(ins->str_extra2, "float64") ||
+                                             !strcmp(ins->str_extra2, "double") || !strcmp(ins->str_extra2, "float32"));
+                if (fold_cexpr(sv->initializer, &cv))
+                    ins->src1 = fl ? irop_const_float(cv.is_float ? cv.f : (double)cv.i)
+                                   : irop_const_int(cv.is_float ? (long)cv.f : cv.i);
+                else {
                     ins->src1 = irop_const_int(0);
+                    fprintf(stderr, "hylian: warning: initializer of '%s' is not a compile-time constant; it starts out as 0\n", sv->var_name);
                 }
             } else if (sv->initializer && sv->initializer->type == NODE_IDENTIFIER) {
                 /* Resolve identifier via the pre-scan table */
@@ -3003,6 +3447,8 @@ IRModule *lower_program(ProgramNode *prog) {
             if (fn->body_count == 0) continue;
             /* Included functions are droppable if nothing reaches them. */
             if (decl->from_include) ir_mark_weak_func(mod, fn->name);
+            s.pending_sret = lower_is_value_struct(&s, &fn->return_type) ? fn->return_type.name : NULL;
+            s.pending_ret = &fn->return_type;
             lower_func_body(fn->name,
                             fn->params, fn->param_count,
                             fn->body,   fn->body_count,
@@ -3014,7 +3460,7 @@ IRModule *lower_program(ProgramNode *prog) {
             ClassNode *cls = (ClassNode *)decl;
 
             /* Constructor — skip body-less .hyi stubs */
-            if (cls->has_ctor && cls->ctor_body_count > 0) {
+            if (cls->has_ctor) {
                 char ctor_name[256];
                 snprintf(ctor_name, sizeof(ctor_name), "%s__ctor", cls->name);
                 if (decl->from_include) ir_mark_weak_func(mod, ctor_name);
@@ -3031,6 +3477,7 @@ IRModule *lower_program(ProgramNode *prog) {
                 char mname[256];
                 snprintf(mname, sizeof(mname), "%s_%s", cls->name, m->name);
                 if (decl->from_include) ir_mark_weak_func(mod, mname);
+                s.pending_ret = &m->return_type;
                 lower_func_body(mname,
                                 m->params, m->param_count,
                                 m->body,   m->body_count,
@@ -3053,6 +3500,7 @@ IRModule *lower_program(ProgramNode *prog) {
                 char mangled[256];
                 snprintf(mangled, sizeof(mangled), "%s__%s", mn->name, fn->name);
                 if (decl->from_include) ir_mark_weak_func(mod, mangled);
+                s.pending_ret = &fn->return_type;
                 lower_func_body(mangled,
                                 fn->params, fn->param_count,
                                 fn->body,   fn->body_count,

@@ -65,19 +65,22 @@ int hylian_int_to_str(int val, usize buf, int buflen) {
         return 1;
     }
 
+    // Digits are taken from the value with its own sign (truncating division
+    // leaves a negative remainder for a negative number), so the most negative
+    // int, which has no positive counterpart to negate into, prints correctly.
     bool neg = val < 0;
     int v = val;
-    if (neg) {
-        v = -v;
-    }
 
     int pos = buflen;
-    while (v > 0) {
+    while (v != 0) {
         pos = pos - 1;
         if (pos < 0) {
             return 0;
         }
         int digit = v % 10;
+        if (neg) {
+            digit = 0 - digit;
+        }
         usize p = buf + cast<usize>(pos);
         unsafe {
             *uint8 dp = cast<*uint8>(p);
@@ -186,6 +189,28 @@ usize hylian_str_concat(usize a, usize b) {
         i = i + 1;
     }
     return out;
+}
+
+// hylian_str_eq: byte-for-byte `a == b` on two strings (what the compiler
+// lowers `==`/`!=` on str to). Lives here, in the always-linked runtime, so
+// comparing strings never depends on the program including std.string.
+// nil equals only nil.
+int hylian_str_eq(usize a, usize b) {
+    if (a == b) { return 1; }
+    if (a == cast<usize>(0)) { return 0; }
+    if (b == cast<usize>(0)) { return 0; }
+    int i = 0;
+    while (true) {
+        uint8 ca; uint8 cb;
+        unsafe {
+            *uint8 pa = cast<*uint8>(a + cast<usize>(i)); ca = *pa;
+            *uint8 pb = cast<*uint8>(b + cast<usize>(i)); cb = *pb;
+        }
+        if (ca != cb) { return 0; }
+        if (cast<int>(ca) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 1;
 }
 
 usize hylian_str_from_int(int v) {

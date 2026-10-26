@@ -30,11 +30,6 @@ from a function. `new` objects are fine; the stdlib modules that need a heap-all
 handle (`map`, `bytes` buffers, `http` responses) use an opaque `usize` pointing at a raw
 word block instead.
 
-### Compound assignment on fields / elements evaluates its target twice
-
-`a[f()] += 1` is rewritten to `a[f()] = a[f()] + 1`, so `f` runs twice. Keep side effects
-out of the target (plain `x += 1`, `p.x += 1`, `a[i] += 1` are exact).
-
 ### A range loop's end is re-evaluated each iteration
 
 `for (i in 0..n)` is a plain `for (int i = 0; i < n; i += 1)`, so changing `n` inside the
@@ -61,31 +56,31 @@ buffer use `static uint8 buf[64];` or `bytes_alloc`.
 Quotes inside `{{ }}` must be escaped (`"{{ok ? \"y\" : \"n\"}}"`), and a string that uses
 interpolation can't also contain a literal `{{`.
 
-### String equality needs `include { string }`
+### No multi-return / tuples
 
-`a == b` between two `str` values compares contents, but it is compiled as a call to
-`equals` from `stdlib/string.hy`, so the module must be included. (`+`, `+=`, `s[i]` and
-interpolation need nothing.)
+Functions return exactly one value.
 
-### No multi-return / tuples, no function pointers
+### Function pointers are untyped
 
-Functions return exactly one value. `addrof_fn(f)` yields an address, but there is no
-indirect-call syntax to use it with.
+`usize fp = addrof_fn(f); fp(1, 2)` calls through the address, and the address can be
+handed to C as a callback. The pointer carries no signature, so nothing checks the
+arguments, and the result of an indirect call is always integer-sized (a function
+returning `float` through a pointer will not come back in the right register).
 
 ## Floating point
 
 - Calls follow the SysV x86-64 ABI, so `float` / `double` / `float32` arguments and results
-  travel in `xmm` registers and mix freely with C. Not yet handled: structs passed **by
-  value** (raylib's `Vector2` / `Color`, SDL's `SDL_Rect`) and `long double`.
+  travel in `xmm` registers and mix freely with C. Flat structs pass and return **by value**
+  to C (raylib's `Vector2` / `Color`, SDL's `SDL_Rect`). Not handled: `long double`, and
+  structs containing nested structs, arrays, unions or padding.
 - Only scalar arithmetic and comparisons exist, and `math.hy`'s transcendental functions are
   ~1e-12 accurate, not libm-exact (call libm through an FFI declaration when you need it).
-- `array<float>` stores each element as a raw word: writing works, but reading an element
-  back yields the integer bit pattern, so convert with `cast` from a `float` variable that
-  you assign through memory instead of indexing directly.
-- The IR optimizer knows no types: it will not fold `x / 0.0` (left to the hardware, giving
-  `inf`/`nan`) and skips folding integer division, modulo, `>>` and ordering compares when a
-  constant is negative, because that could be a large unsigned value. Both only forgo an
-  optimisation.
+- `array<float>` stores each element as a raw 8-byte word; indexing, `pop()` and `for (e in arr)` reinterpret it as a float.
+- Optimisation runs on typed MIR in the hygen middle end (`hygen/libhyopt`), not on the
+  untyped IR: integer division/modulo by constants, comparisons and shifts are folded with the
+  operand's real signedness and width, and `x / 0.0` folds to IEEE `inf`/`nan`. Integer division
+  by a *zero* constant is left to the hardware. The old IR-level passes (`compiler/opt.c`) are
+  disabled by default (`HYLIAN_IROPT=1` re-enables them); only dead-function pruning still runs there.
 
 ## Toolchain
 

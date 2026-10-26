@@ -27,4 +27,6 @@ defer: 20
   defer: outer
 defer: 1
 errors: empty/42 too long/0 true
+fnptr: 5 20 42
+compound: 2 2 115 40 30 40
 interp: world 7 true 5

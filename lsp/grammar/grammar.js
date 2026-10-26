@@ -65,7 +65,7 @@ module.exports = grammar({
 
     module_path: ($) => seq($.identifier, repeat(seq(".", $.identifier))),
 
-    ccpinclude_stmt: ($) => seq("ccpinclude", $.string_literal),
+    ccpinclude_stmt: ($) => seq("ccpinclude", $.string_literal, ";"),
 
     // ── Enum declarations ────────────────────────────────────────────────────
     enum_decl: ($) =>
@@ -249,7 +249,9 @@ module.exports = grammar({
     // ── Function declarations ────────────────────────────────────────────────
     func_decl: ($) =>
       seq(
-        optional("public"),
+        // `static` = file-private helper (`static int _helper(int x) { ... }`);
+        // the compiler takes `static` or `public`, not both
+        optional(choice($.static, "public")),
         optional("naked"),
         field("return_type", $.type),
         optional("?"),

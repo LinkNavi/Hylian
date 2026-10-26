@@ -52,6 +52,11 @@ typedef struct {
     };
 } MIRValue;
 
+/* alias classes for MIRInstr.mem_cls */
+#define MIR_MEM_ANY        0
+#define MIR_MEM_ARRAY_HDR  1
+#define MIR_MEM_ARRAY_ELEM 2
+
 /* ---- Opcodes ---- */
 typedef enum {
     MIR_MOV,
@@ -119,8 +124,24 @@ typedef enum {
                                  register name (or loads a spill into scratch) and encodes
                                  the result for real, post-regalloc, in lower_x64.c. */
 
+    MIR_SELECT,     /* dest = src1 != 0 ? src2 : args[0]   (integer class; no branch) */
+    MIR_SMULH,      /* dest = high 64 bits of the signed 128-bit product src1*src2 */
+    MIR_UMULH,      /* ... unsigned; both exist so division by a constant can use a
+                       multiply by a "magic" reciprocal instead of a slow divide */
+    MIR_ARR_LEN,    /* dest = base ? *(u64*)base : 0           (array {len,cap,data} header) */
+    MIR_ARR_DATA,   /* dest = base ? *(u64*)(base+16) : 0      null-safe reads of the header, so a nil
+                       array behaves as an empty one; alias class MIR_MEM_ARRAY_HDR */
+    MIR_GETPARAM,   /* dest = incoming parameter #extra_int (mem2reg'd parameter).
+                       Only valid in a run at the very top of the function; the
+                       backend moves the ABI register/stack slot straight into
+                       dest's home instead of bouncing through a stack slot. */
+
     MIR_NOP,
 } MIROp;
+
+#define MIR_AGG_SIZE(d)  ((d) >> 2)
+#define MIR_AGG_SSE(d,k) (((d) >> (k)) & 1)
+#define MIR_AGG_MEM(d)   (MIR_AGG_SIZE(d) > 16)
 
 typedef struct {
     MIROp     op;
@@ -132,6 +153,14 @@ typedef struct {
     MIRValue *args;
     int       arg_count;
     const char *callee; /* NULL if indirect (src1 holds fn ptr) */
+    /* Struct by value across the C ABI. arg_aggr[i] != 0: args[i] is the
+       address of a struct passed by value; the descriptor is
+       (size << 2) | sse mask (bit k = eightbyte k is float-only, so xmm),
+       size > 16 = MEMORY class (copied to the stack). ret_aggr != 0: the call
+       returns a struct into the local src2 (a MIRV_LOCAL); MEMORY-class
+       returns get that buffer's address as a hidden first argument. */
+    int      *arg_aggr;
+    int       ret_aggr;
 
     /* MIR_READ_CR / MIR_WRITE_CR control-register number, MIR_ALLOCA_LOCAL
        size, and the volatile flag on MIR_LOAD/MIR_STORE. */
@@ -144,6 +173,19 @@ typedef struct {
        volatile flag for loads, and the x64 backend read the same field as a
        displacement, so `*volatile p` compiled into a read from p+1. */
     int       mem_offset;
+
+    /* MIR_LOAD/MIR_STORE through a pointer: when nonzero, src2 is an index
+       vreg and the effective address is  base + src2*mem_scale + mem_offset
+       (mem_scale is 1, 2, 4 or 8 - one x86 SIB byte). Zero = plain
+       base+offset addressing and src2 is ignored. */
+    int       mem_scale;
+
+    /* Alias class of a LOAD/STORE through a pointer, for the optimizer. A store
+       of one class cannot modify memory another class reads (an array's
+       element storage is separate from its {len,cap,data} header), which lets
+       header loads be reused across element stores. MIR_MEM_ANY (0) may alias
+       everything. */
+    int       mem_cls;
 
     /* MIR_ASM_RAW: raw bytes to splice in directly, already-encoded machine code.
        No text, no reassembly - frontend is responsible for producing correct
@@ -167,6 +209,10 @@ typedef struct {
                                 in declaration order - backend's prologue uses this to know
                                 how many SysV arg registers to spill into local slots */
     int       is_naked;     /* skip prologue/epilogue, e.g. syscall wrappers/ISR */
+    unsigned char *local_pinned; /* local_pinned[id] != 0: slot's address escapes
+                                    (multi-slot aggregate, or otherwise must stay
+                                    in memory) - see mir_pin_local() */
+    int       local_pinned_cap;
     MIRType  *param_types;  /* declared type of each incoming param (param_count entries, or NULL
                                = all integer-class); the backend needs them to know which params
                                arrive in xmm registers (SysV passes floats there) */
@@ -210,6 +256,7 @@ MIRFunc   *mir_func_new(MIRModule *mod, const char *name);
 MIRInstr  *mir_emit(MIRFunc *fn, MIROp op);
 int        mir_new_vreg(MIRFunc *fn);
 int        mir_new_local(MIRFunc *fn); /* allocates a fresh per-call-frame local slot id */
+void       mir_pin_local(MIRFunc *fn, int id); /* keep this slot in memory (opt passes must not promote it) */
 
 MIRValue mir_vreg(int id, MIRType type);
 MIRValue mir_imm_int(int64_t v, MIRType type);

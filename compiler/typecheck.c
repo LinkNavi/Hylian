@@ -10,24 +10,94 @@ static const char *current_tc_file = "<unknown>";
 static int in_unsafe = 0;
 /* Both route through the shared diagnostic sink (see diag.h) so this one
    typechecker can serve the CLI and the LSP. */
-static void tc_error(int line, const char *fmt, ...) {
+/* Diagnostics anchor to a node: its line, column and width come from the
+   parser's exact source span (see ast.c), so the editor can underline the
+   offending expression instead of guessing. */
+static void tc_emit(DiagSeverity sev, const ASTNode *n, const char *hint, const char *buf) {
+  int span = (n && n->end_line == n->line && n->end_col > n->col) ? n->end_col - n->col : 0;
+  diag_set_span(span);
+  diag_emit(sev, current_tc_file, n ? n->line : 0, (n && n->line > 0) ? n->col : -1, hint, "%s", buf);
+}
+
+static void tc_error(const ASTNode *n, const char *fmt, ...) {
   char buf[1024];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  diag_emit(DIAG_ERROR, current_tc_file, line, -1, NULL, "%s", buf);
+  tc_emit(DIAG_ERROR, n, NULL, buf);
 }
 
-static void tc_warn(int line, const char *fmt, ...) {
+static void tc_warn(const ASTNode *n, const char *fmt, ...) {
   char buf[1024];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  diag_emit(DIAG_WARNING, current_tc_file, line, -1, NULL, "%s", buf);
+  tc_emit(DIAG_WARNING, n, NULL, buf);
 }
 
+
+/* Error with a second line of advice (shown as `hint:` by the CLI and after the
+   message in the editor). */
+static void tc_error_hint(const ASTNode *n, const char *hint, const char *fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  tc_emit(DIAG_ERROR, n, hint, buf);
+}
+
+/* ── "did you mean ...?" ─────────────────────────────────────────────────── */
+
+typedef struct { const char *target; const char *best; int bestd; } Suggest;
+
+static void sg_init(Suggest *s, const char *target) {
+  s->target = target; s->best = NULL; s->bestd = 1000;
+}
+
+/* Levenshtein distance, case-insensitive (a wrong-case name is the most likely
+   typo of all), capped so long names stay cheap. */
+static int edit_distance(const char *a, const char *b) {
+  int la = (int)strlen(a), lb = (int)strlen(b);
+  if (la > 40 || lb > 40) return 1000;
+  int prev[64], cur[64];
+  for (int j = 0; j <= lb; j++) prev[j] = j;
+  for (int i = 1; i <= la; i++) {
+    cur[0] = i;
+    for (int j = 1; j <= lb; j++) {
+      char ca = a[i - 1], cb = b[j - 1];
+      if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+      if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+      int sub = prev[j - 1] + (ca != cb);
+      int del = prev[j] + 1, ins = cur[j - 1] + 1;
+      int m = sub < del ? sub : del;
+      cur[j] = m < ins ? m : ins;
+    }
+    memcpy(prev, cur, sizeof(int) * (size_t)(lb + 1));
+  }
+  return prev[lb];
+}
+
+static void sg_add(Suggest *s, const char *cand) {
+  if (!cand || !cand[0] || strcmp(cand, s->target) == 0) return;
+  if (cand[0] == '_' && s->target[0] != '_') return; /* private helpers */
+  int d = edit_distance(s->target, cand);
+  if (d < s->bestd) { s->bestd = d; s->best = cand; }
+}
+
+/* the closest candidate, if it is close enough to plausibly be a typo */
+static const char *sg_result(const Suggest *s) {
+  int len = (int)strlen(s->target);
+  int limit = len <= 3 ? 1 : len <= 6 ? 2 : 3;
+  return s->best && s->bestd <= limit ? s->best : NULL;
+}
+
+static void did_you_mean_hint(const char *best, char *buf, size_t n) {
+  if (best) snprintf(buf, n, "did you mean '%s'?", best);
+  else buf[0] = '\0';
+}
 
 #define MAX_SCOPE_DEPTH 32
 #define MAX_SCOPE_SYMS 4096
@@ -91,6 +161,8 @@ static int field_count = 0;
 
 
 static const char *enum_type_names[256];
+static const char *tc_class_names[1024];
+static int tc_class_name_count = 0;
 static int enum_type_count = 0;
 
 static const char *tc_module_names[64];
@@ -163,6 +235,32 @@ static FieldEntry *field_lookup(const char *class_name, const char *fname) {
   return NULL;
 }
 
+
+/* does the class have at least one registered field (so a missing field is a real error, not
+   a type we know nothing about)? */
+static int class_is_known(const char *class_name) {
+  for (int i = 0; i < field_count; i++)
+    if (fields[i].class_name && strcmp(fields[i].class_name, class_name) == 0) return 1;
+  return 0;
+}
+
+static int type_name_declared(const char *n) {
+  static const char *builtin[] = { "int","int8","int16","int32","int64","uint8","uint16","uint32","uint64",
+    "usize","isize","float","float32","float64","double","bool","char","str","void","Error","auto",
+    "ptr","rawptr","any","array","multi","unknown","nil", NULL };
+  for (int i = 0; builtin[i]; i++) if (strcmp(n, builtin[i]) == 0) return 1;
+  for (int i = 0; i < tc_class_name_count; i++) if (tc_class_names[i] && strcmp(tc_class_names[i], n) == 0) return 1;
+  if (is_enum_type(n)) return 1;
+  for (int i = 0; i < tc_module_count; i++) if (tc_module_names[i] && strcmp(tc_module_names[i], n) == 0) return 1;
+  if (class_is_known(n)) return 1;
+  return 0;
+}
+
+static void suggest_type(const char *name, char *hint, size_t n) {
+  Suggest sg; sg_init(&sg, name);
+  for (int i = 0; i < tc_class_name_count; i++) sg_add(&sg, tc_class_names[i]);
+  did_you_mean_hint(sg_result(&sg), hint, n);
+}
 
 static Type unknown_type(void) { return make_simple_type(NULL, 0); }
 
@@ -240,6 +338,63 @@ static Type ext_type(const TCExternal *e) {
   return make_simple_type((char *)e->type_name, 0);
 }
 
+/* Suggestion builders. They live here, after the tables they read. */
+
+static void suggest_variable(const char *name, char *hint, size_t n) {
+  Suggest s; sg_init(&s, name);
+  for (int i = 0; i < sym_count; i++) sg_add(&s, symbols[i].name);
+  for (int i = 0; i < g_ext_count; i++)
+    if (g_ext[i].kind == TC_EXT_VAR) sg_add(&s, g_ext[i].name);
+  const char *best = sg_result(&s);
+  if (!best && (func_lookup(name) || ext_find(name, TC_EXT_FUNC))) {
+    snprintf(hint, n, "'%s' is a function: call it as %s(...), or take its address with addrof_fn(%s)",
+             name, name, name);
+    return;
+  }
+  did_you_mean_hint(best, hint, n);
+}
+
+static void suggest_function(const char *name, char *hint, size_t n) {
+  Suggest s; sg_init(&s, name);
+  for (int i = 0; i < func_count; i++)
+    if (funcs[i].name && !strstr(funcs[i].name, "__")) sg_add(&s, funcs[i].name);
+  for (int i = 0; i < g_ext_count; i++)
+    if (g_ext[i].kind == TC_EXT_FUNC && !strstr(g_ext[i].name, "__")) sg_add(&s, g_ext[i].name);
+  const char *best = sg_result(&s);
+  if (!best && scope_lookup(name)) {
+    snprintf(hint, n, "'%s' is a variable, not a function", name);
+    return;
+  }
+  did_you_mean_hint(best, hint, n);
+}
+
+static void suggest_field(const char *cls, const char *name, char *hint, size_t n) {
+  Suggest s; sg_init(&s, name);
+  for (int i = 0; i < field_count; i++)
+    if (fields[i].class_name && strcmp(fields[i].class_name, cls) == 0) sg_add(&s, fields[i].field_name);
+  for (int i = 0; i < g_ext_field_count; i++)
+    if (g_ext_fields[i].class_name && strcmp(g_ext_fields[i].class_name, cls) == 0)
+      sg_add(&s, g_ext_fields[i].field_name);
+  did_you_mean_hint(sg_result(&s), hint, n);
+}
+
+static void suggest_method(const char *cls, const char *name, char *hint, size_t n) {
+  Suggest s; sg_init(&s, name);
+  size_t pl = strlen(cls);
+  for (int i = 0; i < func_count; i++) {
+    const char *fnm = funcs[i].name;
+    if (fnm && strncmp(fnm, cls, pl) == 0 && fnm[pl] == '_' && fnm[pl + 1] == '_') sg_add(&s, fnm + pl + 2);
+  }
+  for (int i = 0; i < g_ext_count; i++) {
+    const char *fnm = g_ext[i].name;
+    if (g_ext[i].kind == TC_EXT_FUNC && fnm && strncmp(fnm, cls, pl) == 0 && fnm[pl] == '_' && fnm[pl + 1] == '_')
+      sg_add(&s, fnm + pl + 2);
+  }
+  for (int i = 0; i < field_count; i++)  /* a field called like a method */
+    if (fields[i].class_name && strcmp(fields[i].class_name, cls) == 0) sg_add(&s, fields[i].field_name);
+  did_you_mean_hint(sg_result(&s), hint, n);
+}
+
 static Type infer_expr(ASTNode *node) {
   if (!node)
     return unknown_type();
@@ -284,7 +439,9 @@ static Type infer_expr(ASTNode *node) {
         /* a module name used as a namespace prefix, e.g. `Pmm.init()` */
         result = make_simple_type((char *)em->name, 0);
       } else {
-        tc_error(node->line, "undefined variable '%s'", id->name);
+        char hint[256];
+        suggest_variable(id->name, hint, sizeof(hint));
+        tc_error_hint(node, hint, "undefined variable '%s'", id->name);
       }
     }
     break;
@@ -331,7 +488,7 @@ static Type infer_expr(ASTNode *node) {
           (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
            strcmp(op, "*") == 0 || strcmp(op, "/") == 0 ||
            strcmp(op, "%") == 0)) {
-        tc_warn(node->line, "arithmetic on boolean value with operator '%s'", op);
+        tc_warn(node, "arithmetic on boolean value with operator '%s'", op);
       }
       result = left;
     }
@@ -344,11 +501,18 @@ static Type infer_expr(ASTNode *node) {
     Type operand = infer_expr(un->operand);
     if (un->op && strcmp(un->op, "!") == 0)
       result = make_simple_type("bool", 0);
-    else if (un->op && strcmp(un->op, "addrof") == 0)
+    else if (un->op && strcmp(un->op, "addrof") == 0) {
+      if (!un->operand || un->operand->type != NODE_IDENTIFIER)
+        tc_error(node, "'&' can only take the address of a variable");
       result = make_ref_type(infer_expr(un->operand));
+    }
     else if (un->op && strcmp(un->op, "deref") == 0) {
+      if (operand.kind == TYPE_SIMPLE && operand.name &&
+          (!strcmp(operand.name, "float") || !strcmp(operand.name, "float32") ||
+           !strcmp(operand.name, "float64") || !strcmp(operand.name, "double") || !strcmp(operand.name, "bool")))
+        tc_error(node, "cannot dereference a value of type '%s'", operand.name);
       if (operand.kind == TYPE_RAWPTR && !in_unsafe && !un->is_volatile)
-        tc_error(node->line, "cannot deref raw pointer outside unsafe block");
+        tc_error(node, "cannot deref raw pointer outside unsafe block");
       result = (operand.elem_type_count > 0) ? operand.elem_types[0]
                                              : unknown_type();
     } else
@@ -502,6 +666,12 @@ static Type infer_expr(ASTNode *node) {
       result = make_simple_type("int", 0);
     } else if (fc->name && strcmp(fc->name, "syscall") == 0) {
       result = make_simple_type("int", 0);
+    } else if (fc->name && !func_lookup(fc->name) && !ext_find(fc->name, TC_EXT_FUNC) &&
+               scope_lookup(fc->name)) {
+      /* `fp(args)` where fp is a variable: an indirect call through a
+         function address (see addrof_fn). The result is int-sized. */
+      fc->is_indirect = 1;
+      result = make_simple_type("int", 0);
     } else if (fc->name) {
       FuncInfo *fi = func_lookup(fc->name);
       const TCExternal *ef = fi ? NULL : ext_find(fc->name, TC_EXT_FUNC);
@@ -519,11 +689,13 @@ static Type infer_expr(ASTNode *node) {
           FuncInfo *mfi = func_lookup(mangled);
           result = mfi ? mfi->return_type : unknown_type();
         } else if (owner) {
-          tc_error(node->line,
+          tc_error(node,
                     "call to undefined function '%s' - '%s' is defined inside module '%s'; call it as %s.%s(...)",
                     fc->name, fc->name, owner, owner, fc->name);
         } else {
-          tc_error(node->line, "call to undefined function '%s'", fc->name);
+          char hint[256];
+          suggest_function(fc->name, hint, sizeof(hint));
+          tc_error_hint(node, hint, "call to undefined function '%s'", fc->name);
         }
       }
     }
@@ -544,7 +716,7 @@ static Type infer_expr(ASTNode *node) {
         if (fi) {
           result = fi->return_type;
         } else {
-          tc_error(node->line, "no function '%s' in module '%s'", mc->method, obj_name);
+          tc_error(node, "no function '%s' in module '%s'", mc->method, obj_name);
         }
         node->resolved_type = result;
         return result;
@@ -588,8 +760,10 @@ static Type infer_expr(ASTNode *node) {
           result = ext_type(eu);
           mc->is_ufcs = 1;
         } else {
-          tc_error(node->line, "no method '%s' on type '%s'", mc->method,
-                   obj_type.name ? obj_type.name : "unknown");
+          char hint[256] = "";
+          if (obj_type.name) suggest_method(obj_type.name, mc->method, hint, sizeof(hint));
+          tc_error_hint(node, hint, "no method '%s' on type '%s'", mc->method,
+                        obj_type.name ? obj_type.name : "unknown");
         }
       }
     } else if (mc->method && obj_type.kind == TYPE_ARRAY) {
@@ -597,11 +771,11 @@ static Type infer_expr(ASTNode *node) {
           strcmp(mc->method, "len") == 0 || strcmp(mc->method, "cap") == 0) {
         result = make_simple_type("int", 0);
       } else {
-        tc_error(node->line, "no method '%s' on type '%s'", mc->method,
+        tc_error(node, "no method '%s' on type '%s'", mc->method,
                  type_name(obj_type));
       }
     } else if (mc->method && !obj_type.name) {
-      tc_error(node->line, "no method '%s' on type 'unknown'", mc->method);
+      tc_error(node, "no method '%s' on type 'unknown'", mc->method);
     }
     break;
   }
@@ -647,7 +821,9 @@ static Type infer_expr(ASTNode *node) {
             result = make_simple_type(
                 (char *)(ef->type_name && ef->type_name[0] ? ef->type_name : "int"), 0);
           } else {
-            tc_error(node->line, "no field '%s' on type '%s'", ma->member, obj_type.name);
+            char hint[256];
+            suggest_field(obj_type.name, ma->member, hint, sizeof(hint));
+            tc_error_hint(node, hint, "no field '%s' on type '%s'", ma->member, obj_type.name);
           }
         }
       }
@@ -751,7 +927,13 @@ static void infer_stmt(ASTNode *node) {
     if (decl_type.name && strcmp(decl_type.name, "auto") == 0 &&
         (!init_type.name || strcmp(init_type.name, "unknown") == 0) &&
         init_type.kind == TYPE_SIMPLE && !init_type.name) {
-      tc_warn(node->line, "cannot infer type for '%s' from initializer", vd->var_name);
+      tc_warn(node, "cannot infer type for '%s' from initializer", vd->var_name);
+    }
+    /* a type name nobody declared (`Smal s;`) */
+    if (decl_type.kind == TYPE_SIMPLE && decl_type.name && !type_name_declared(decl_type.name)) {
+      char hint[256] = "";
+      suggest_type(decl_type.name, hint, sizeof hint);
+      tc_error_hint(node, hint[0] ? hint : NULL, "unknown type '%s'", decl_type.name);
     }
     scope_define(vd->var_name, decl_type);
     node->resolved_type = decl_type;
@@ -871,9 +1053,20 @@ static void infer_stmt(ASTNode *node) {
 
   case NODE_MEMBER_ASSIGN: {
     MemberAssignNode *ma = (MemberAssignNode *)node;
+    Type ot = unknown_type();
     if (ma->object)
-      infer_expr(ma->object);
+      ot = infer_expr(ma->object);
     infer_expr(ma->value);
+    /* assigning to a field that doesn't exist used to warn at lowering and silently drop the store */
+    if (ma->object && ot.kind == TYPE_SIMPLE && ot.name && ma->member &&
+        strcmp(ot.name, "array") != 0 && strcmp(ot.name, "multi") != 0 &&
+        strcmp(ot.name, "unknown") != 0 && strcmp(ot.name, "auto") != 0 &&
+        class_is_known(ot.name) && !field_lookup(ot.name, ma->member) &&
+        !ext_field_find(ot.name, ma->member)) {
+      char hint[256];
+      suggest_field(ot.name, ma->member, hint, sizeof(hint));
+      tc_error_hint(node, hint, "no field '%s' on type '%s'", ma->member, ot.name);
+    }
     break;
   }
 
@@ -917,7 +1110,17 @@ static void infer_stmt(ASTNode *node) {
 static void infer_function(ASTNode **params, int param_count, ASTNode **body,
                            int body_count, Type return_type,
                            const char *class_name) {
-  (void)return_type;
+  if (body_count > 0) {    /* declarations from .hyi stubs are trusted */
+    if (return_type.kind == TYPE_SIMPLE && return_type.name && !type_name_declared(return_type.name) &&
+        param_count >= 0 && body[0])
+      tc_error(body[0], "unknown return type '%s'", return_type.name);
+    for (int i = 0; i < param_count; i++) {
+      VarDeclNode *pv = (VarDeclNode *)params[i];
+      if (pv && pv->base.type == NODE_VAR_DECL && pv->var_type.kind == TYPE_SIMPLE && pv->var_type.name &&
+          !type_name_declared(pv->var_type.name))
+        tc_error(params[i], "unknown type '%s' for parameter '%s'", pv->var_type.name, pv->var_name);
+    }
+  }
   scope_push();
   if (class_name) {
     scope_define("self", make_simple_type((char *)class_name, 0));
@@ -1063,6 +1266,16 @@ void typecheck(ProgramNode *program, const char *filename) {
       continue;
     }
 
+    if (d->type == NODE_CLASS && tc_class_name_count < 1024) {
+      const char *cname = ((ClassNode *)d)->name;
+      if (!d->from_include)
+        for (int k = 0; k < tc_class_name_count; k++)
+          if (tc_class_names[k] && cname && strcmp(tc_class_names[k], cname) == 0) {
+            tc_error(d, "class '%s' is defined more than once", cname);
+            break;
+          }
+      tc_class_names[tc_class_name_count++] = cname;
+    }
     if (d->type == NODE_ENUM) {
       EnumNode *en = (EnumNode *)d;
       if (enum_type_count < 64)

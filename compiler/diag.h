@@ -36,6 +36,21 @@ void diag_set_sink(DiagSink sink, void *user);
 void diag_emit(DiagSeverity sev, const char *file, int line, int col,
                const char *hint, const char *fmt, ...);
 
+/* A syntax error knows how wide the offending token is; the emitter sets it
+   just before diag_emit and sinks read it with diag_span_len(). 0 = unknown. */
+void diag_set_span(int len);
+int  diag_span_len(void);
+
+/* Work out the column and width to underline for a diagnostic on `line_text`.
+   Uses `col` when the frontend knew it (>= 0); otherwise looks for the first
+   'quoted' name in the message and finds that word in the line; otherwise
+   spans the whole line's code. Returns 1 if a precise token was found. */
+int diag_guess_span(const char *line_text, const char *message, int col,
+                    int span_len, int *out_col, int *out_len);
+
+/* Remove ANSI colour escapes from `s` in place (hints carry them for the CLI). */
+void diag_strip_ansi(char *s);
+
 /* Counts since the last diag_reset_counts(). The CLI uses the error count to
    decide whether to keep going; the LSP ignores them. */
 int  diag_error_count(void);

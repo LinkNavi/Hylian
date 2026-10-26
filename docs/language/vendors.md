@@ -28,7 +28,11 @@ fn snprintf(buf: str, n: int, fmt: str, x: float, y: int) -> int   // variadic i
   from 32 bits), `uint32`, `int64` for `long`, `float32` for C `float`, `float` for
   `double`. Zora's generator maps by the canonical C type, so `Uint32`, `size_t` and enums
   come out right automatically.
-- Not supported: structs by value, and function pointers as callbacks.
+- Structs pass and return **by value** per the SysV classification (`fn DrawCircleV(c: Vector2,
+  r: float32, color: Color)`, `fn GetMousePosition() -> Vector2`): small structs travel in
+  registers, larger ones on the stack or through a hidden return pointer. The struct must
+  be flat - no nested structs, arrays, unions, or fields C would pad.
+- Function pointers: `addrof_fn(f)` gives a `usize` you can pass to a C callback parameter.
 - Both directions work: a Hylian `float f(float a, int n)` can be called from C as
   `double f(double, int)`. See `tests/stdlib/ffi_float.*` for a runnable example that calls
   libm and has C call back into Hylian.

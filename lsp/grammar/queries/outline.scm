@@ -23,6 +23,14 @@
     (func_decl
       name: (identifier) @name))) @item
 
+; ── Structs and enums ─────────────────────────────────────────────────────────
+
+(struct_decl
+  name: (identifier) @name) @item
+
+(enum_decl
+  name: (identifier) @name) @item
+
 ; ── Union classes ─────────────────────────────────────────────────────────────
 
 (union_class_decl

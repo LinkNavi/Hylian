@@ -12,79 +12,216 @@ void enc_mov_ri64(X64Buf *b, X64Reg dst, int64_t imm) {
     x64_buf_write64(b, (uint64_t)imm);
 }
 
+/* ---- general memory operand:  [base + idx*scale + disp] ----------------
+   Handles the two ModRM special cases that a fixed "mod=10, rm=base" encoding
+   gets wrong: rsp/r12 as a base need a SIB byte, and rbp/r13 can't use mod=00.
+   disp8 is used when it fits. */
+static void emit_mem_operand(X64Buf *b, int reg, X64Mem m) {
+    int base = m.base;
+    int has_idx = m.idx >= 0;
+    int mod;
+    if (m.disp == 0 && (base & 7) != 5) mod = 0;
+    else if (m.disp >= -128 && m.disp <= 127) mod = 1;
+    else mod = 2;
+    if (has_idx || (base & 7) == 4) {
+        x64_buf_push(b, x64_modrm(mod, reg, 4));
+        int ss = m.scale == 8 ? 3 : m.scale == 4 ? 2 : m.scale == 2 ? 1 : 0;
+        int idxf = has_idx ? (m.idx & 7) : 4;
+        x64_buf_push(b, (uint8_t)((ss << 6) | (idxf << 3) | (base & 7)));
+    } else {
+        x64_buf_push(b, x64_modrm(mod, reg, base));
+    }
+    if (mod == 1) x64_buf_push(b, (uint8_t)(int8_t)m.disp);
+    else if (mod == 2) x64_buf_write32(b, (uint32_t)m.disp);
+}
+
+/* REX for a memory operand; `force` emits it even when it would be 0x40
+   (needed for byte registers sil/dil/... instead of ah/ch/dh/bh). */
+static void emit_rex_mem(X64Buf *b, int w, int reg, X64Mem m, int force) {
+    uint8_t rex = (uint8_t)(0x40 | (w << 3) | (((reg >> 3) & 1) << 2) |
+                            ((m.idx >= 0 ? (m.idx >> 3) & 1 : 0) << 1) | ((m.base >> 3) & 1));
+    if (rex != 0x40 || force) x64_buf_push(b, rex);
+}
+
+X64Mem x64_mem(X64Reg base, int32_t disp) {
+    X64Mem m = { base, -1, 1, disp };
+    return m;
+}
+X64Mem x64_mem_idx(X64Reg base, X64Reg idx, int scale, int32_t disp) {
+    X64Mem m = { base, (int)idx, scale, disp };
+    return m;
+}
+
+void enc_load_mem(X64Buf *b, X64Reg dst, X64Mem m, int size, int is_signed) {
+    switch (size) {
+    case 1:
+        emit_rex_mem(b, 1, dst, m, 1);
+        x64_buf_push(b, 0x0F); x64_buf_push(b, is_signed ? 0xBE : 0xB6);
+        break;
+    case 2:
+        emit_rex_mem(b, 1, dst, m, 1);
+        x64_buf_push(b, 0x0F); x64_buf_push(b, is_signed ? 0xBF : 0xB7);
+        break;
+    case 4:
+        if (is_signed) { emit_rex_mem(b, 1, dst, m, 1); x64_buf_push(b, 0x63); }
+        else           { emit_rex_mem(b, 0, dst, m, 0); x64_buf_push(b, 0x8B); }
+        break;
+    default:
+        emit_rex_mem(b, 1, dst, m, 1); x64_buf_push(b, 0x8B);
+        break;
+    }
+    emit_mem_operand(b, dst, m);
+}
+
+void enc_store_mem(X64Buf *b, X64Mem m, X64Reg src, int size) {
+    switch (size) {
+    case 1: emit_rex_mem(b, 0, src, m, 1); x64_buf_push(b, 0x88); break;
+    case 2: x64_buf_push(b, 0x66); emit_rex_mem(b, 0, src, m, 0); x64_buf_push(b, 0x89); break;
+    case 4: emit_rex_mem(b, 0, src, m, 0); x64_buf_push(b, 0x89); break;
+    default: emit_rex_mem(b, 1, src, m, 1); x64_buf_push(b, 0x89); break;
+    }
+    emit_mem_operand(b, src, m);
+}
+
+void enc_store_imm_mem(X64Buf *b, X64Mem m, int32_t imm, int size) {
+    switch (size) {
+    case 1: emit_rex_mem(b, 0, 0, m, 0); x64_buf_push(b, 0xC6); emit_mem_operand(b, 0, m); x64_buf_push(b, (uint8_t)imm); break;
+    case 2: x64_buf_push(b, 0x66); emit_rex_mem(b, 0, 0, m, 0); x64_buf_push(b, 0xC7); emit_mem_operand(b, 0, m);
+            x64_buf_push(b, (uint8_t)imm); x64_buf_push(b, (uint8_t)(imm >> 8)); break;
+    case 4: emit_rex_mem(b, 0, 0, m, 0); x64_buf_push(b, 0xC7); emit_mem_operand(b, 0, m); x64_buf_write32(b, (uint32_t)imm); break;
+    default: emit_rex_mem(b, 1, 0, m, 1); x64_buf_push(b, 0xC7); emit_mem_operand(b, 0, m); x64_buf_write32(b, (uint32_t)imm); break;
+    }
+}
+
+void enc_lea_m(X64Buf *b, X64Reg dst, X64Mem m) {
+    emit_rex_mem(b, 1, dst, m, 1);
+    x64_buf_push(b, 0x8D);
+    emit_mem_operand(b, dst, m);
+}
+
+/* dst = dst OP [m]  (64-bit) */
+void enc_alu_rm(X64Buf *b, AluOp op, X64Reg dst, X64Mem m) {
+    emit_rex_mem(b, 1, dst, m, 1);
+    x64_buf_push(b, (uint8_t)(op + 2)); /* the r,r/m form of each ALU opcode */
+    emit_mem_operand(b, dst, m);
+}
+
+static int alu_digit(AluOp op) {
+    switch (op) {
+        case ALU_ADD: return 0; case ALU_OR: return 1; case ALU_AND: return 4;
+        case ALU_SUB: return 5; case ALU_XOR: return 6; default: return 7;
+    }
+}
+
+/* [m] = [m] OP imm32  (64-bit) - mainly `cmp qword [spill], imm` */
+void enc_alu_mi(X64Buf *b, AluOp op, X64Mem m, int32_t imm) {
+    emit_rex_mem(b, 1, 0, m, 1);
+    if (imm >= -128 && imm <= 127) {
+        x64_buf_push(b, 0x83); emit_mem_operand(b, alu_digit(op), m); x64_buf_push(b, (uint8_t)(int8_t)imm);
+    } else {
+        x64_buf_push(b, 0x81); emit_mem_operand(b, alu_digit(op), m); x64_buf_write32(b, (uint32_t)imm);
+    }
+}
+
+/* dst = dst OP imm, choosing the short imm8 encoding when it fits */
+void enc_alu_ri(X64Buf *b, AluOp op, X64Reg dst, int32_t imm) {
+    x64_buf_push(b, x64_rex(1, 0, dst));
+    if (imm >= -128 && imm <= 127) {
+        x64_buf_push(b, 0x83);
+        x64_buf_push(b, x64_modrm(3, alu_digit(op), dst));
+        x64_buf_push(b, (uint8_t)(int8_t)imm);
+    } else {
+        x64_buf_push(b, 0x81);
+        x64_buf_push(b, x64_modrm(3, alu_digit(op), dst));
+        x64_buf_write32(b, (uint32_t)imm);
+    }
+}
+
+void enc_test_rr(X64Buf *b, X64Reg a, X64Reg c) {
+    x64_buf_push(b, x64_rex(1, c, a));
+    x64_buf_push(b, 0x85);
+    x64_buf_push(b, x64_modrm(3, c, a));
+}
+
+void enc_xchg_rr(X64Buf *b, X64Reg a, X64Reg c) {
+    x64_buf_push(b, x64_rex(1, c, a));
+    x64_buf_push(b, 0x87);
+    x64_buf_push(b, x64_modrm(3, c, a));
+}
+
+/* dst = dst * [m] */
+void enc_imul_rm(X64Buf *b, X64Reg dst, X64Mem m) {
+    emit_rex_mem(b, 1, dst, m, 1);
+    x64_buf_push(b, 0x0F); x64_buf_push(b, 0xAF);
+    emit_mem_operand(b, dst, m);
+}
+
+/* dst = src * imm32 (three-operand form) */
+void enc_imul_rri(X64Buf *b, X64Reg dst, X64Reg src, int32_t imm) {
+    x64_buf_push(b, x64_rex(1, dst, src));
+    if (imm >= -128 && imm <= 127) {
+        x64_buf_push(b, 0x6B); x64_buf_push(b, x64_modrm(3, dst, src)); x64_buf_push(b, (uint8_t)(int8_t)imm);
+    } else {
+        x64_buf_push(b, 0x69); x64_buf_push(b, x64_modrm(3, dst, src)); x64_buf_write32(b, (uint32_t)imm);
+    }
+}
+
+void enc_imul_rmi(X64Buf *b, X64Reg dst, X64Mem m, int32_t imm) {
+    emit_rex_mem(b, 1, dst, m, 1);
+    if (imm >= -128 && imm <= 127) {
+        x64_buf_push(b, 0x6B); emit_mem_operand(b, dst, m); x64_buf_push(b, (uint8_t)(int8_t)imm);
+    } else {
+        x64_buf_push(b, 0x69); emit_mem_operand(b, dst, m); x64_buf_write32(b, (uint32_t)imm);
+    }
+}
+
+void enc_shift_ri(X64Buf *b, ShiftKind kind, X64Reg reg, int imm) {
+    x64_buf_push(b, x64_rex(1, 0, reg));
+    if (imm == 1) {
+        x64_buf_push(b, 0xD1);
+        x64_buf_push(b, x64_modrm(3, (int)kind, reg));
+    } else {
+        x64_buf_push(b, 0xC1);
+        x64_buf_push(b, x64_modrm(3, (int)kind, reg));
+        x64_buf_push(b, (uint8_t)imm);
+    }
+}
+
+/* idiv/div/neg/not on a memory operand are not needed: callers load the
+   divisor into a register. */
+
+/* dst = imm, with the shortest encoding: xor for 0 (clobbers flags - only use
+   where flags are dead), mov r32,imm32 (zero-extends) for u32, mov r64,simm32
+   for i32, movabs otherwise. */
+void enc_mov_ri(X64Buf *b, X64Reg dst, int64_t imm) {
+    if (imm >= 0 && imm <= 0xFFFFFFFFLL) {
+        if (dst >= 8) x64_buf_push(b, 0x41);
+        x64_buf_push(b, (uint8_t)(0xB8 + (dst & 7)));
+        x64_buf_write32(b, (uint32_t)imm);
+    } else if (imm >= INT32_MIN && imm <= INT32_MAX) {
+        x64_buf_push(b, x64_rex(1, 0, dst));
+        x64_buf_push(b, 0xC7);
+        x64_buf_push(b, x64_modrm(3, 0, dst));
+        x64_buf_write32(b, (uint32_t)imm);
+    } else {
+        enc_mov_ri64(b, dst, imm);
+    }
+}
+
 void enc_mov_load(X64Buf *b, X64Reg dst, X64Reg base, int32_t disp) {
-    x64_buf_push(b, x64_rex(1, dst, base));
-    x64_buf_push(b, 0x8B);
-    x64_buf_push(b, x64_modrm(2, dst, base));
-    x64_buf_write32(b, (uint32_t)disp);
+    enc_load_mem(b, dst, x64_mem(base, disp), 8, 0);
 }
 
 void enc_mov_store(X64Buf *b, X64Reg base, int32_t disp, X64Reg src) {
-    x64_buf_push(b, x64_rex(1, src, base));
-    x64_buf_push(b, 0x89);
-    x64_buf_push(b, x64_modrm(2, src, base));
-    x64_buf_write32(b, (uint32_t)disp);
+    enc_store_mem(b, x64_mem(base, disp), src, 8);
 }
 
 void enc_mov_store_sz(X64Buf *b, X64Reg base, int32_t disp, X64Reg src, int size) {
-    switch (size) {
-    case 1:
-        /* mov r/m8, r8. The REX prefix is emitted unconditionally even when
-           no bit in it is set: without one, encodings 4-7 mean ah/ch/dh/bh
-           rather than spl/bpl/sil/dil, so a store from rsi would silently
-           become a store from dh. A bare 0x40 REX forces the modern reading. */
-        x64_buf_push(b, x64_rex(0, src, base));
-        x64_buf_push(b, 0x88);
-        break;
-    case 2:
-        x64_buf_push(b, 0x66); /* operand-size override: 16-bit */
-        x64_buf_push(b, x64_rex(0, src, base));
-        x64_buf_push(b, 0x89);
-        break;
-    case 4:
-        x64_buf_push(b, x64_rex(0, src, base));
-        x64_buf_push(b, 0x89);
-        break;
-    default:
-        x64_buf_push(b, x64_rex(1, src, base));
-        x64_buf_push(b, 0x89);
-        break;
-    }
-    x64_buf_push(b, x64_modrm(2, src, base));
-    x64_buf_write32(b, (uint32_t)disp);
+    enc_store_mem(b, x64_mem(base, disp), src, size);
 }
 
 void enc_mov_load_sz(X64Buf *b, X64Reg dst, X64Reg base, int32_t disp, int size, int is_signed) {
-    switch (size) {
-    case 1:
-        /* movzx/movsx r64, r/m8 */
-        x64_buf_push(b, x64_rex(1, dst, base));
-        x64_buf_push(b, 0x0F);
-        x64_buf_push(b, is_signed ? 0xBE : 0xB6);
-        break;
-    case 2:
-        x64_buf_push(b, x64_rex(1, dst, base));
-        x64_buf_push(b, 0x0F);
-        x64_buf_push(b, is_signed ? 0xBF : 0xB7);
-        break;
-    case 4:
-        if (is_signed) {
-            x64_buf_push(b, x64_rex(1, dst, base)); /* movsxd r64, r/m32 */
-            x64_buf_push(b, 0x63);
-        } else {
-            /* a 32-bit mov zero-extends into the full 64-bit register, so the
-               plain 32-bit load is already the correct zero-extending form */
-            x64_buf_push(b, x64_rex(0, dst, base));
-            x64_buf_push(b, 0x8B);
-        }
-        break;
-    default:
-        x64_buf_push(b, x64_rex(1, dst, base));
-        x64_buf_push(b, 0x8B);
-        break;
-    }
-    x64_buf_push(b, x64_modrm(2, dst, base));
-    x64_buf_write32(b, (uint32_t)disp);
+    enc_load_mem(b, dst, x64_mem(base, disp), size, is_signed);
 }
 
 size_t enc_lea_rip(X64Buf *b, X64Reg dst) {
@@ -248,10 +385,7 @@ void enc_pop(X64Buf *b, X64Reg reg) {
 }
 
 void enc_lea_mem(X64Buf *b, X64Reg dst, X64Reg base, int32_t disp) {
-    x64_buf_push(b, x64_rex(1, dst, base));
-    x64_buf_push(b, 0x8D);
-    x64_buf_push(b, x64_modrm(2, dst, base)); /* mod=10 -> disp32, safe for any base incl rbp/r13/rsp/r12 */
-    x64_buf_write32(b, (uint32_t)disp);
+    enc_lea_m(b, dst, x64_mem(base, disp));
 }
 
 void enc_ret(X64Buf *b) { x64_buf_push(b, 0xC3); }
@@ -262,6 +396,13 @@ size_t enc_call_rel32(X64Buf *b) {
     size_t off = b->len;
     x64_buf_write32(b, 0);
     return off;
+}
+
+/* call *reg */
+void enc_call_r(X64Buf *b, X64Reg r) {
+    if (r >= 8) x64_buf_push(b, 0x41);
+    x64_buf_push(b, 0xFF);
+    x64_buf_push(b, x64_modrm(3, 2, r & 7));
 }
 
 size_t enc_jmp_rel32(X64Buf *b) {
@@ -456,4 +597,71 @@ void enc_movq_xmm_to_gpr(X64Buf *b, X64Reg dst_gpr, int src_xmm) {
     x64_buf_push(b, x64_rex(1, src_xmm, dst_gpr));
     x64_buf_push(b, 0x0F); x64_buf_push(b, 0x7E);
     x64_buf_push(b, x64_modrm(3, src_xmm, dst_gpr));
+}
+
+/* movaps xmm, xmm - full-register copy, no dependency on the destination's old
+   contents (movsd/movss xmm,xmm merge into it) */
+/* rdx:rax = rax * reg  (one-operand imul / mul) */
+void enc_test_ri(X64Buf *b, X64Reg reg, int32_t imm) {
+    x64_buf_push(b, x64_rex(1, 0, reg));
+    x64_buf_push(b, 0xF7);
+    x64_buf_push(b, x64_modrm(3, 0, reg));
+    x64_buf_write32(b, (uint32_t)imm);
+}
+
+void enc_mul1_r(X64Buf *b, X64Reg reg, int is_signed) {
+    x64_buf_push(b, x64_rex(1, 0, reg));
+    x64_buf_push(b, 0xF7);
+    x64_buf_push(b, x64_modrm(3, is_signed ? 5 : 4, reg));
+}
+
+void enc_cmovcc_rr(X64Buf *b, CondCode cc, X64Reg dst, X64Reg src) {
+    x64_buf_push(b, x64_rex(1, dst, src));
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, (uint8_t)(0x40 | cc));
+    x64_buf_push(b, x64_modrm(3, dst, src));
+}
+
+void enc_cmovcc_rm(X64Buf *b, CondCode cc, X64Reg dst, X64Mem m) {
+    x64_buf_push(b, (uint8_t)(0x48 | (((dst >> 3) & 1) << 2) | ((m.idx >= 0 ? (m.idx >> 3) & 1 : 0) << 1) | ((m.base >> 3) & 1)));
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, (uint8_t)(0x40 | cc));
+    emit_mem_operand(b, dst, m);
+}
+
+void enc_movaps_xx(X64Buf *b, int dst_xmm, int src_xmm) {
+    if ((dst_xmm | src_xmm) >= 8)
+        x64_buf_push(b, x64_rex(0, dst_xmm, src_xmm));
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, 0x28);
+    x64_buf_push(b, x64_modrm(3, dst_xmm, src_xmm));
+}
+
+/* ---- SSE scalar with a general memory operand ---------------------------
+   prefix: 0xF2 (sd) / 0xF3 (ss) / 0x66 / 0 ; opcode: second byte after 0F */
+void enc_sse_rm(X64Buf *b, int prefix, int opcode, int xmm, X64Mem m) {
+    if (prefix) x64_buf_push(b, (uint8_t)prefix);
+    emit_rex_mem(b, 0, xmm, m, 0);
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, (uint8_t)opcode);
+    emit_mem_operand(b, xmm, m);
+}
+
+/* same, rip-relative; returns the offset of the disp32 to relocate */
+size_t enc_sse_rip(X64Buf *b, int prefix, int opcode, int xmm) {
+    if (prefix) x64_buf_push(b, (uint8_t)prefix);
+    if (xmm >= 8) x64_buf_push(b, x64_rex(0, xmm, 0));
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, (uint8_t)opcode);
+    x64_buf_push(b, x64_modrm(0, xmm, 5));
+    size_t off = b->len;
+    x64_buf_write32(b, 0);
+    return off;
+}
+
+void enc_xorps_xx(X64Buf *b, int dst_xmm, int src_xmm) {
+    if ((dst_xmm | src_xmm) >= 8) x64_buf_push(b, x64_rex(0, dst_xmm, src_xmm));
+    x64_buf_push(b, 0x0F);
+    x64_buf_push(b, 0x57);
+    x64_buf_push(b, x64_modrm(3, dst_xmm, src_xmm));
 }

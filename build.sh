@@ -102,9 +102,9 @@ fi
     exit 1
   fi
 
-  run  gcc lex.yy.c parser.tab.c ast.c diag.c ir.c ir_to_mir.c lower.c opt.c codegen_hygen.c typecheck.c compiler.c \
-  -I../hygen/libhymir/include -I../hygen/libhyregalloc/include -I../hygen/libhyx64/include -I../hygen/libhyobj/include \
-  ../hygen/build/libhymir/libhymir.a ../hygen/build/libhyregalloc/libhyregalloc.a \
+  run  gcc lex.yy.c parser.tab.c ast.c diag.c ir.c ir_to_mir.c lower.c opt.c codegen_hygen.c typecheck.c loader.c compiler.c \
+  -I../hygen/libhymir/include -I../hygen/libhyregalloc/include -I../hygen/libhyx64/include -I../hygen/libhyobj/include -I../hygen/libhyopt/include \
+  ../hygen/build/libhyopt/libhyopt.a ../hygen/build/libhymir/libhymir.a ../hygen/build/libhyregalloc/libhyregalloc.a \
   ../hygen/build/libhyx64/libhyx64.a ../hygen/build/libhyobj/libhyobj.a \
   -o ../hylian
 

@@ -2,11 +2,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include "ast.h"
 #include "diag.h"
 
 extern int yylex();
 extern int yylineno;
+
+/* Record the span of the rule being reduced (see ast.c) in addition to
+   computing @$ the usual way. */
+extern int g_loc_l1, g_loc_c1, g_loc_l2, g_loc_c2;
+#define YYLLOC_DEFAULT(Current, Rhs, N)                                        \
+    do {                                                                        \
+        if (N) {                                                                \
+            (Current).first_line   = YYRHSLOC(Rhs, 1).first_line;               \
+            (Current).first_column = YYRHSLOC(Rhs, 1).first_column;             \
+            (Current).last_line    = YYRHSLOC(Rhs, N).last_line;                \
+            (Current).last_column  = YYRHSLOC(Rhs, N).last_column;              \
+        } else {                                                                \
+            (Current).first_line   = (Current).last_line   = YYRHSLOC(Rhs, 0).last_line;   \
+            (Current).first_column = (Current).last_column = YYRHSLOC(Rhs, 0).last_column; \
+        }                                                                       \
+        g_loc_l1 = (Current).first_line;  g_loc_c1 = (Current).first_column;    \
+        g_loc_l2 = (Current).last_line;   g_loc_c2 = (Current).last_column;     \
+    } while (0)
 
 /* Set this to the current source file path before calling yyparse() */
 const char *current_parse_file = "<unknown>";
@@ -66,6 +85,77 @@ static void add_type_alias(char *name, Type t) {
    `break` works, exactly as in C. */
 static int do_while_counter = 0;
 
+/* Bison names tokens like RPAREN and IDENTIFIER; people think in `)` and
+   "an identifier". Turn one token name into something readable. */
+static const char *tok_display(const char *name, char *buf, size_t n) {
+    static const struct { const char *tok, *shown; } tbl[] = {
+        {"LBRACE","'{'"},{"RBRACE","'}'"},{"LPAREN","'('"},{"RPAREN","')'"},
+        {"LBRACKET","'['"},{"RBRACKET","']'"},{"SEMICOLON","';'"},{"COMMA","','"},
+        {"DOT","'.'"},{"QUESTION","'?'"},{"COLON","':'"},{"ASSIGN","'='"},
+        {"DECLARE_ASSIGN","':='"},{"INC","'++'"},{"DEC","'--'"},
+        {"PLUS_ASSIGN","'+='"},{"MINUS_ASSIGN","'-='"},{"STAR_ASSIGN","'*='"},
+        {"SLASH_ASSIGN","'/='"},{"MOD_ASSIGN","'%='"},{"LSHIFT_ASSIGN","'<<='"},
+        {"RSHIFT_ASSIGN","'>>='"},{"AND_ASSIGN","'&='"},{"OR_ASSIGN","'|='"},
+        {"XOR_ASSIGN","'^='"},{"DOTDOT","'..'"},{"DOTDOTEQ","'..='"},
+        {"AND","'&&'"},{"OR","'||'"},{"NOT","'!'"},{"GE","'>='"},{"LE","'<='"},
+        {"EQ","'=='"},{"NE","'!='"},{"GT","'>'"},{"LT","'<'"},{"PLUS","'+'"},
+        {"MINUS","'-'"},{"STAR","'*'"},{"SLASH","'/'"},{"MOD","'%'"},{"PIPE","'|'"},
+        {"AMP","'&'"},{"TILDE","'~'"},{"LSHIFT","'<<'"},{"RSHIFT","'>>'"},
+        {"XOR","'^'"},{"IDENTIFIER","an identifier"},{"NUMBER","a number"},
+        {"FLOAT_LITERAL","a number"},{"STRING_LITERAL","a string"},
+        {"INTERP_STRING","a string"},{"$end","end of file"},{"ASM_BLOCK","an asm block"},
+        {"UNION_KW","'union'"},{"TRUE_LIT","'true'"},{"FALSE_LIT","'false'"},
+        {"NIL","'nil'"},{"STRING","'str'"},{"ERROR","'Error'"},{"ANY_KW","'any'"},
+        {"SIZE_OF","'sizeof'"},{"ADDROF_FN","'addrof_fn'"},{"SECTION_ATTR","'@section'"},
+        {"UMINUS","'-'"},
+        {NULL,NULL}
+    };
+    for (int i = 0; tbl[i].tok; i++)
+        if (strcmp(name, tbl[i].tok) == 0) return tbl[i].shown;
+    /* everything else is a keyword token: WHILE -> 'while' */
+    size_t o = 0;
+    if (o < n) buf[o++] = '\'';
+    for (const char *p = name; *p && o + 2 < n; p++)
+        buf[o++] = (*p >= 'A' && *p <= 'Z') ? (char)(*p - 'A' + 'a') : *p;
+    buf[o++] = '\'';
+    buf[o] = '\0';
+    return buf;
+}
+
+/* "syntax error, unexpected A, expecting B or C" ->
+   "unexpected ')'; expected an identifier or ','" */
+static void pretty_syntax_error(const char *s, char *out, size_t outsz) {
+    const char *un = strstr(s, "unexpected ");
+    if (!un) { snprintf(out, outsz, "%s", s); return; }
+    un += 11;
+    char tokname[64]; size_t k = 0;
+    while (un[k] && un[k] != ',' && k + 1 < sizeof(tokname)) { tokname[k] = un[k]; k++; }
+    tokname[k] = '\0';
+    char tb[80];
+    int n = snprintf(out, outsz, "unexpected %s", tok_display(tokname, tb, sizeof(tb)));
+    const char *ex = strstr(un, "expecting ");
+    if (!ex) return;
+    ex += 10;
+    /* split on " or " */
+    char list[512]; snprintf(list, sizeof(list), "%s", ex);
+    char *parts[8]; int np = 0;
+    char *p = list;
+    while (p && np < 8) {
+        parts[np++] = p;
+        char *nx = strstr(p, " or ");
+        if (nx) { *nx = '\0'; p = nx + 4; } else p = NULL;
+    }
+    if (n < (int)outsz) n += snprintf(out + n, outsz - n, "; expected ");
+    for (int i = 0; i < np && n < (int)outsz; i++) {
+        char b2[80];
+        n += snprintf(out + n, outsz - n, "%s%s", i == 0 ? "" : (i == np - 1 ? " or " : ", "),
+                      tok_display(parts[i], b2, sizeof(b2)));
+    }
+}
+
+extern int lex_tok_col, lex_tok_len, lex_tok_line, lex_tok_first;
+extern int lex_prev_line, lex_prev_end_col, lex_prev_last;
+
 void yyerror(const char *s) {
     /* Hint logic — inspect the Bison-generated message for common patterns */
     const char *hint = NULL;
@@ -104,10 +194,32 @@ void yyerror(const char *s) {
         hint = "double-check the statement for missing semicolons, mismatched brackets, or incorrect type syntax";
     }
 
+    char pretty[512];
+    pretty_syntax_error(s, pretty, sizeof(pretty));
+    char msg[600];
+    if (strncmp(s, "syntax error", 12) == 0) snprintf(msg, sizeof(msg), "syntax error: %s", pretty);
+    else                                     snprintf(msg, sizeof(msg), "%s", s);
+
     /* Routed through the shared sink rather than printed here directly, so the
        same parser can serve the CLI (colour on stderr) and the LSP (structured
-       diagnostics with positions) — see diag.h. */
-    diag_emit(DIAG_ERROR, current_parse_file, yylineno, -1, hint, "%s", s);
+       diagnostics with positions) - see diag.h. The lookahead token that
+       tripped the parser is the one to underline. */
+    /* `int y = 3` NEWLINE `return y;` - the parser only notices at the next
+       line's first token, but the mistake is the missing `;` where the
+       previous line ended (this is where clang points too). */
+    int prev_ends_expr = lex_prev_last && (isalnum((unsigned char)lex_prev_last) || lex_prev_last == '_' ||
+                         lex_prev_last == ')' || lex_prev_last == ']' || lex_prev_last == '"' || lex_prev_last == '\'');
+    int starts_stmt = lex_tok_first && (isalpha((unsigned char)lex_tok_first) || lex_tok_first == '_' ||
+                       lex_tok_first == '*' || lex_tok_first == '{');
+    if (strncmp(s, "syntax error", 12) == 0 && lex_prev_line > 0 && lex_prev_line < lex_tok_line &&
+        prev_ends_expr && starts_stmt && lex_tok_first != '{') {
+        diag_set_span(1);
+        diag_emit(DIAG_ERROR, current_parse_file, lex_prev_line, lex_prev_end_col, NULL,
+                  "syntax error: expected ';' at the end of this statement");
+        return;
+    }
+    diag_set_span(lex_tok_len);
+    diag_emit(DIAG_ERROR, current_parse_file, lex_tok_line, lex_tok_col, hint, "%s", msg);
 }
 
 
@@ -197,6 +309,7 @@ void typelist_add(TypeList* l, Type t) {
 
 %code requires { #include "ast.h" }
 
+%locations
 %define parse.error verbose
 
 /* The two reduce/reduce conflicts are `Foo ? x ...` at the start of a
@@ -328,8 +441,8 @@ program:
     }
     /* plain top-level variable: `int counter = 0;` is `static int counter = 0;` */
     | program type IDENTIFIER ASSIGN expr SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $2; sv->var_name = $3; sv->initializer = $5;
         sv->is_const = 0; sv->array_size = 0;
@@ -433,8 +546,8 @@ section_attr:
 
 static_var_decl:
     STATIC type IDENTIFIER ASSIGN expr SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $2;
         sv->var_name = $3;
@@ -444,8 +557,8 @@ static_var_decl:
         $$ = (ASTNode*)sv;
     }
     | STATIC type IDENTIFIER SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $2;
         sv->var_name = $3;
@@ -455,8 +568,8 @@ static_var_decl:
         $$ = (ASTNode*)sv;
     }
     | PUBLIC STATIC type IDENTIFIER ASSIGN expr SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $3;
         sv->var_name = $4;
@@ -466,8 +579,8 @@ static_var_decl:
         $$ = (ASTNode*)sv;
     }
     | PUBLIC STATIC type IDENTIFIER SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $3;
         sv->var_name = $4;
@@ -477,8 +590,8 @@ static_var_decl:
         $$ = (ASTNode*)sv;
     }
     | CONST type IDENTIFIER ASSIGN expr SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $2; sv->var_name = $3; sv->initializer = $5;
         sv->is_const = 1; sv->array_size = 0;
@@ -486,8 +599,8 @@ static_var_decl:
         $$ = (ASTNode*)sv;
     }
     | PUBLIC CONST type IDENTIFIER ASSIGN expr SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $3; sv->var_name = $4; sv->initializer = $6;
         sv->is_const = 1; sv->array_size = 0;
@@ -495,8 +608,8 @@ static_var_decl:
         $$ = (ASTNode*)sv;
     }
     | STATIC type IDENTIFIER LBRACKET NUMBER RBRACKET SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $2; sv->var_name = $3;
         sv->initializer = NULL; sv->is_const = 0; sv->array_size = (int)$5;
@@ -504,8 +617,8 @@ static_var_decl:
         $$ = (ASTNode*)sv;
     }
     | PUBLIC STATIC type IDENTIFIER LBRACKET NUMBER RBRACKET SEMICOLON {
-        StaticVarNode *sv = malloc(sizeof(StaticVarNode));
-        sv->base.type = NODE_STATIC_VAR;
+        StaticVarNode *sv = calloc(1, sizeof(StaticVarNode));
+        sv->base.type = NODE_STATIC_VAR; ast_stamp(&sv->base);
         memset(&sv->base.resolved_type, 0, sizeof(Type));
         sv->var_type = $3; sv->var_name = $4;
         sv->initializer = NULL; sv->is_const = 0; sv->array_size = (int)$6;
@@ -1052,8 +1165,8 @@ stmt:
     | BREAK SEMICOLON    { $$ = (ASTNode*)make_break(); }
     | CONTINUE SEMICOLON { $$ = (ASTNode*)make_continue(); }
     | ASM_BLOCK {
-        AsmBlockNode *ab = malloc(sizeof(AsmBlockNode));
-        ab->base.type = NODE_ASM_BLOCK;
+        AsmBlockNode *ab = calloc(1, sizeof(AsmBlockNode));
+        ab->base.type = NODE_ASM_BLOCK; ast_stamp(&ab->base);
         ab->base.resolved_type.kind = TYPE_SIMPLE;
         ab->base.resolved_type.nullable = 0;
         ab->base.resolved_type.name = NULL;
@@ -1251,8 +1364,8 @@ var_decl:
     /* struct literal with the type name inferred from the declared type:
        `Color bleh = { r: 1, ... };` instead of `Color bleh = Color { ... };` */
     | type IDENTIFIER ASSIGN LBRACE field_init_list RBRACE SEMICOLON {
-        StructLiteralNode *sl = malloc(sizeof(StructLiteralNode));
-        sl->base.type = NODE_STRUCT_LITERAL;
+        StructLiteralNode *sl = calloc(1, sizeof(StructLiteralNode));
+        sl->base.type = NODE_STRUCT_LITERAL; ast_stamp(&sl->base);
         memset(&sl->base.resolved_type, 0, sizeof(Type));
         sl->class_name = strdup($1.name ? $1.name : "");
         NodeList *fl = (NodeList*)$5;
@@ -1408,8 +1521,8 @@ expr:
     | LPAREN expr RPAREN { $$ = $2; }
     /* struct literal: ClassName { field: value, ... } */
     | IDENTIFIER LBRACE field_init_list RBRACE {
-        StructLiteralNode *sl = malloc(sizeof(StructLiteralNode));
-        sl->base.type = NODE_STRUCT_LITERAL;
+        StructLiteralNode *sl = calloc(1, sizeof(StructLiteralNode));
+        sl->base.type = NODE_STRUCT_LITERAL; ast_stamp(&sl->base);
         memset(&sl->base.resolved_type, 0, sizeof(Type));
         sl->class_name = $1;
         NodeList *fl = (NodeList*)$3;

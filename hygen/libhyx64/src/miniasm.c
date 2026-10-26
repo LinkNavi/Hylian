@@ -15,6 +15,7 @@ typedef struct {
     OperandKind kind;
     X64Reg  reg;      /* OPK_REG, and OPK_MEM's base */
     int64_t imm;      /* OPK_IMM, and OPK_MEM's disp */
+    int     size;     /* OPK_MEM: byte width from a qword/dword/word/byte prefix, 0 = unspecified */
     char    label[64]; /* OPK_LABEL */
 } Operand;
 
@@ -67,6 +68,17 @@ static int parse_int(const char *s, int64_t *out) {
 static Operand parse_operand(char *tok, char *errbuf, size_t errcap) {
     Operand op = {0};
     tok = trim(tok);
+    {   /* `qword [rbp - 8]` etc: a width prefix on a memory operand */
+        static const struct { const char *w; int n; } pf[] = { {"qword", 8}, {"dword", 4}, {"word", 2}, {"byte", 1} };
+        for (int k = 0; k < 4; k++) {
+            size_t l = strlen(pf[k].w);
+            if (strncasecmp(tok, pf[k].w, l) == 0 && (tok[l] == ' ' || tok[l] == '\t' || tok[l] == '[')) {
+                char *rest = trim(tok + l);
+                if (*rest == '[') { tok = rest; op.size = pf[k].n; }
+                break;
+            }
+        }
+    }
     if (*tok == '[') {
         char *close = strchr(tok, ']');
         if (!close) { snprintf(errbuf, errcap, "unterminated '[' in operand: %s", tok); op.kind = OPK_NONE; return op; }
@@ -259,6 +271,11 @@ int miniasm_assemble(const char *text, X64Buf *out, X64RelocList *out_relocs,
                 enc_mov_load(out, ops[0].reg, ops[1].reg, (int32_t)ops[1].imm);
             } else if (NEED_MEM(ops[0]) && NEED_REG(ops[1])) {
                 enc_mov_store(out, ops[0].reg, (int32_t)ops[0].imm, ops[1].reg);
+            } else if (NEED_MEM(ops[0]) && NEED_IMM(ops[1]) &&
+                       ops[1].imm >= INT32_MIN && ops[1].imm <= INT32_MAX) {
+                /* mov qword [base+disp], imm32 (sign-extended to 64 bits) */
+                enc_store_imm_mem(out, x64_mem(ops[0].reg, (int32_t)ops[0].imm), (int32_t)ops[1].imm,
+                                  ops[0].size ? ops[0].size : 8);
             } else {
                 ERR("unsupported mov operand combination");
             }

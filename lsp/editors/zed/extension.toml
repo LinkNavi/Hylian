@@ -12,7 +12,7 @@ version = "0.3.0"
 
 [grammars.hylian]
 repository = "https://github.com/LinkNavi/tree-sitter-hylian"
-rev = "e164c26d2023d65ab0fb081857ae34d1db18fe70"
+rev = "033463465bf7b9896b323f2c404707ce4d47788c"
 
 [language_servers.hylian-lsp]
 language = "Hylian"

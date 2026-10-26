@@ -294,6 +294,10 @@
         {
           "type": "SYMBOL",
           "name": "string_literal"
+        },
+        {
+          "type": "STRING",
+          "value": ";"
         }
       ]
     },
@@ -1175,8 +1179,17 @@
           "type": "CHOICE",
           "members": [
             {
-              "type": "STRING",
-              "value": "public"
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "static"
+                },
+                {
+                  "type": "STRING",
+                  "value": "public"
+                }
+              ]
             },
             {
               "type": "BLANK"

@@ -1,4 +1,5 @@
 #include "hyregalloc.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -32,11 +33,12 @@ typedef struct {
     int use_src1, use_src2;
 } OpShape;
 
-static OpShape op_shape(MIROp op) {
+static OpShape op_shape(const MIRInstr *ins) {
     OpShape s = {1, 0, 1, 1}; /* default: dest=def, src1/src2=use */
-    switch (op) {
+    switch (ins->op) {
     case MIR_STORE:
-        s.has_def = 0; s.dest_is_use = 1; s.use_src1 = 1; s.use_src2 = 0;
+        /* src2 is the index of a scaled address, a read only when mem_scale is set */
+        s.has_def = 0; s.dest_is_use = 1; s.use_src1 = 1; s.use_src2 = ins->mem_scale != 0;
         break;
     case MIR_LABEL: case MIR_JMP:
         s.has_def = 0; s.use_src1 = 0; s.use_src2 = 0;
@@ -45,7 +47,7 @@ static OpShape op_shape(MIROp op) {
         s.has_def = 0; s.use_src1 = 1; s.use_src2 = 0;
         break;
     case MIR_CALL:
-        s.use_src1 = 0; s.use_src2 = 0; /* args[] handled separately */
+        s.use_src1 = 1; s.use_src2 = 0; /* args[] handled separately; src1 is the target of an indirect call (NONE otherwise) */
         break;
     case MIR_ASM_TEXT:
         s.has_def = 0; s.use_src1 = 0; s.use_src2 = 0; /* args[] handled separately, no dest in v1 */
@@ -71,7 +73,7 @@ static OpShape op_shape(MIROp op) {
     case MIR_NOP: case MIR_ASM_RAW:
         s.has_def = 0; s.use_src1 = 0; s.use_src2 = 0;
         break;
-    case MIR_LEA_LOCAL: case MIR_LEA_GLOBAL: case MIR_ALLOCA_LOCAL:
+    case MIR_LEA_LOCAL: case MIR_LEA_GLOBAL: case MIR_ALLOCA_LOCAL: case MIR_GETPARAM:
         s.use_src1 = 0; s.use_src2 = 0; /* src1 is a global/label name, not a vreg use */
         break;
     default:
@@ -173,42 +175,47 @@ static void cfg_free(CFG *cfg) {
     free(cfg->instr_block);
 }
 
-/* ---- liveness: classic backward dataflow to a fixpoint ---- */
+/* ---- liveness: classic backward dataflow to a fixpoint (bit-packed) ---- */
 
 typedef struct {
-    unsigned char *use; /* use[B][v] */
-    unsigned char *def;
-    unsigned char *live_in;
-    unsigned char *live_out;
+    int      words;      /* 64-bit words per block row */
+    uint64_t *use;       /* use[B]: read before written in B */
+    uint64_t *def;
+    uint64_t *live_in;
+    uint64_t *live_out;
 } Liveness;
+
+static inline int  lbit(const uint64_t *r, int v) { return (int)((r[v >> 6] >> (v & 63)) & 1); }
+static inline void lset(uint64_t *r, int v) { r[v >> 6] |= (uint64_t)1 << (v & 63); }
 
 static Liveness compute_liveness(const MIRFunc *fn, const CFG *cfg, int nvregs) {
     Liveness lv;
-    size_t sz = (size_t)cfg->block_count * nvregs;
-    lv.use = calloc(sz, 1);
-    lv.def = calloc(sz, 1);
-    lv.live_in = calloc(sz, 1);
-    lv.live_out = calloc(sz, 1);
+    lv.words = (nvregs + 63) / 64;
+    size_t sz = (size_t)cfg->block_count * lv.words;
+    lv.use = calloc(sz, sizeof(uint64_t));
+    lv.def = calloc(sz, sizeof(uint64_t));
+    lv.live_in = calloc(sz, sizeof(uint64_t));
+    lv.live_out = calloc(sz, sizeof(uint64_t));
 
     for (int bi = 0; bi < cfg->block_count; bi++) {
-        unsigned char *use_b = lv.use + (size_t)bi * nvregs;
-        unsigned char *def_b = lv.def + (size_t)bi * nvregs;
+        uint64_t *use_b = lv.use + (size_t)bi * lv.words;
+        uint64_t *def_b = lv.def + (size_t)bi * lv.words;
         Block *blk = &cfg->blocks[bi];
         for (int i = blk->start; i < blk->end; i++) {
             const MIRInstr *ins = &fn->instrs[i];
-            OpShape sh = op_shape(ins->op);
+            OpShape sh = op_shape(ins);
             /* uses first (before this instr's own def clobbers it) */
-            if (sh.use_src1 && ins->src1.kind == MIRV_VREG && !def_b[ins->src1.vreg])
-                use_b[ins->src1.vreg] = 1;
-            if (sh.use_src2 && ins->src2.kind == MIRV_VREG && !def_b[ins->src2.vreg])
-                use_b[ins->src2.vreg] = 1;
-            if (sh.dest_is_use && ins->dest.kind == MIRV_VREG && !def_b[ins->dest.vreg])
-                use_b[ins->dest.vreg] = 1;
+            if (sh.use_src1 && ins->src1.kind == MIRV_VREG && !lbit(def_b, ins->src1.vreg))
+                lset(use_b, ins->src1.vreg);
+            if (sh.use_src2 && ins->src2.kind == MIRV_VREG && !lbit(def_b, ins->src2.vreg))
+                lset(use_b, ins->src2.vreg);
+            if (sh.dest_is_use && ins->dest.kind == MIRV_VREG && !lbit(def_b, ins->dest.vreg))
+                lset(use_b, ins->dest.vreg);
             for (int a = 0; a < ins->arg_count; a++)
-                if (ins->args[a].kind == MIRV_VREG && !def_b[ins->args[a].vreg])
-                    use_b[ins->args[a].vreg] = 1;
+                if (ins->args[a].kind == MIRV_VREG && !lbit(def_b, ins->args[a].vreg))
+                    lset(use_b, ins->args[a].vreg);
             if (sh.has_def && ins->dest.kind == MIRV_VREG)
-                def_b[ins->dest.vreg] = 1;
+                lset(def_b, ins->dest.vreg);
         }
     }
 
@@ -216,25 +223,18 @@ static Liveness compute_liveness(const MIRFunc *fn, const CFG *cfg, int nvregs) 
     while (changed) {
         changed = 0;
         for (int bi = cfg->block_count - 1; bi >= 0; bi--) {
-            unsigned char *out_b = lv.live_out + (size_t)bi * nvregs;
-            unsigned char *in_b  = lv.live_in  + (size_t)bi * nvregs;
-            unsigned char *use_b = lv.use      + (size_t)bi * nvregs;
-            unsigned char *def_b = lv.def      + (size_t)bi * nvregs;
+            uint64_t *out_b = lv.live_out + (size_t)bi * lv.words;
+            uint64_t *in_b  = lv.live_in  + (size_t)bi * lv.words;
+            uint64_t *use_b = lv.use      + (size_t)bi * lv.words;
+            uint64_t *def_b = lv.def      + (size_t)bi * lv.words;
             Block *blk = &cfg->blocks[bi];
-
-            unsigned char *new_out = calloc(nvregs, 1);
             for (int s = 0; s < blk->succ_count; s++) {
-                unsigned char *succ_in = lv.live_in + (size_t)blk->succ[s] * nvregs;
-                for (int v = 0; v < nvregs; v++) if (succ_in[v]) new_out[v] = 1;
+                uint64_t *succ_in = lv.live_in + (size_t)blk->succ[s] * lv.words;
+                for (int w = 0; w < lv.words; w++) out_b[w] |= succ_in[w];
             }
-            for (int v = 0; v < nvregs; v++) {
-                if (new_out[v] != out_b[v]) { changed = 1; out_b[v] = new_out[v]; }
-            }
-            free(new_out);
-
-            for (int v = 0; v < nvregs; v++) {
-                unsigned char new_in = use_b[v] || (out_b[v] && !def_b[v]);
-                if (new_in != in_b[v]) { changed = 1; in_b[v] = new_in; }
+            for (int w = 0; w < lv.words; w++) {
+                uint64_t ni = use_b[w] | (out_b[w] & ~def_b[w]);
+                if (ni != in_b[w]) { in_b[w] = ni; changed = 1; }
             }
         }
     }
@@ -253,6 +253,9 @@ typedef struct {
     int start, end;
     int is_float;
     int crosses_call;   /* live range spans a call -> caller-saved regs are unsafe */
+    double weight;      /* uses+defs, each scaled by 8^(loop depth): what spilling would cost */
+    unsigned forbid;    /* integer registers (pool ids) some instruction inside the range clobbers */
+    int pref;           /* preferred register id (coalescing / ABI hint), -1 = none */
 } Interval;
 
 /* Any instruction that executes a `call`-like transfer and therefore destroys
@@ -260,7 +263,8 @@ typedef struct {
    instruction itself clobbers rcx and r11, and the kernel is free to touch
    the caller-saved set. */
 static int op_clobbers_caller_saved(MIROp op) {
-    return op == MIR_CALL || op == MIR_SYSCALL;
+    /* rep stos/movs consume rdi/rsi/rcx, which are (or overlap) allocatable */
+    return op == MIR_CALL || op == MIR_SYSCALL || op == MIR_MEMSET || op == MIR_MEMCPY;
 }
 
 static void extend(int *start, int *end, int pos) {
@@ -268,8 +272,41 @@ static void extend(int *start, int *end, int pos) {
     if (pos > *end) *end = pos;
 }
 
+/* Loop nesting depth of every instruction, from backward jumps (structured
+   code: a jump back to a label at or before it encloses everything between). */
+static int *compute_depth(const MIRFunc *fn) {
+    int n = fn->count;
+    int *depth = calloc(n + 1, sizeof(int));
+    int maxl = -1;
+    for (int i = 0; i < n; i++)
+        if (fn->instrs[i].op == MIR_LABEL && fn->instrs[i].dest.label_id > maxl) maxl = fn->instrs[i].dest.label_id;
+    if (maxl < 0) return depth;
+    int *lpos = malloc((maxl + 1) * sizeof(int));
+    for (int i = 0; i <= maxl; i++) lpos[i] = -1;
+    for (int i = 0; i < n; i++) if (fn->instrs[i].op == MIR_LABEL) lpos[fn->instrs[i].dest.label_id] = i;
+    for (int j = 0; j < n; j++) {
+        MIROp op = fn->instrs[j].op;
+        if (op != MIR_JMP && op != MIR_JMP_IF && op != MIR_JMP_UNLESS) continue;
+        int l = fn->instrs[j].dest.label_id;
+        if (l < 0 || l > maxl || lpos[l] < 0 || lpos[l] > j) continue;
+        for (int k = lpos[l]; k <= j; k++) depth[k]++;
+    }
+    free(lpos);
+    return depth;
+}
+
+static double depth_weight(int d) {
+    double w = 1;
+    for (int i = 0; i < d && i < 6; i++) w *= 8;
+    return w;
+}
+
 static Interval *compute_intervals(const MIRFunc *fn, const CFG *cfg, const Liveness *lv,
-                                    int nvregs, int *out_count) {
+                                    int nvregs, int *out_count, const RegAllocTarget *target) {
+    int *depth = compute_depth(fn);
+    double *weight = calloc(nvregs, sizeof(double));
+    int *pref = malloc(nvregs * sizeof(int));
+    for (int v = 0; v < nvregs; v++) pref[v] = -1;
     int *start = malloc(nvregs * sizeof(int));
     int *end   = malloc(nvregs * sizeof(int));
     int *is_float = calloc(nvregs, sizeof(int));
@@ -277,15 +314,45 @@ static Interval *compute_intervals(const MIRFunc *fn, const CFG *cfg, const Live
 
     for (int bi = 0; bi < cfg->block_count; bi++) {
         Block *blk = &cfg->blocks[bi];
-        unsigned char *in_b  = lv->live_in  + (size_t)bi * nvregs;
-        unsigned char *out_b = lv->live_out + (size_t)bi * nvregs;
-        for (int v = 0; v < nvregs; v++) {
-            if (in_b[v])  extend(&start[v], &end[v], blk->start);
-            if (out_b[v]) extend(&start[v], &end[v], blk->end - 1);
+        const uint64_t *in_b  = lv->live_in  + (size_t)bi * lv->words;
+        const uint64_t *out_b = lv->live_out + (size_t)bi * lv->words;
+        for (int w = 0; w < lv->words; w++) {
+            for (uint64_t m = in_b[w]; m; m &= m - 1) {
+                int v = w * 64 + __builtin_ctzll(m);
+                if (v < nvregs) extend(&start[v], &end[v], blk->start);
+            }
+            for (uint64_t m = out_b[w]; m; m &= m - 1) {
+                int v = w * 64 + __builtin_ctzll(m);
+                if (v < nvregs) extend(&start[v], &end[v], blk->end - 1);
+            }
         }
         for (int i = blk->start; i < blk->end; i++) {
             const MIRInstr *ins = &fn->instrs[i];
-            OpShape sh = op_shape(ins->op);
+            OpShape sh = op_shape(ins);
+            {
+                double w = depth_weight(depth[i]);
+                if (sh.use_src1 && ins->src1.kind == MIRV_VREG) weight[ins->src1.vreg] += w;
+                if (sh.use_src2 && ins->src2.kind == MIRV_VREG) weight[ins->src2.vreg] += w;
+                if ((sh.dest_is_use || sh.has_def) && ins->dest.kind == MIRV_VREG) weight[ins->dest.vreg] += w;
+                for (int a = 0; a < ins->arg_count; a++)
+                    if (ins->args[a].kind == MIRV_VREG) weight[ins->args[a].vreg] += w;
+                /* register hints */
+                if (ins->op == MIR_MOV && ins->dest.kind == MIRV_VREG && ins->src1.kind == MIRV_VREG) {
+                    /* dest and source like to share a register (the move vanishes) */
+                    if (pref[ins->dest.vreg] < 0) pref[ins->dest.vreg] = -2 - ins->src1.vreg;   /* encoded: follow src */
+                    if (pref[ins->src1.vreg] < 0) pref[ins->src1.vreg] = -2 - ins->dest.vreg;
+                }
+                if (ins->op == MIR_CALL && !ins->arg_aggr) {
+                    for (int a = 0; a < ins->arg_count && a < 6; a++)
+                        if (ins->args[a].kind == MIRV_VREG && target->arg_regs[a] >= 0 &&
+                            !mir_type_is_float(ins->args[a].type) && pref[ins->args[a].vreg] < 0)
+                            pref[ins->args[a].vreg] = target->arg_regs[a];
+                }
+                if (ins->op == MIR_GETPARAM && ins->dest.kind == MIRV_VREG && ins->extra_int < 6 &&
+                    !mir_type_is_float(ins->dest.type) &&
+                    target->arg_regs[ins->extra_int] >= 0 && pref[ins->dest.vreg] < 0)
+                    pref[ins->dest.vreg] = target->arg_regs[ins->extra_int];
+            }
             if (sh.use_src1 && ins->src1.kind == MIRV_VREG) {
                 extend(&start[ins->src1.vreg], &end[ins->src1.vreg], i);
                 if (mir_type_is_float(ins->src1.type)) is_float[ins->src1.vreg] = 1;
@@ -320,6 +387,18 @@ static Interval *compute_intervals(const MIRFunc *fn, const CFG *cfg, const Live
     for (int i = 0; i < fn->count; i++)
         calls_before[i + 1] = calls_before[i] + (op_clobbers_caller_saved(fn->instrs[i].op) ? 1 : 0);
 
+    /* prefix counts of instructions clobbering each integer register */
+    int nregs = target->num_int_regs > 32 ? 32 : target->num_int_regs;
+    int *clob_prefix = NULL;
+    if (target->clobber_mask && nregs > 0) {
+        clob_prefix = calloc((size_t)(fn->count + 1) * nregs, sizeof(int));
+        for (int i = 0; i < fn->count; i++) {
+            unsigned m = target->clobber_mask(&fn->instrs[i]);
+            for (int r = 0; r < nregs; r++)
+                clob_prefix[(size_t)(i + 1) * nregs + r] = clob_prefix[(size_t)i * nregs + r] + ((m >> r) & 1);
+        }
+    }
+
     Interval *intervals = malloc(nvregs * sizeof(Interval));
     int count = 0;
     for (int v = 0; v < nvregs; v++) {
@@ -331,10 +410,18 @@ static Interval *compute_intervals(const MIRFunc *fn, const CFG *cfg, const Live
         /* calls in the open interval (start, end) */
         intervals[count].crosses_call =
             (end[v] > start[v]) && (calls_before[end[v]] - calls_before[start[v] + 1] > 0);
+        intervals[count].weight = weight[v];
+        intervals[count].pref = pref[v];
+        intervals[count].forbid = 0;
+        if (clob_prefix && end[v] > start[v] + 1)
+            for (int r = 0; r < nregs; r++)
+                if (clob_prefix[(size_t)end[v] * nregs + r] - clob_prefix[(size_t)(start[v] + 1) * nregs + r] > 0)
+                    intervals[count].forbid |= 1u << r;
         count++;
     }
     free(calls_before);
     free(start); free(end); free(is_float);
+    free(depth); free(weight); free(pref); free(clob_prefix);
     *out_count = count;
     return intervals;
 }
@@ -343,110 +430,119 @@ static int cmp_by_start(const void *a, const void *b) {
     return ((const Interval *)a)->start - ((const Interval *)b)->start;
 }
 
-/* ---- linear scan (Poletto-Sarkar), run once per register class ---- */
+/* ---- linear scan (Poletto-Sarkar), run once per register class ----
+   Differences from the textbook version:
+   - When registers run out the victim is the interval that is cheapest to
+     keep in memory - fewest (loop-depth weighted) uses per instruction of
+     life - not merely the one that ends last, so loop variables win over
+     values that are idle for most of the function.
+   - Intervals carry a register hint (a move partner, or the ABI register they
+     are passed in) which is honoured when that register happens to be free. */
 
 typedef struct {
     Interval  iv;
-    int       reg;      /* assigned register id, -1 if spilled */
+    int       reg;      /* assigned register id */
 } Active;
 
+static double density(const Interval *iv) {
+    return iv->weight / (double)(iv->end - iv->start + 1);
+}
+
+static unsigned g_cs_mask;   /* callee-saved registers used by the class being allocated */
+
+static void set_reg(MCLoc *locs, unsigned char *assigned, const Interval *iv, int reg, int is_float_class,
+                    int num_callee_saved, int *callee_saved_used) {
+    locs[iv->vreg].kind = MCLOC_REG;
+    locs[iv->vreg].is_float = is_float_class;
+    locs[iv->vreg].reg_id = reg;
+    assigned[iv->vreg] = 1;
+    if (reg < num_callee_saved) g_cs_mask |= 1u << reg;
+    if (reg < num_callee_saved && reg + 1 > *callee_saved_used) *callee_saved_used = reg + 1;
+}
+
 static void linear_scan_class(Interval *intervals, int n, int num_regs,
-                               MCLoc *out_locs, int is_float_class, int *spill_count,
-                               int num_callee_saved, int *callee_saved_used) {
+                               MCLoc *out_locs, unsigned char *assigned, int is_float_class,
+                               int *spill_count, int num_callee_saved, int *callee_saved_used,
+                               const int *order) {
     if (n == 0) return;
     qsort(intervals, n, sizeof(Interval), cmp_by_start);
 
-    Active *active = malloc(num_regs > 0 ? num_regs * sizeof(Active) : sizeof(Active));
+    Active *active = malloc((num_regs > 0 ? num_regs : 1) * sizeof(Active));
     int active_count = 0;
-    int *free_regs = malloc(num_regs * sizeof(int));
+    int *free_regs = malloc((num_regs > 0 ? num_regs : 1) * sizeof(int));
     int free_count = num_regs;
-    /* Hand out the *caller-saved* ids first (they're the tail of the pool) so
-       the scarce callee-saved ones stay available for the values that actually
-       need them, and so functions that never carry anything across a call
-       don't pay for saving/restoring registers they didn't need. free_regs is
-       popped from the top, so push callee-saved at the bottom. */
+    /* free_regs is popped from the top: keep the caller-saved ids there so the
+       scarce callee-saved ones stay available for values that cross calls */
     for (int i = 0; i < num_regs; i++) free_regs[i] = num_regs - 1 - i;
     int next_spill = 0;
 
     for (int i = 0; i < n; i++) {
         Interval cur = intervals[i];
 
-        /* expire intervals that have ended before cur starts */
         for (int a = 0; a < active_count; ) {
             if (active[a].iv.end < cur.start) {
-                if (active[a].reg >= 0) free_regs[free_count++] = active[a].reg;
+                free_regs[free_count++] = active[a].reg;
                 active[a] = active[--active_count];
             } else {
                 a++;
             }
         }
 
-        /* A value live across a call can only sit in a callee-saved register.
-           Look for a free one specifically; if the class has none (SysV has no
-           callee-saved xmm) or they're all taken, fall through to spilling -
-           the stack is the only other place a value can survive a call. */
-        if (cur.crosses_call) {
-            int pick = -1;
-            for (int f = free_count - 1; f >= 0; f--) {
-                if (free_regs[f] < num_callee_saved) { pick = f; break; }
-            }
-            if (pick >= 0 && active_count < num_regs) {
-                int reg = free_regs[pick];
-                free_regs[pick] = free_regs[--free_count];
-                out_locs[cur.vreg].kind = MCLOC_REG;
-                out_locs[cur.vreg].is_float = is_float_class;
-                out_locs[cur.vreg].reg_id = reg;
-                if (reg + 1 > *callee_saved_used) *callee_saved_used = reg + 1;
-                active[active_count].iv = cur;
-                active[active_count].reg = reg;
-                active_count++;
-            } else {
-                out_locs[cur.vreg].kind = MCLOC_SPILL;
-                out_locs[cur.vreg].is_float = is_float_class;
-                out_locs[cur.vreg].spill_slot = next_spill++;
-            }
-            continue;
+        /* --- pick a free register, honouring the hint --- */
+        int pick = -1;                       /* index into free_regs */
+        int want = -1;
+        if (cur.pref >= 0) want = cur.pref;
+        else if (cur.pref <= -2) {
+            int partner = -2 - cur.pref;
+            if (assigned[partner] && out_locs[partner].kind == MCLOC_REG &&
+                out_locs[partner].is_float == is_float_class)
+                want = out_locs[partner].reg_id;
         }
-
-        if (active_count < num_regs && free_count > 0) {
-            int reg = free_regs[--free_count];
-            out_locs[cur.vreg].kind = MCLOC_REG;
-            out_locs[cur.vreg].is_float = is_float_class;
-            out_locs[cur.vreg].reg_id = reg;
-            if (reg < num_callee_saved && reg + 1 > *callee_saved_used)
-                *callee_saved_used = reg + 1;
+        if (want >= 0 && want < num_regs && (!cur.crosses_call || want < num_callee_saved) &&
+            !((cur.forbid >> want) & 1)) {
+            for (int f = 0; f < free_count; f++) if (free_regs[f] == want) { pick = f; break; }
+        }
+        if (pick < 0) {
+            /* walk the preference order: cheap caller-saved registers first unless the
+               value has to survive a call */
+            for (int oi = 0; oi < num_regs && pick < 0; oi++) {
+                int rg = order ? order[oi] : num_regs - 1 - oi;
+                if ((cur.forbid >> rg) & 1) continue;
+                if (cur.crosses_call && rg >= num_callee_saved) continue;
+                for (int f = 0; f < free_count; f++) if (free_regs[f] == rg) { pick = f; break; }
+            }
+        }
+        if (pick >= 0) {
+            int reg = free_regs[pick];
+            free_regs[pick] = free_regs[--free_count];
+            set_reg(out_locs, assigned, &cur, reg, is_float_class, num_callee_saved, callee_saved_used);
             active[active_count].iv = cur;
             active[active_count].reg = reg;
             active_count++;
-        } else {
-            /* spill: pick the active interval with the furthest end; if it
-               ends later than cur, steal its register for cur and spill it
-               instead (classic Poletto-Sarkar heuristic) */
-            int spill_idx = -1;
-            for (int a = 0; a < active_count; a++) {
-                if (active[a].reg < 0) continue;
-                if (spill_idx < 0 || active[a].iv.end > active[spill_idx].iv.end) spill_idx = a;
-            }
-            if (spill_idx >= 0 && active[spill_idx].iv.end > cur.end) {
-                int reg = active[spill_idx].reg;
-                out_locs[active[spill_idx].iv.vreg].kind = MCLOC_SPILL;
-                out_locs[active[spill_idx].iv.vreg].is_float = is_float_class;
-                out_locs[active[spill_idx].iv.vreg].spill_slot = next_spill++;
+            continue;
+        }
 
-                /* reuse this active slot for cur instead of appending -
-                   active_count must never exceed num_regs */
-                out_locs[cur.vreg].kind = MCLOC_REG;
-                out_locs[cur.vreg].is_float = is_float_class;
-                out_locs[cur.vreg].reg_id = reg;
-                if (reg < num_callee_saved && reg + 1 > *callee_saved_used)
-                    *callee_saved_used = reg + 1;
-                active[spill_idx].iv = cur;
-                active[spill_idx].reg = reg;
-            } else {
-                out_locs[cur.vreg].kind = MCLOC_SPILL;
-                out_locs[cur.vreg].is_float = is_float_class;
-                out_locs[cur.vreg].spill_slot = next_spill++;
-            }
+        /* --- no register free: evict the cheapest usable victim, or spill cur --- */
+        int victim = -1;
+        for (int a = 0; a < active_count; a++) {
+            if (cur.crosses_call && active[a].reg >= num_callee_saved) continue;
+            if ((cur.forbid >> active[a].reg) & 1) continue;
+            if (victim < 0 || density(&active[a].iv) < density(&active[victim].iv)) victim = a;
+        }
+        if (victim >= 0 && density(&active[victim].iv) < density(&cur)) {
+            int reg = active[victim].reg;
+            out_locs[active[victim].iv.vreg].kind = MCLOC_SPILL;
+            out_locs[active[victim].iv.vreg].is_float = is_float_class;
+            out_locs[active[victim].iv.vreg].spill_slot = next_spill++;
+            assigned[active[victim].iv.vreg] = 1;
+            set_reg(out_locs, assigned, &cur, reg, is_float_class, num_callee_saved, callee_saved_used);
+            active[victim].iv = cur;
+            active[victim].reg = reg;
+        } else {
+            out_locs[cur.vreg].kind = MCLOC_SPILL;
+            out_locs[cur.vreg].is_float = is_float_class;
+            out_locs[cur.vreg].spill_slot = next_spill++;
+            assigned[cur.vreg] = 1;
         }
     }
 
@@ -470,7 +566,7 @@ RegAllocResult regalloc_run(const MIRFunc *fn, const RegAllocTarget *target) {
     CFG cfg = build_cfg(fn);
     Liveness lv = compute_liveness(fn, &cfg, nvregs);
     int total_count = 0;
-    Interval *all = compute_intervals(fn, &cfg, &lv, nvregs, &total_count);
+    Interval *all = compute_intervals(fn, &cfg, &lv, nvregs, &total_count, target);
 
     Interval *ints = malloc(total_count * sizeof(Interval));
     Interval *floats = malloc(total_count * sizeof(Interval));
@@ -480,14 +576,18 @@ RegAllocResult regalloc_run(const MIRFunc *fn, const RegAllocTarget *target) {
         else ints[int_n++] = all[i];
     }
 
-    linear_scan_class(ints, int_n, target->num_int_regs, res.vreg_locs, 0,
+    unsigned char *assigned = calloc(nvregs, 1);
+    g_cs_mask = 0;
+    linear_scan_class(ints, int_n, target->num_int_regs, res.vreg_locs, assigned, 0,
                       &res.num_int_spill_slots,
-                      target->num_callee_saved_int_regs, &res.callee_saved_int_used);
-    linear_scan_class(floats, float_n, target->num_float_regs, res.vreg_locs, 1,
+                      target->num_callee_saved_int_regs, &res.callee_saved_int_used,
+                      target->int_alloc_order);
+    res.callee_saved_int_mask = g_cs_mask;
+    linear_scan_class(floats, float_n, target->num_float_regs, res.vreg_locs, assigned, 1,
                       &res.num_float_spill_slots,
-                      target->num_callee_saved_float_regs, &res.callee_saved_float_used);
+                      target->num_callee_saved_float_regs, &res.callee_saved_float_used, NULL);
 
-    free(ints); free(floats); free(all);
+    free(ints); free(floats); free(all); free(assigned);
     liveness_free(&lv);
     cfg_free(&cfg);
     return res;

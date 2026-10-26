@@ -196,9 +196,8 @@ declaration, so use it inside an expression (`int m = a > b ? a : b;`).
 
 **Compound assignment** (`+= -= *= /= %= <<= >>= &= |= ^=`) works on a variable, a field,
 an element, and a dereference: `x += 1; p.x *= 3; a[i] <<= 2; *ptr |= 4;`. The field /
-element / pointer forms are rewritten to `target = target op value`, so keep side effects
-out of the target expression (`a[f()] += 1` would call `f` twice). `:=` only targets a
-bare identifier.
+element / pointer forms evaluate the target's side effects once (`a[i++] += 1` bumps `i`
+once, `a[f()] += 1` calls `f` once). `:=` only targets a bare identifier.
 
 Increment/decrement (`++x`, `x++`, `--x`, `x--`) work in prefix and postfix, in
 expression and statement position, and as a `for` post-clause.
@@ -387,10 +386,10 @@ public class Player {
   otherwise typed — as *the* constructor. Only one constructor is supported.)
 - Methods may be `naked` and may have a nullable (`Type?`) return, same as free
   functions.
-- **Class fields — both the implicit `name = n;` self-write shown above and explicit
-  `obj.field` access — do not work end-to-end yet.** See
-  [Known Limitations](known-limitations.md) before relying on this pattern; only
-  zero-field classes reliably instantiate and link today.
+- Fields are read and written with `obj.field` (or the bare name inside a method); a
+  constructor with an empty body (`Box() { }`) is fine. A class without a constructor is a
+  by-value struct: `T a = b;`, `a = b;`, passing it, and returning it from a function all copy
+  the whole thing, and `new T()` gives a zeroed one.
 
 ### Modifiers: `packed` and `union`
 
@@ -494,7 +493,9 @@ int v = volatile *ptr;       // volatile read
   `sizeof(uint8)` is 1, `sizeof(char)` is 1), aliases, and struct/class layouts
   (`sizeof(Header)`).
 - `addrof_fn(name)` (also spelled `adrof_fn(name)` — both lex to the same token) takes
-  the address of a named function.
+  the address of a named function. Store it in a `usize` and call through it like a
+  function: `usize fp = addrof_fn(add); fp(2, 3);`. It can also be passed to C as a
+  callback, or kept in an array as a dispatch table.
 
 ## `naked` Functions and Inline Assembly
 

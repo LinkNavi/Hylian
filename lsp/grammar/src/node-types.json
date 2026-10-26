@@ -964,6 +964,10 @@
         {
           "type": "param_list",
           "named": true
+        },
+        {
+          "type": "static",
+          "named": true
         }
       ]
     }

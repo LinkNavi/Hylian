@@ -133,11 +133,65 @@ static int SOCK_DGRAM  = 2;
 // calling mmap directly - keeps the actual syscall(NR_MMAP, ...) argument
 // order in exactly one place.
 
+// Small blocks (payload <= 2032 bytes) come from 256 KiB chunks instead of a
+// page-sized mmap each: every string operation used to cost an mmap and a page
+// fault. Each block has a 16-byte header holding its size class, freed blocks go
+// on a per-class free list, and they are zeroed when freed so a recycled block
+// looks exactly like fresh mmap memory (callers rely on that). Large blocks
+// still map/unmap directly.
+static usize _ra_cur = 0;
+static usize _ra_end = 0;
+static usize _ra_free[130];
+
 usize raw_alloc(int size) {
+    if (size > 0 && size <= 2032) {
+        int total = (size + 16 + 15) / 16 * 16;
+        int cls = total / 16;
+        usize head = _ra_free[cls];
+        if (head != cast<usize>(0)) {
+            unsafe {
+                _ra_free[cls] = *cast<*usize>(head + cast<usize>(16));
+                *cast<*usize>(head + cast<usize>(16)) = cast<usize>(0);
+            }
+            return head + cast<usize>(16);
+        }
+        if (_ra_cur + cast<usize>(total) > _ra_end) {
+            usize chunk = cast<usize>(syscall(NR_MMAP, 0, 262144, PROT_READ + PROT_WRITE,
+                                              MAP_PRIVATE + MAP_ANONYMOUS, -1, 0));
+            _ra_cur = chunk;
+            _ra_end = chunk + cast<usize>(262144);
+        }
+        usize blk = _ra_cur;
+        _ra_cur = _ra_cur + cast<usize>(total);
+        unsafe {
+            *cast<*usize>(blk) = cast<usize>(cls);
+        }
+        return blk + cast<usize>(16);
+    }
     return cast<usize>(syscall(NR_MMAP, 0, size, PROT_READ + PROT_WRITE,
                                 MAP_PRIVATE + MAP_ANONYMOUS, -1, 0));
 }
 
 void raw_free(usize ptr, int size) {
+    if (size > 0 && size <= 2032) {
+        usize blk = ptr - cast<usize>(16);
+        usize cls;
+        unsafe {
+            cls = *cast<*usize>(blk);
+        }
+        usize off = cast<usize>(16);
+        usize end = cls * cast<usize>(16);
+        while (off < end) {
+            unsafe {
+                *cast<*usize>(blk + off) = cast<usize>(0);
+            }
+            off = off + cast<usize>(8);
+        }
+        unsafe {
+            *cast<*usize>(blk + cast<usize>(16)) = _ra_free[cast<int>(cls)];
+        }
+        _ra_free[cast<int>(cls)] = blk;
+        return;
+    }
     syscall(NR_MUNMAP, cast<int>(ptr), size, 0);
 }

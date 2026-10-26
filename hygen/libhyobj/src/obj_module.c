@@ -47,6 +47,9 @@ void obj_module_free(ObjModule *mod) {
 }
 
 void obj_add_func(ObjModule *mod, const char *name, const X64Buf *code, const X64RelocList *relocs) {
+    /* start every function on a 16-byte boundary (int3 padding, never executed):
+       the x64 backend aligns loop headers relative to the function start */
+    while (mod->text.len % 16) objbuf_push(&mod->text, 0xCC);
     size_t base = mod->text.len;
     objbuf_write(&mod->text, code->data, code->len);
 
@@ -99,7 +102,11 @@ void obj_add_global(ObjModule *mod, const char *name, int has_init, int64_t init
     g->section = NULL;
     if (has_init) {
         g->offset = mod->data.len;
-        objbuf_write(&mod->data, &init_val, size);
+        /* init_val is 8 bytes; a larger global (a static array) gets it in element 0 and
+           zeros after - copying `size` bytes from init_val read stack garbage */
+        int n = size < 8 ? size : 8;
+        objbuf_write(&mod->data, &init_val, n);
+        for (int i = n; i < size; i++) objbuf_push(&mod->data, 0);
     } else {
         g->offset = mod->bss_size;
         mod->bss_size += size;

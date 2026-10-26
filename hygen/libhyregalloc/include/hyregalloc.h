@@ -17,6 +17,19 @@ typedef struct {
     int num_float_regs;
     int num_callee_saved_int_regs;
     int num_callee_saved_float_regs;
+    /* pool id of the register that carries argument k in the calling
+       convention, or -1 if it isn't allocatable. Only used as a hint. */
+    int arg_regs[6];
+    /* Optional: for an instruction, the bitmask (over integer pool ids) of
+       registers it overwrites beyond its operands - e.g. a divide destroys rdx.
+       A value that stays live across such an instruction is kept out of them.
+       (Calls are handled separately through the callee-saved split.) */
+    unsigned (*clobber_mask)(const MIRInstr *ins);
+    /* Optional: integer pool ids in the order they should be handed out to values
+       that do NOT live across a call (cheap, caller-saved registers first, so a
+       leaf function needs no push/pop). NULL = highest id first. Must list every
+       id 0..num_int_regs-1 once. */
+    const int *int_alloc_order;
 } RegAllocTarget;
 
 typedef enum { MCLOC_REG, MCLOC_SPILL } MCLocKind;
@@ -39,6 +52,8 @@ typedef struct {
        none). The target uses this to save/restore exactly the registers it
        has to in the prologue/epilogue, rather than all of them. */
     int    callee_saved_int_used;
+    /* Exactly which callee-saved integer registers (pool ids) were handed out */
+    unsigned callee_saved_int_mask;
     int    callee_saved_float_used;
 } RegAllocResult;
 

@@ -108,13 +108,16 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
       ../../compiler/ast.c \
       ../../compiler/diag.c \
       ../../compiler/typecheck.c \
+      ../../compiler/loader.c \
       lsp_diag.c \
+      lsp_zora.c \
+      lsp_modules.c \
+      lsp_query.c \
+      lsp_complete.c \
+      lsp_features.c \
       lsp_analysis.c \
       lsp_proto.c \
       lsp_main.c \
-      lsp_c_extractor.c \
-      -ltree-sitter \
-      -ltree-sitter-c \
       -o ../hylian-lsp
   if [[ $? -ne 0 ]]; then
     fail "gcc compilation failed"

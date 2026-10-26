@@ -36,6 +36,15 @@
 static int ARENA_HEADER_SIZE = 24;
 static int ARENA_BLOCK_SIZE  = 65536;
 
+// Recycled standard-size blocks. Every function that uses `new` gets an arena
+// and frees it on return, so without a pool each such call cost an mmap and a
+// munmap (microseconds); with it, the steady state is a few loads and stores.
+// A block goes back to the pool zeroed, because fresh mmap memory is zero and
+// `new` objects have always started out that way.
+static usize ARENA_POOL = 0;        // singly linked through each block's `next` word
+static int   ARENA_POOL_COUNT = 0;
+static int   ARENA_POOL_MAX = 64;   // 4 MiB of standing memory at most
+
 // Backing arena for `multi` values (see hylian_multi_alloc at the bottom of
 // this file). It lives here rather than in its own always-linked module so it
 // can reuse the block machinery above instead of duplicating it.
@@ -50,6 +59,15 @@ void _mem_raw_free(usize ptr, int size) {
 }
 
 usize _arena_new_block(usize min_size) {
+    if (min_size <= cast<usize>(ARENA_BLOCK_SIZE) && ARENA_POOL != cast<usize>(0)) {
+        usize b = ARENA_POOL;
+        unsafe {
+            ARENA_POOL = *cast<*usize>(b);
+            *cast<*usize>(b) = cast<usize>(0);
+        }
+        ARENA_POOL_COUNT = ARENA_POOL_COUNT - 1;
+        return b;
+    }
     usize sz = min_size;
     if (sz < cast<usize>(ARENA_BLOCK_SIZE)) {
         sz = cast<usize>(ARENA_BLOCK_SIZE);
@@ -65,10 +83,11 @@ usize _arena_new_block(usize min_size) {
     return block;
 }
 
+// The first block is mapped lazily by arena_alloc, so a function that owns an
+// arena but never reaches an allocation pays for a store, not an mmap.
 void arena_init(usize slot) {
-    usize block = _arena_new_block(cast<usize>(ARENA_BLOCK_SIZE));
     unsafe {
-        *cast<*usize>(slot) = block;
+        *cast<*usize>(slot) = cast<usize>(0);
     }
 }
 
@@ -78,6 +97,12 @@ usize arena_alloc(usize slot, usize size) {
     usize block;
     unsafe {
         block = *cast<*usize>(slot);
+    }
+    if (block == cast<usize>(0)) {
+        block = _arena_new_block(aligned);
+        unsafe {
+            *cast<*usize>(slot) = block;
+        }
     }
 
     usize used;
@@ -205,7 +230,29 @@ void arena_free(usize slot) {
             next = *cast<*usize>(block);
             cap  = *cast<*usize>(block + cast<usize>(16));
         }
-        _mem_raw_free(block, cast<int>(cap + cast<usize>(ARENA_HEADER_SIZE)));
+        if (cap == cast<usize>(ARENA_BLOCK_SIZE) && ARENA_POOL_COUNT < ARENA_POOL_MAX) {
+            // recycle: clear what was used, reset the header, push on the pool
+            usize used;
+            unsafe {
+                used = *cast<*usize>(block + cast<usize>(8));
+            }
+            usize off = cast<usize>(ARENA_HEADER_SIZE);
+            usize end = off + used;
+            while (off < end) {
+                unsafe {
+                    *cast<*usize>(block + off) = cast<usize>(0);
+                }
+                off = off + cast<usize>(8);
+            }
+            unsafe {
+                *cast<*usize>(block + cast<usize>(8)) = cast<usize>(0);
+                *cast<*usize>(block) = ARENA_POOL;
+            }
+            ARENA_POOL = block;
+            ARENA_POOL_COUNT = ARENA_POOL_COUNT + 1;
+        } else {
+            _mem_raw_free(block, cast<int>(cap + cast<usize>(ARENA_HEADER_SIZE)));
+        }
         block = next;
     }
 

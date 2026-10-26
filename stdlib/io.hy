@@ -35,9 +35,10 @@ void eprintln(str msg) {
 str int_to_str(int n) {
     if (n == 0) { return "0"; }
 
+    // digits are taken with the number's own sign, so the most negative int (which has
+    // no positive counterpart) prints correctly too
     bool neg = n < 0;
     int v = n;
-    if (neg) { v = -v; }
 
     // enough for a 64-bit value's digits plus a sign
     usize buf = raw_alloc(32);
@@ -45,8 +46,9 @@ str int_to_str(int n) {
     unsafe { *uint8 tp = cast<*uint8>(buf + cast<usize>(pos)); *tp = 0; }
     pos -= 1;
 
-    while (v > 0) {
+    while (v != 0) {
         int digit = v % 10;
+        if (neg) { digit = 0 - digit; }
         usize p = buf + cast<usize>(pos);
         unsafe { *uint8 dp = cast<*uint8>(p); *dp = cast<uint8>(48 + digit); }
         pos -= 1;

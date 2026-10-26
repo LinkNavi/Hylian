@@ -6,4 +6,12 @@ c_mix=172.25
 callback=1014.5
 3.142/42
 c ints: -5 7 0 2.5
+callback ptr=43
+vec2: 1.75 6.0
+col: 100 50 25 255
+rect: 120 -1 0 34 8
+vec3: 14.0 2.0 4.0 6.0
+big: 54321 1 5
+mix: 9.0 7
+spill: 7036
 sum sqrt = 6.146264

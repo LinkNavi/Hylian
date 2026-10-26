@@ -653,6 +653,7 @@ int opt_strip_unreachable(IRModule *mod) {
                 continue;
             }
 
+            if (!target) continue; /* indirect call */
             int callee = span_find(spans, span_n, target);
             if (callee < 0 || spans[callee].reachable) continue;
             spans[callee].reachable = 1;
@@ -701,6 +702,9 @@ int opt_run_all(IRModule *mod) {
        of a program that never calls it. */
     int total = opt_strip_unreachable(mod);
     int delta;
+    /* Per-instruction cleanup now lives in the hygen middle end (libhyopt),
+       on typed MIR. Set HYLIAN_IROPT=1 to also run the legacy IR passes. */
+    if (!getenv("HYLIAN_IROPT")) return total;
     for (int iter = 0; iter < 12; iter++) {
         delta  = opt_constant_fold(mod);
         delta += opt_constant_prop(mod);

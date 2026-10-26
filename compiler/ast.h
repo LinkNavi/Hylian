@@ -42,6 +42,7 @@ typedef enum {
     NODE_MODULE,      /* module Name { ... } */
     NODE_TERNARY,     /* cond ? then : else */
     NODE_DEFER,       /* defer stmt;  /  defer { ... } - runs when the function returns */
+    NODE_TEMP_REF,    /* lowering-only: an already-evaluated IR temp (see lower_hoist_compound) */
 } NodeType;
 
 typedef enum {
@@ -77,6 +78,10 @@ typedef struct ASTNode {
        ast.c). 0 means unknown. Needed by the LSP to place diagnostics, and by
        the CLI so errors stop reporting themselves as "file:0:". */
     int      line;
+    /* Exact source span, from the parser's location tracking: the node starts
+       at (line, col) and ends at (end_line, end_col); columns are 0-based and
+       end_col is one past the last character. line == 0 means unknown. */
+    int      col, end_line, end_col;
 } ASTNode;
 
 typedef struct {
@@ -223,6 +228,7 @@ typedef struct {
     char *name;
     ASTNode **args;
     int arg_count;
+    int is_indirect; /* `fp(args)` where fp is a variable holding a function address */
 } FuncCallNode;
 
 typedef struct {
@@ -279,6 +285,10 @@ typedef struct {
 } LiteralNode;
 
 typedef struct { ASTNode base; char *name; } IdentifierNode;
+
+/* Created only during lowering: stands in for an expression whose value was
+   already computed into IR temp `temp`. */
+typedef struct { ASTNode base; int temp; } TempRefNode;
 
 /* Each segment of an interpolated string: either a literal piece or an expr source */
 typedef struct {
@@ -461,6 +471,9 @@ int ast_is_class(ClassNode **classes, int class_count, const char *name);
    `class Foo { Foo() {...} }` (heap, made with `new`) and an interface-only
    declaration like `class Error { fn message() -> str }` (an opaque handle
    whose values are pointers). Callers use this to decide address-vs-load. */
+/* stamp position/flags on a node the parser allocates itself */
+void ast_stamp(ASTNode *n);
+int ast_sysv_aggregate(ClassNode **classes, int class_count, const char *name);
 int ast_is_value_aggregate(ClassNode **classes, int class_count, const char *name);
 
 /* Does `name` declare a constructor? `new` needs this to know whether to

@@ -108,6 +108,7 @@ run() {
 run language ""
 run ffi_float "-lm"
 run math ""
+run str_eq ""
 run assert_fail ""
 run string_ext ""
 run map ""

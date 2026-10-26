@@ -2,9 +2,36 @@
 #include "parser.tab.h"
 #include <string.h>
 #include <stdlib.h>
+#include "diag.h"
 
 extern const char *current_parse_file;
 static int input(void);
+
+/* Column tracking for diagnostics: lex_tok_col/lex_tok_len describe the token
+   most recently returned (0-based column, length in bytes), which is the
+   lookahead token when the parser reports a syntax error. Reset lex_col to 0
+   before parsing a new buffer. */
+int lex_col = 0, lex_tok_col = 0, lex_tok_len = 0, lex_tok_line = 1, lex_tok_first = 0;
+/* the token BEFORE the current one: where it ended and what it ended with */
+int lex_prev_line = 0, lex_prev_end_col = 0, lex_prev_last = 0;
+static int cur_end_line = 0, cur_end_col = 0, cur_last = 0;
+/* advance the column for one character consumed by hand with input() (flex's
+   input() already advances yylineno itself under %option yylineno - bumping it
+   here too used to double-count every line inside a block comment) */
+#define LEX_ADV(c) do { if ((c) == '\n') lex_col = 0; else lex_col++; } while (0)
+#define YY_USER_ACTION { \
+    int _ws = (yytext[0] == ' ' || yytext[0] == '\t' || yytext[0] == '\n' || yytext[0] == '\r' || \
+               (yytext[0] == '/' && (yytext[1] == '/' || yytext[1] == '*'))); \
+    int _start = lex_col, _nl = 0; \
+    for (int _i = 0; _i < yyleng; _i++) { if (yytext[_i] == '\n') { lex_col = 0; _nl++; } else lex_col++; } \
+    if (!_ws) { \
+        yylloc.first_line = yylineno - _nl; yylloc.first_column = _start; \
+        yylloc.last_line = yylineno; yylloc.last_column = lex_col; \
+        lex_prev_line = cur_end_line; lex_prev_end_col = cur_end_col; lex_prev_last = cur_last; \
+        lex_tok_col = _start; lex_tok_len = (int)yyleng; lex_tok_first = yytext[0]; \
+        lex_tok_line = yylineno; \
+        cur_end_line = yylineno; cur_end_col = lex_col; cur_last = yytext[yyleng - 1]; \
+    } }
 extern const char *current_compile_target;
 
 /* Skip tokens for a top-level declaration (function or class body).
@@ -15,8 +42,8 @@ static void skip_target_decl(void) {
     int c;
     int brace_depth = 0;
     int seen_brace = 0;
-    while ((c = input()) != EOF) {
-        if (c == '\n') yylineno++;
+    while ((c = input()) != EOF && c != 0) {
+        LEX_ADV(c);
         if (c == '{') { brace_depth++; seen_brace = 1; }
         else if (c == '}') {
             brace_depth--;
@@ -196,12 +223,18 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
 [ \t\r\n]+          { /* skip whitespace */ }
 "//".*              { /* skip single-line comments */ }
 "/*"                {
-    /* C-style block comment (not nested) */
-    int c, prev = 0;
-    while ((c = input()) != EOF) {
-        if (c == '\n') yylineno++;
-        if (prev == '*' && c == '/') break;
+    /* C-style block comment (not nested). flex's input() reports end of file
+       as 0, not EOF - an unterminated comment used to loop here forever. */
+    int c, prev = 0, closed = 0;
+    int start_line = yylineno, start_col = lex_col - 2;
+    while ((c = input()) != EOF && c != 0) {
+        LEX_ADV(c);
+        if (prev == '*' && c == '/') { closed = 1; break; }
         prev = c;
+    }
+    if (!closed) {
+        diag_set_span(2);
+        diag_emit(DIAG_ERROR, current_parse_file, start_line, start_col, NULL, "unterminated /* comment");
     }
 }
 
@@ -210,14 +243,14 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
     int len = 0;
     char *buf = malloc(capacity);
     int c;
-    while ((c = input()) != EOF) {
+    while ((c = input()) != EOF && c != 0) {
         if (c == '}') break;
         if (len + 2 >= capacity) {
             capacity *= 2;
             buf = realloc(buf, capacity);
         }
         buf[len++] = (char)c;
-        if (c == '\n') yylineno++;
+        LEX_ADV(c);
     }
     buf[len] = '\0';
     yylval.str = buf;
@@ -228,14 +261,14 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
     int len = 0;
     char *buf = malloc(capacity);
     int c;
-    while ((c = input()) != EOF) {
+    while ((c = input()) != EOF && c != 0) {
         if (c == '}') break;
         if (len + 2 >= capacity) {
             capacity *= 2;
             buf = realloc(buf, capacity);
         }
         buf[len++] = (char)c;
-        if (c == '\n') yylineno++;
+        LEX_ADV(c);
     }
     buf[len] = '\0';
     yylval.str = buf;

@@ -1039,10 +1039,10 @@ section "Strings (std.strings)"
 run_test "t110" "str_length of literal" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
-    int n = str_length("hello");
+    int n = length("hello");
     println(n);
     return nil;
 }' \
@@ -1051,11 +1051,11 @@ Error? main() {
 run_test "t111" "str_length of variable" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
     str s = "hylian";
-    int n = str_length(s);
+    int n = length(s);
     println(n);
     return nil;
 }' \
@@ -1064,10 +1064,10 @@ Error? main() {
 run_test "t112" "str_to_upper" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
-    str s = str_to_upper("hello");
+    str s = to_upper("hello");
     println(s);
     return nil;
 }' \
@@ -1076,10 +1076,10 @@ Error? main() {
 run_test "t113" "str_to_lower" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
-    str s = str_to_lower("WORLD");
+    str s = to_lower("WORLD");
     println(s);
     return nil;
 }' \
@@ -1088,10 +1088,10 @@ Error? main() {
 run_test "t114" "str_contains true" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
-    bool found = str_contains("hello world", "world");
+    bool found = contains("hello world", "world");
     if (found) {
         println("yes");
     } else {
@@ -1104,10 +1104,10 @@ Error? main() {
 run_test "t115" "str_contains false" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
-    bool found = str_contains("hello", "xyz");
+    bool found = contains("hello", "xyz");
     if (found) {
         println("yes");
     } else {
@@ -1120,10 +1120,10 @@ Error? main() {
 run_test "t116" "str_equals same strings" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
-    bool eq = str_equals("hello", "hello");
+    bool eq = equals("hello", "hello");
     if (eq) {
         println("equal");
     } else {
@@ -1136,10 +1136,10 @@ Error? main() {
 run_test "t117" "str_equals different strings" \
 'include {
     std.io,
-    std.strings,
+    std.string,
 }
 Error? main() {
-    bool eq = str_equals("foo", "bar");
+    bool eq = equals("foo", "bar");
     if (eq) {
         println("equal");
     } else {
@@ -1592,7 +1592,8 @@ run_test "t170" "addrof and deref round-trip" \
 Error? main() {
     int x = 42;
     *int p = &x;
-    int y = *p;
+    int y = 0;
+    unsafe { y = *p; }
     println(y);
     return nil;
 }' \

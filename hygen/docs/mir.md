@@ -199,3 +199,45 @@ omitted from the result and the caller is told the result is incomplete.
 Note: `ir_to_mir.c`/`.h` depend on Hylian's `ir.h`/`ir.c` directly (they're
 frontend glue, not a generic lib) — canonical copy lives in
 `Hylian/compiler/`, mirrored here for tracking only.
+
+
+## Optimizer (libhyopt)
+
+`hyopt_module()` runs between MIR verification and register allocation
+(`compiler/codegen_hygen.c`). MIR is **not** SSA - a vreg may be assigned many times - so the
+passes are explicit dataflow rather than def-use chains. Pipeline per function (callees first, so
+small ones can be inlined into their callers):
+
+1. inline small non-recursive functions of the same module (and a small self-recursive one into itself once or twice)
+2. CFG cleanup (unreachable code, jump threading, empty labels)
+3. `mem2reg`: locals whose address is never taken become vregs; parameters become `MIR_GETPARAM`
+4. fixpoint of: single-def propagation, available-copies propagation (`copy_prop_df`), local
+   folding/algebra/CSE, addressing-mode folding, global CSE with branch facts (`gcse`), mov folding,
+   liveness-based DCE
+5. SROA: by-value struct locals whose address never escapes are split into one vreg per 8-byte field (memcpys expand per field)
+6. division/modulo by constants -> multiply by a reciprocal (`MIR_SMULH`/`MIR_UMULH`)
+7. if-conversion of tiny branches into `MIR_SELECT` (cmov)
+8. loop rotation, then loop-invariant code motion (dominators + natural loops, preheader)
+
+Debugging switches: `HYLIAN_OPT=0` (off), `HYLIAN_OPT_OFF=cfg,mem2reg,prop,copyprop,cse,addr,gcse,dce,sroa,div,ifcvt,loops,licm,inline,selfinline`,
+`HYLIAN_OPT_VERIFY=1` (names the first pass that leaves a use before any def),
+`HYLIAN_DUMP_MIR=1` / `HYLIAN_DUMP_OPT_MIR=1` (MIR before / after). Functions containing inline asm,
+privileged instructions or `naked` are not optimized.
+
+### Ops and fields added for the optimizer
+- `MIR_GETPARAM` (`dest = parameter #extra_int`): only at the top of a function.
+- `MIR_ARR_LEN` / `MIR_ARR_DATA`: null-safe reads of an array header `{len, cap, data}`; `a[i]` is
+  expanded to `arr_len; ucmp_lt; jmp_unless; arr_data; load [data + i*8]` so the header reads can be
+  shared and hoisted.
+- `MIR_SELECT` (`dest = src1 ? src2 : args[0]`), `MIR_SMULH` / `MIR_UMULH` (high half of the 128-bit product).
+- `MIRInstr.mem_scale`: when nonzero, `src2` is an index vreg scaled by 1/2/4/8 (one SIB byte).
+- `MIRInstr.mem_cls`: alias class of a load/store (`MIR_MEM_ARRAY_HDR` vs `MIR_MEM_ARRAY_ELEM`): a
+  store of one class cannot modify a read of the other.
+- `MIRFunc.local_pinned`: slots that must stay in memory (aggregates).
+
+### Backend notes (libhyx64)
+Operand-aware selection (immediate/memory operands, `lea`, SIB addressing), fused
+compare+branch/select, `test` for `(a & b) == 0`, parallel-move argument passing, direct
+parameter receipt, frame-pointer omission for functions with no stack slots, float constants in a
+rodata pool, 12 allocatable integer registers (`rdx`/`rcx` are reserved again in functions with asm or
+privileged instructions), loop-header alignment.

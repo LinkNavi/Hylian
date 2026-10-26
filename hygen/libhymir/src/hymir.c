@@ -23,6 +23,8 @@ void mir_module_free(MIRModule *mod) {
             if (f->instrs[j].args) free(f->instrs[j].args);
         }
         free(f->instrs);
+        free(f->local_pinned);
+        free(f->param_types);
         free(f->name);
         free(f);
     }
@@ -57,6 +59,18 @@ int mir_new_vreg(MIRFunc *fn) {
 
 int mir_new_local(MIRFunc *fn) {
     return fn->local_count++;
+}
+
+void mir_pin_local(MIRFunc *fn, int id) {
+    if (id < 0) return;
+    if (id >= fn->local_pinned_cap) {
+        int ncap = fn->local_pinned_cap ? fn->local_pinned_cap : 16;
+        while (ncap <= id) ncap *= 2;
+        fn->local_pinned = realloc(fn->local_pinned, ncap);
+        memset(fn->local_pinned + fn->local_pinned_cap, 0, ncap - fn->local_pinned_cap);
+        fn->local_pinned_cap = ncap;
+    }
+    fn->local_pinned[id] = 1;
 }
 
 MIRInstr *mir_emit(MIRFunc *fn, MIROp op) {
@@ -216,6 +230,10 @@ const char *mir_op_name(MIROp op) {
     case MIR_MEMSET: return "memset"; case MIR_MEMCPY: return "memcpy";
     case MIR_SYSCALL: return "syscall";
     case MIR_ASM_TEXT: return "asm_text";
+    case MIR_GETPARAM: return "getparam";
+    case MIR_SELECT: return "select";
+    case MIR_SMULH: return "smulh"; case MIR_UMULH: return "umulh";
+    case MIR_ARR_LEN: return "arr_len"; case MIR_ARR_DATA: return "arr_data";
     case MIR_NOP: return "nop";
     }
     return "?";
@@ -245,6 +263,20 @@ void mir_dump(const MIRModule *mod, FILE *out) {
             dump_val(&ins->src1, out);
             fprintf(out, ", ");
             dump_val(&ins->src2, out);
+            if (ins->op == MIR_LOAD || ins->op == MIR_STORE) {
+                if (ins->mem_scale) fprintf(out, "  [+idx*%d", ins->mem_scale);
+                else fprintf(out, "  [");
+                fprintf(out, "%+d]", ins->mem_offset);
+            }
+            if (ins->op == MIR_CALL) {
+                fprintf(out, "  %s(", ins->callee ? ins->callee : "*");
+                for (int a = 0; a < ins->arg_count; a++) {
+                    if (a) fprintf(out, ", ");
+                    dump_val(&ins->args[a], out);
+                }
+                fprintf(out, ")");
+            }
+            if (ins->op == MIR_GETPARAM) fprintf(out, "  #%d", ins->extra_int);
             fprintf(out, "\n");
         }
     }
@@ -308,6 +340,13 @@ MIRVerifyResult mir_verify(const MIRModule *mod) {
         /* track vreg definitions seen so far (dense-ish ids, linear scan is fine
            for typical function sizes) */
         int *defined = calloc(nvregs + 1, sizeof(int));
+        /* The check below is linear-order: a use that precedes its def in the instruction
+           stream is normal after loop rotation / if-conversion (control flow need not follow
+           layout), so only a vreg with no definition anywhere in the function is an error. */
+        int *ever = calloc(nvregs + 1, sizeof(int));
+        for (int i = 0; i < fn->count; i++)
+            if (fn->instrs[i].dest.kind == MIRV_VREG && fn->instrs[i].dest.vreg <= nvregs)
+                ever[fn->instrs[i].dest.vreg] = 1;
 
         for (int i = 0; i < fn->count; i++) {
             MIRInstr *ins = &fn->instrs[i];
@@ -315,22 +354,22 @@ MIRVerifyResult mir_verify(const MIRModule *mod) {
             /* use-before-def check on plain vreg sources */
             MIRValue *srcs[2] = { &ins->src1, &ins->src2 };
             for (int s = 0; s < 2; s++) {
-                if (srcs[s]->kind == MIRV_VREG && !defined[srcs[s]->vreg]) {
+                if (srcs[s]->kind == MIRV_VREG && !defined[srcs[s]->vreg] && !ever[srcs[s]->vreg]) {
                     snprintf(r.msg, sizeof(r.msg),
                         "func %s: instr %d (%s) uses v%d before it's defined",
                         fn->name, i, mir_op_name(ins->op), srcs[s]->vreg);
                     r.ok = 0;
-                    free(defined);
+                    free(defined); free(ever);
                     return r;
                 }
             }
             for (int a = 0; a < ins->arg_count; a++) {
-                if (ins->args[a].kind == MIRV_VREG && !defined[ins->args[a].vreg]) {
+                if (ins->args[a].kind == MIRV_VREG && !defined[ins->args[a].vreg] && !ever[ins->args[a].vreg]) {
                     snprintf(r.msg, sizeof(r.msg),
                         "func %s: instr %d (%s) call arg uses v%d before it's defined",
                         fn->name, i, mir_op_name(ins->op), ins->args[a].vreg);
                     r.ok = 0;
-                    free(defined);
+                    free(defined); free(ever);
                     return r;
                 }
             }
@@ -343,7 +382,7 @@ MIRVerifyResult mir_verify(const MIRModule *mod) {
                         "func %s: instr %d (%s) is a float op but v%d isn't typed float",
                         fn->name, i, mir_op_name(ins->op), ins->src1.vreg);
                     r.ok = 0;
-                    free(defined);
+                    free(defined); free(ever);
                     return r;
                 }
             }
@@ -362,7 +401,7 @@ MIRVerifyResult mir_verify(const MIRModule *mod) {
             r.ok = 0;
         }
 
-        free(defined);
+        free(defined); free(ever);
         if (!r.ok) return r;
     }
 

@@ -41,6 +41,14 @@ int deferred(int n) {
     return n;
 }
 
+int fp_add(int a, int b) { return a + b; }
+int fp_mul(int a, int b) { return a * b; }
+int fp_run(usize f, int a, int b) { return f(a, b); }
+
+int ca_calls = 0;
+int ca_next() { ca_calls += 1; return ca_calls - 1; }
+class CaBox { int v; }
+
 int main() {
     // for loops with ++ / -- / compound post-clauses
     int s = 0;
@@ -165,6 +173,25 @@ int main() {
     Error? e2 = check("toolongname");
     Error? e3 = check("ok");
     println("errors: {{e1.message()}}/{{e1.code()}} {{e2.message()}}/{{e2.code()}} {{e3 == nil}}");
+
+    // function pointers: indirect calls through a variable, a table, a parameter
+    usize fp = addrof_fn(fp_add);
+    usize ops[2];
+    ops[0] = addrof_fn(fp_add);
+    ops[1] = addrof_fn(fp_mul);
+    usize op1 = ops[1];
+    println("fnptr: {{fp(2, 3)}} {{op1(4, 5)}} {{fp_run(addrof_fn(fp_mul), 6, 7)}}");
+
+    // compound assignment evaluates its target once
+    int ca_arr[4];
+    ca_arr[0] = 10; ca_arr[1] = 20; ca_arr[2] = 30; ca_arr[3] = 40;
+    int ci = 0;
+    ca_arr[ci++] += 5;
+    ca_arr[ca_next()] += 100;
+    ca_arr[ca_next()] *= 2;
+    usize cp = &ci;
+    *cp += 1;
+    println("compound: {{ci}} {{ca_calls}} {{ca_arr[0]}} {{ca_arr[1]}} {{ca_arr[2]}} {{ca_arr[3]}}");
 
     // interpolation with expressions
     str who = "world";

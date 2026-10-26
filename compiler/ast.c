@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 static void zero_resolved_type(ASTNode *n);
+void ast_stamp(ASTNode *n);   /* for nodes the parser builds by hand */
 
 /* Parse a raw interpolated string (with surrounding quotes) into segments.
    "hello {{name}}, you have {{count}} items!"
@@ -266,6 +267,7 @@ FuncCallNode *make_func_call(char *name) {
     zero_resolved_type(&n->base);
     n->name = strdup(name);
     n->args = NULL; n->arg_count = 0;
+    n->is_indirect = 0;
     return n;
 }
 
@@ -331,6 +333,14 @@ Type make_simple_type(char *name, int nullable) {
    whole separate AST just to carry positions. */
 extern int yylineno;
 
+/* Span of the grammar rule currently being reduced, recorded by parser.y's
+   YYLLOC_DEFAULT just before each rule's action runs. Every node built inside
+   an action is therefore stamped with the exact source range of the construct
+   it represents (a function: from its return type to its closing brace). */
+int g_loc_l1 = 0, g_loc_c1 = 0, g_loc_l2 = 0, g_loc_c2 = 0;
+
+void ast_stamp(ASTNode *n) { zero_resolved_type(n); }
+
 static void zero_resolved_type(ASTNode *n) {
     n->resolved_type.kind = TYPE_SIMPLE;
     n->resolved_type.nullable = 0;
@@ -339,7 +349,12 @@ static void zero_resolved_type(ASTNode *n) {
     n->resolved_type.elem_type_count = 0;
     n->resolved_type.is_any = 0;
     n->resolved_type.fixed_size = 0;
-    n->line = yylineno;
+    if (g_loc_l1 > 0) {
+        n->line = g_loc_l1; n->col = g_loc_c1;
+        n->end_line = g_loc_l2; n->end_col = g_loc_c2;
+    } else {
+        n->line = yylineno; n->col = 0; n->end_line = yylineno; n->end_col = 0;
+    }
     n->from_include = 0;
 }
 
@@ -449,6 +464,7 @@ ModuleNode *make_module(char *name) {
     n->base.resolved_type.elem_type_count = 0;
     n->base.resolved_type.is_any = 0;
     n->base.resolved_type.fixed_size = 0;
+    ast_stamp(&n->base);
     n->name = strdup(name);
     n->funcs = NULL;
     n->func_count = 0;
@@ -566,6 +582,37 @@ int ast_field_offset(ClassNode **classes, int class_count,
         if (!cn->is_union) running += w;
     }
     return -1;
+}
+
+/* SysV x86-64 classification of a flat by-value struct, for calling C.
+   Returns an aggregate descriptor - (C size << 2) | sse mask, bit k set when
+   eightbyte k holds only float/double fields (passed in an xmm register
+   rather than a general one) - or 0 when the struct can't be passed the way C
+   would (nested structs, arrays, unions, or padding: Hylian lays fields out
+   back to back, so a field that C would align differently can't be matched).
+   Structs over 16 bytes are MEMORY class: the mask is unused. */
+int ast_sysv_aggregate(ClassNode **classes, int class_count, const char *name) {
+    ClassNode *cn = ast_find_class(classes, class_count, name);
+    if (!cn || cn->has_ctor || cn->is_union || cn->field_count == 0) return 0;
+    int off = 0, mask = 0, seen_int = 0;
+    for (int i = 0; i < cn->field_count; i++) {
+        FieldNode *f = cn->fields[i];
+        if (!f || f->field_type.kind == TYPE_ARRAY) return 0;
+        const char *tn = f->field_type.name ? f->field_type.name : "int";
+        if (ast_find_class(classes, class_count, tn)) return 0;
+        int w = ast_prim_width(tn);
+        if (w <= 0 || off % w != 0) return 0; /* would need padding */
+        int is_float = !strcmp(tn, "float") || !strcmp(tn, "double") ||
+                       !strcmp(tn, "float32") || !strcmp(tn, "float64");
+        int eb = off / 8;
+        if (eb < 2) {
+            if (is_float) { if (!(seen_int & (1 << eb))) mask |= 1 << eb; }
+            else          { seen_int |= 1 << eb; mask &= ~(1 << eb); }
+        }
+        off += w;
+    }
+    if (off == 0) return 0;
+    return (off << 2) | (off > 16 ? 0 : mask);
 }
 
 int ast_is_class(ClassNode **classes, int class_count, const char *name) {
