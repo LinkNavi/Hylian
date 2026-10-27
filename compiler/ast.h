@@ -43,6 +43,9 @@ typedef enum {
     NODE_TERNARY,     /* cond ? then : else */
     NODE_DEFER,       /* defer stmt;  /  defer { ... } - runs when the function returns */
     NODE_TEMP_REF,    /* lowering-only: an already-evaluated IR temp (see lower_hoist_compound) */
+    NODE_TUPLE,       /* (a, b, ...) - becomes a struct literal of a generated __tuple class */
+    NODE_TRY,         /* try f() - unwrap a (T, Error?) result or return the error early */
+    NODE_SPLICE,      /* parser-only: several statements standing in for one (see stmt_list) */
 } NodeType;
 
 typedef enum {
@@ -64,6 +67,15 @@ typedef struct Type {
     int elem_type_count;
     int is_any;               /* multi<any> */
     int fixed_size;           /* 0 = flexible, >0 = fixed */
+    /* Function pointer type `fn(A, B) -> R`: a TYPE_SIMPLE "usize" (so every
+       later pass that only knows addresses keeps working) with is_fn set;
+       elem_types/elem_type_count hold the parameter types, fn_ret the result. */
+    int is_fn;
+    struct Type *fn_ret;
+    /* Generic instantiation `Foo<int, str>` before monomorphization rewrites
+       it to a plain TYPE_SIMPLE with a mangled name. */
+    struct Type *type_args;
+    int type_arg_count;
 } Type;
 
 /* from_include: this declaration arrived through an `include`, rather than
@@ -106,6 +118,8 @@ typedef struct {
     ASTNode **body;
     int body_count;
     int is_naked; /* 1 = naked function (no prologue/epilogue) */
+    char **type_params; /* `T map<U>(...)`: a generic method (a template until mono expands it) */
+    int type_param_count;
 } MethodNode;
 
 typedef struct {
@@ -119,6 +133,8 @@ typedef struct {
     int is_naked;       /* 1 = naked function (no prologue/epilogue) */
     int is_public;      /* 1 = public module member, 0 = private */
     char *module_name;  /* set when inside a module, NULL otherwise */
+    char **type_params; /* T max<T>(T a, T b): the template's parameter names */
+    int type_param_count;
 } FuncNode;
 
 typedef struct {
@@ -216,6 +232,9 @@ typedef struct {
     char *method;
     ASTNode **args;
     int arg_count;
+    Type *type_args;   /* `obj.map<int>(f)` */
+    int type_arg_count;
+    Type *field_fn_type; /* `obj.f(args)` where f is a field holding a typed fn pointer (set by typecheck) */
     int is_ufcs; /* set by typecheck when `obj.method(args)` resolves to a free
                     function `method(obj, args)` rather than a real ClassName
                     method (UFCS sugar) — tells lower.c to emit a plain call
@@ -229,6 +248,10 @@ typedef struct {
     ASTNode **args;
     int arg_count;
     int is_indirect; /* `fp(args)` where fp is a variable holding a function address */
+    int implicit_self; /* `helper(x)` inside a method that means `self.helper(x)` (set by typecheck) */
+    Type *callee_type; /* typed fn pointer being called (is_fn), set by typecheck; NULL if untyped */
+    Type *type_args;   /* explicit generic arguments: max<int>(a, b) */
+    int type_arg_count;
 } FuncCallNode;
 
 typedef struct {
@@ -236,6 +259,8 @@ typedef struct {
     char *class_name;
     ASTNode **args;
     int arg_count;
+    Type *type_args;   /* new Box<int>(...) */
+    int type_arg_count;
 } NewNode;
 
 typedef struct {
@@ -253,6 +278,8 @@ typedef struct {
     ASTNode **ctor_body;
     int ctor_body_count;
     int has_ctor;
+    char **type_params;   /* class Box<T> { ... }: the template's parameter names */
+    int type_param_count;
 } ClassNode;
 
 typedef struct {
@@ -285,6 +312,34 @@ typedef struct {
 } LiteralNode;
 
 typedef struct { ASTNode base; char *name; } IdentifierNode;
+
+/* (a, b): elements are checked against the expected or inferred tuple type,
+   then `lowered` is the equivalent struct literal that lower.c emits. */
+typedef struct {
+    ASTNode base;
+    ASTNode **elems;
+    int elem_count;
+    ASTNode *lowered;
+} TupleNode;
+
+/* try expr: `expr` yields (T, Error?) or Error?. On a non-nil error the
+   enclosing function returns it; otherwise the value is T (or nothing). */
+typedef struct {
+    ASTNode base;
+    ASTNode *operand;
+    int mode;               /* set by typecheck: 1 = tuple operand, 2 = plain Error? */
+    char *operand_class;    /* mode 1: the tuple class of the operand */
+    int operand_count;      /* mode 1: its element count */
+    char *result_class;     /* mode 1, 3+ elements: the tuple of all but the last */
+    char *ret_class;        /* the enclosing function's tuple class, or NULL if it returns Error? */
+    int ret_count;
+} TryNode;
+
+typedef struct {
+    ASTNode base;
+    ASTNode **items;
+    int count;
+} SpliceNode;
 
 /* Created only during lowering: stands in for an expression whose value was
    already computed into IR temp `temp`. */
@@ -395,6 +450,9 @@ BreakNode *make_break();
 ContinueNode *make_continue();
 UnsafeBlockNode *make_unsafe_block(ASTNode **body, int body_count);
 DeferNode *make_defer(ASTNode **body, int body_count);
+TupleNode *make_tuple(ASTNode **elems, int count);
+TryNode *make_try(ASTNode *operand);
+SpliceNode *make_splice(ASTNode **items, int count);
 
 typedef struct {
     ASTNode base;
@@ -420,12 +478,15 @@ Type make_simple_type(char *name, int nullable);
 Type make_array_type(Type elem, int fixed_size);
 Type make_multi_type(Type *elems, int count, int is_any, int fixed_size);
 Type make_ref_type(Type inner);
+Type make_fn_type(Type *params, int count, Type ret);
 Type make_rawptr_type(Type inner);
 ModuleNode *make_module(char *name);
 
 typedef struct {
     ASTNode   base;
     char     *class_name;
+    Type     *type_args;     /* Box<int> { ... } */
+    int       type_arg_count;
     char    **field_names;   /* parallel arrays */
     ASTNode **field_values;
     int       field_count;
@@ -474,6 +535,16 @@ int ast_is_class(ClassNode **classes, int class_count, const char *name);
 /* stamp position/flags on a node the parser allocates itself */
 void ast_stamp(ASTNode *n);
 int ast_sysv_aggregate(ClassNode **classes, int class_count, const char *name);
+
+/* A scalar of a by-value struct, at its offset in Hylian's layout and in C's.
+   Lets the call lowering marshal structs whose layouts differ (nested structs,
+   fixed arrays, unions, fields C would pad). */
+typedef struct { int h_off, c_off, size, is_float; } CLeaf;
+/* Flatten `name` into C-layout leaves (at most `max`); returns the leaf count, or
+   0 if it can't be done. *csize is the struct's size in C, *desc the same
+   descriptor ast_sysv_aggregate returns. A union is treated as integer bytes. */
+int ast_c_layout(ClassNode **classes, int class_count, const char *name,
+                 CLeaf *out, int max, int *csize, int *desc);
 int ast_is_value_aggregate(ClassNode **classes, int class_count, const char *name);
 
 /* Does `name` declare a constructor? `new` needs this to know whether to

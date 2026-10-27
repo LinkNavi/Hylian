@@ -1,0 +1,16 @@
+max int: 9
+max explicit: 12
+max float: 2.5
+first: 5
+box: 42 hits 2
+box str: hello
+pair: 7 seven
+q: 1 0.5
+avg 1.5
+pop 3 size 2
+cmp 3 false false
+sz 8 16
+float stack 1.5
+nested box 5
+inferred 41 inferred
+float method 3.25

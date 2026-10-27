@@ -1,0 +1,11 @@
+len 101
+k77 154 true
+miss: key not found: nope (404)
+or -1
+count 9 len 101
+has k5 false k6 true len 100
+first count
+must count = 9
+run failed: key not found: absent
+names beta
+float 3.25

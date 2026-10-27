@@ -88,12 +88,61 @@ char *trim(char *s) {
 
 /* A type as written in a .hyi declaration: `int`, `float`, `str`, `*void`,
    `**uint8`, a struct name... */
+static Type hyi_parse_type(const char *text);
+
+/* index of the ')' closing the '(' at text[0], or -1 */
+static int hyi_match_paren(const char *text) {
+    int depth = 0;
+    for (int i = 0; text[i]; i++) {
+        if (text[i] == '(') depth++;
+        else if (text[i] == ')' && --depth == 0) return i;
+    }
+    return -1;
+}
+
+/* split `list` at commas outside parentheses, calling each piece through out[] */
+static int hyi_split_commas(char *list, char **out, int max) {
+    int n = 0, depth = 0;
+    char *start = list;
+    for (char *q = list; ; q++) {
+        if (*q == '(') depth++;
+        else if (*q == ')') depth--;
+        if ((*q == ',' && depth == 0) || !*q) {
+            int last = !*q;
+            *q = '\0';
+            if (n < max) out[n++] = start;
+            if (last) break;
+            start = q + 1;
+        }
+    }
+    return n;
+}
+
 static Type hyi_parse_type(const char *text) {
-    char buf[128];
+    char buf[256];
     strncpy(buf, text, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     char *t = trim(buf);
     if (*t == '*') return make_rawptr_type(hyi_parse_type(t + 1));
+    /* fn(int64, int64) -> int64: a typed callback */
+    if (!strncmp(t, "fn(", 3) || !strncmp(t, "fn (", 4)) {
+        char *open = strchr(t, '(');
+        int close = hyi_match_paren(open);
+        if (close > 0) {
+            char inner[256];
+            snprintf(inner, sizeof inner, "%.*s", close - 1, open + 1);
+            Type ps[16]; int np = 0;
+            char *items[16];
+            int ni = hyi_split_commas(inner, items, 16);
+            for (int i = 0; i < ni; i++) {
+                char *it = trim(items[i]);
+                if (*it) ps[np++] = hyi_parse_type(it);
+            }
+            char *arrow = strstr(open + close, "->");
+            Type ret = arrow ? hyi_parse_type(arrow + 2) : make_simple_type(strdup("void"), 0);
+            return make_fn_type(ps, np, ret);
+        }
+    }
     return make_simple_type(strdup(t), 0);
 }
 
@@ -118,9 +167,10 @@ static void hyi_parse_params(const char *open_paren, ASTNode ***out_params, int 
     if (len >= sizeof(list)) len = sizeof(list) - 1;
     memcpy(list, p, len);
     list[len] = '\0';
-    char *save = NULL;
-    for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        char *item = trim(tok);
+    char *toks[64];
+    int ntok = hyi_split_commas(list, toks, 64);
+    for (int ti = 0; ti < ntok; ti++) {
+        char *item = trim(toks[ti]);
         if (!*item) continue;
         char *colon = strchr(item, ':');
         char pname[64];
@@ -378,7 +428,8 @@ ProgramNode *parse_hyi_into_program(const char *filepath, char **out_link,
 
             /* Extract return type after "->" if present */
             Type ret_type;
-            char *arrow = strstr(paren, "->");
+            int pclose = hyi_match_paren(paren);
+            char *arrow = pclose > 0 ? strstr(paren + pclose, "->") : NULL;
             if (arrow) {
                 char ret_str[256];
                 strncpy(ret_str, arrow + 2, sizeof(ret_str) - 1);

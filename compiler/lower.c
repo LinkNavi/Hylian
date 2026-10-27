@@ -206,6 +206,7 @@ static int classify_print_arg(ASTNode *arg) {
 
 static int  lower_is_self_field(LowerState *s, const char *name);
 static int  lower_is_value_struct(LowerState *s, const Type *t);
+static void lower_emit_memcpy(LowerState *s, int tdst, int tsrc, int size);
 static int  lower_is_struct_param(LowerState *s, const char *name);
 static int  lower_expr(ASTNode *node, LowerState *s);
 static void lower_stmt(ASTNode *node, LowerState *s);
@@ -657,6 +658,55 @@ static int lower_copy_struct_return(LowerState *s, const char *var, int taddr) {
     return 1;
 }
 
+/* A struct that C would lay out differently from Hylian (nested struct, array,
+   union, padding): copy it leaf by leaf into a buffer shaped like C's, or the
+   other way. `to_c` picks the direction; `buf` is the C-layout buffer's
+   address and `hy` the Hylian one. Neighbouring leaves that line up in both
+   layouts are copied together. */
+static int lower_ptr_plus(LowerState *s, int base, int off) {
+    if (!off) return base;
+    int tc = alloc_temp(s), t = alloc_temp(s);
+    IRInstr *c = ir_emit(s->mod, IR_CONST_INT);
+    c->dest = irop_temp(tc); c->src1 = irop_const_int(off);
+    IRInstr *a = ir_emit(s->mod, IR_ADD);
+    a->dest = irop_temp(t); a->src1 = irop_temp(base); a->src2 = irop_temp(tc);
+    return t;
+}
+
+static void lower_marshal(LowerState *s, int hy, int buf, const CLeaf *lv, int n, int to_c) {
+    for (int i = 0; i < n; ) {
+        int j = i, len = lv[i].size;
+        while (j + 1 < n && lv[j + 1].h_off == lv[j].h_off + lv[j].size &&
+               lv[j + 1].c_off == lv[j].c_off + lv[j].size) { j++; len += lv[j].size; }
+        int from = to_c ? hy : buf, to = to_c ? buf : hy;
+        int foff = to_c ? lv[i].h_off : lv[i].c_off, toff = to_c ? lv[i].c_off : lv[i].h_off;
+        int tf = lower_ptr_plus(s, from, foff), tt = lower_ptr_plus(s, to, toff);
+        lower_emit_memcpy(s, tt, tf, len);
+        i = j + 1;
+    }
+}
+
+/* a local the size of a C struct: a packed class of 8-byte words, made on demand */
+static const char *lower_image_class(LowerState *s, int csize) {
+    char nm[48];
+    snprintf(nm, sizeof nm, "__cimg_%d", csize);
+    if (!ast_is_class(s->mod->classes, s->mod->class_count, nm)) {
+        ClassNode *cn = make_class(strdup(nm), 1);
+        cn->is_packed = 1;
+        cn->fields = malloc(((csize + 7) / 8) * sizeof(FieldNode *));
+        for (int i = 0; i < (csize + 7) / 8; i++) {
+            char fn[16];
+            snprintf(fn, sizeof fn, "w%d", i);
+            cn->fields[cn->field_count++] = make_field(make_simple_type("int", 0), strdup(fn), 1);
+        }
+        s->mod->classes = realloc(s->mod->classes, (s->mod->class_count + 1) * sizeof(ClassNode *));
+        s->mod->classes[s->mod->class_count++] = cn;
+    }
+    for (int i = 0; i < s->mod->class_count; i++)
+        if (!strcmp(s->mod->classes[i]->name, nm)) return s->mod->classes[i]->name;
+    return NULL;
+}
+
 /* "float" / "float32" when `t` is a float type (array elements are stored as raw
    words, so reading one back has to reinterpret the bits), else NULL. */
 static const char *lower_float_type_name(const Type *t) {
@@ -674,7 +724,8 @@ static const char *lower_array_elem_float(const Type *arr) {
    struct, and `new`, already produce an address; a variable / field chain is
    resolved with lower_object_base_ptr. */
 static int lower_struct_value_addr(ASTNode *e, LowerState *s) {
-    if (e->type == NODE_FUNC_CALL || e->type == NODE_NEW || e->type == NODE_METHOD_CALL)
+    if (e->type == NODE_FUNC_CALL || e->type == NODE_NEW || e->type == NODE_METHOD_CALL ||
+        e->type == NODE_STRUCT_LITERAL)
         return lower_expr(e, s);
     return lower_object_base_ptr(e, s);
 }
@@ -933,6 +984,71 @@ static int lower_hoist_compound(ASTNode *node, LowerState *s, int *result, int a
         *slots[i][1] = orig[i];
     }
     return 1;
+}
+
+/* Emit an indirect call: `tf` holds the function address, `callee_type` (may be
+   NULL for an untyped usize pointer) supplies parameter kinds and the result kind. */
+static int lower_indirect_call(int tf, ASTNode **args, int argc, const Type *callee_type, LowerState *s) {
+    int t = alloc_temp(s);
+    IROperand *arg_ops = argc > 0 ? malloc(argc * sizeof(IROperand)) : NULL;
+    for (int i = 0; i < argc; i++) {
+        int ta = lower_call_arg(args[i], s);
+        /* a typed pointer knows its parameter kinds: convert int<->float
+           so each argument lands in the register class the callee reads */
+        if (callee_type && i < callee_type->elem_type_count) {
+            int pk = tc_type_param_kind(&callee_type->elem_types[i]);
+            const char *an = args[i]->resolved_type.kind == TYPE_SIMPLE ? args[i]->resolved_type.name : NULL;
+            int ak = 0;
+            if (an) {
+                if (!strcmp(an, "float") || !strcmp(an, "double") || !strcmp(an, "float64")) ak = 2;
+                else if (!strcmp(an, "float32")) ak = 4;
+                else if (strcmp(an, "unknown") && strcmp(an, "auto") && strcmp(an, "str") &&
+                         strcmp(an, "void") && strcmp(an, "Error")) ak = 1;
+            }
+            if (args[i]->type == NODE_LITERAL && ((LiteralNode *)args[i])->lit_type == LIT_FLOAT) ak = 2;
+            const char *conv = NULL;
+            if (pk == 2 && ak != 2 && ak != 0) conv = "float";
+            else if (pk == 4 && ak != 4 && ak != 0) conv = "float32";
+            else if (pk == 1 && (ak == 2 || ak == 4)) conv = "int";
+            if (conv) {
+                int tc = alloc_temp(s);
+                IRInstr *c = ir_emit(s->mod, IR_CAST);
+                c->dest = irop_temp(tc); c->src1 = irop_temp(ta); c->str_extra = strdup(conv);
+                ta = tc;
+            }
+        }
+        arg_ops[i] = irop_temp(ta);
+    }
+    /* A pointer to a Hylian function returning a struct by value: pass the
+       hidden result buffer first, as a direct call does. The buffer's address
+       is the call's value. */
+    if (callee_type && callee_type->fn_ret && lower_is_value_struct(s, callee_type->fn_ret)) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "__sret_%d", alloc_label(s));
+        emit_alloca(s, nm, callee_type->fn_ret->name, TYPE_SIMPLE);
+        int sret_t = alloc_temp(s);
+        IRInstr *af = ir_emit(s->mod, IR_ADDROF);
+        af->dest = irop_temp(sret_t);
+        af->str_extra = strdup(nm);
+        IROperand *na = malloc((argc + 1) * sizeof(IROperand));
+        na[0] = irop_temp(sret_t);
+        for (int i = 0; i < argc; i++) na[i + 1] = arg_ops[i];
+        free(arg_ops);
+        arg_ops = na;
+        argc++;
+        t = sret_t;
+    }
+    IRInstr *ins = ir_emit(s->mod, IR_CALL);
+    ins->dest      = irop_temp(t);
+    ins->src1      = irop_temp(tf);
+    ins->str_extra = NULL;
+    ins->args      = arg_ops;
+    ins->arg_count = argc;
+    /* the pointer's declared result type picks the result register
+       (xmm0 for a float, narrowed for a small int) */
+    if (callee_type && callee_type->fn_ret)
+        ins->extra_int = tc_type_return_flags(callee_type->fn_ret);
+    return t;
 }
 
 static int lower_expr(ASTNode *node, LowerState *s) {
@@ -1753,23 +1869,29 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             return acc;
         }
 
+        /* ── helper(x) inside a method meaning self.helper(x) ─────────── */
+        if (call->implicit_self && s->class_name) {
+            IdentifierNode self_id = {0};
+            self_id.base.type = NODE_IDENTIFIER;
+            self_id.base.resolved_type = make_simple_type((char *)s->class_name, 0);
+            self_id.name = "self";
+            MethodCallNode mc = {0};
+            mc.base.type = NODE_METHOD_CALL;
+            mc.base.resolved_type = call->base.resolved_type;
+            mc.object = (ASTNode *)&self_id;
+            mc.method = call->name;
+            mc.args = call->args;
+            mc.arg_count = call->arg_count;
+            return lower_expr((ASTNode *)&mc, s);
+        }
+
         /* ── Indirect call: fp(args) through a variable ───────────────── */
         if (call->is_indirect) {
-            int t = alloc_temp(s);
             IdentifierNode fp_id = {0};
             fp_id.base.type = NODE_IDENTIFIER;
             fp_id.name = call->name;
             int tf = lower_expr((ASTNode *)&fp_id, s);
-            IROperand *arg_ops = call->arg_count > 0 ? malloc(call->arg_count * sizeof(IROperand)) : NULL;
-            for (int i = 0; i < call->arg_count; i++)
-                arg_ops[i] = irop_temp(lower_call_arg(call->args[i], s));
-            IRInstr *ins = ir_emit(s->mod, IR_CALL);
-            ins->dest      = irop_temp(t);
-            ins->src1      = irop_temp(tf);
-            ins->str_extra = NULL;
-            ins->args      = arg_ops;
-            ins->arg_count = call->arg_count;
-            return t;
+            return lower_indirect_call(tf, call->args, call->arg_count, call->callee_type, s);
         }
 
         /* ── General function call ─────────────────────────────────────── */
@@ -1827,6 +1949,23 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                             if (!arg_aggr) arg_aggr = calloc(nargs, sizeof(int));
                             arg_aggr[i] = desc;
                             arg_ops[i] = irop_temp(lower_object_base_ptr(call_args[i], s));
+                            continue;
+                        }
+                        CLeaf lv[64]; int csize = 0;
+                        int nl = ast_c_layout(s->mod->classes, s->mod->class_count,
+                                              call_args[i]->resolved_type.name, lv, 64, &csize, &desc);
+                        if (nl > 0) {
+                            const char *img = lower_image_class(s, csize);
+                            char nm[64];
+                            snprintf(nm, sizeof nm, "__cimg_arg_%d", alloc_label(s));
+                            emit_alloca(s, nm, img, TYPE_SIMPLE);
+                            int tb = alloc_temp(s);
+                            IRInstr *af = ir_emit(s->mod, IR_ADDROF);
+                            af->dest = irop_temp(tb); af->str_extra = strdup(nm);
+                            lower_marshal(s, lower_object_base_ptr(call_args[i], s), tb, lv, nl, 1);
+                            if (!arg_aggr) arg_aggr = calloc(nargs, sizeof(int));
+                            arg_aggr[i] = desc;
+                            arg_ops[i] = irop_temp(tb);
                             continue;
                         }
                         fprintf(stderr, "[lower] struct '%s' can't be passed by value to C "
@@ -1895,14 +2034,23 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                expression has. The local must exist before the call. */
             int ret_desc = 0;
             char *ret_buf = NULL;
+            CLeaf ret_lv[64]; int ret_nl = 0;   /* >0: copy the C-layout result into a Hylian struct */
             if (use_c_abi_args && lower_is_value_struct(s, &call->base.resolved_type)) {
                 ret_desc = ast_sysv_aggregate(s->mod->classes, s->mod->class_count,
                                               call->base.resolved_type.name);
+                const char *ret_type = call->base.resolved_type.name;
+                if (!ret_desc) {
+                    int csize = 0;
+                    ret_nl = ast_c_layout(s->mod->classes, s->mod->class_count, ret_type,
+                                          ret_lv, 64, &csize, &ret_desc);
+                    if (ret_nl > 0) ret_type = lower_image_class(s, csize);
+                    else ret_desc = 0;
+                }
                 if (ret_desc) {
                     char buf_name[64];
                     snprintf(buf_name, sizeof(buf_name), "__ret_%d", alloc_label(s));
                     ret_buf = strdup(buf_name);
-                    emit_alloca(s, ret_buf, call->base.resolved_type.name, TYPE_SIMPLE);
+                    emit_alloca(s, ret_buf, ret_type, TYPE_SIMPLE);
                 }
             }
             IRInstr *ins = ir_emit(s->mod, IR_CALL);
@@ -1914,12 +2062,33 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->extra_int = tc_func_return_flags(resolved_name);
             ins->ret_aggr  = ret_desc;
             ins->str_extra2 = ret_buf;
+            if (ret_nl > 0) {
+                /* the call left C-layout bytes at t; hand back a Hylian-layout copy */
+                char hn[64];
+                snprintf(hn, sizeof hn, "__hret_%d", alloc_label(s));
+                emit_alloca(s, hn, call->base.resolved_type.name, TYPE_SIMPLE);
+                int th = alloc_temp(s);
+                IRInstr *af = ir_emit(s->mod, IR_ADDROF);
+                af->dest = irop_temp(th); af->str_extra = strdup(hn);
+                lower_marshal(s, th, t, ret_lv, ret_nl, 0);
+                return th;
+            }
             return t;
         }
     }
 
     case NODE_METHOD_CALL: {
         MethodCallNode *mc = (MethodCallNode *)node;
+        if (mc->field_fn_type) {
+            /* obj.handler(args): load the pointer out of the field, call through it */
+            MemberAccessNode fa = {0};
+            fa.base.type = NODE_MEMBER_ACCESS;
+            fa.base.resolved_type = *mc->field_fn_type;
+            fa.object = mc->object;
+            fa.member = mc->method;
+            int tf = lower_expr((ASTNode *)&fa, s);
+            return lower_indirect_call(tf, mc->args, mc->arg_count, mc->field_fn_type, s);
+        }
         int t = alloc_temp(s);
 
         /* Array intrinsics */
@@ -2023,7 +2192,12 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->str_extra = mname;
             ins->args      = arg_ops;
             ins->arg_count = total;
+            /* The method's symbol is Class_method but the typechecker registers
+               Class__method, so the name lookup finds nothing for a real method:
+               fall back to the result type the typechecker gave this call. Without
+               it a float-returning method's result was read from rax, not xmm0. */
             ins->extra_int = tc_func_return_flags(mname);
+            if (!ins->extra_int) ins->extra_int = tc_type_return_flags(&mc->base.resolved_type);
             return t;
         }
     }
@@ -2262,6 +2436,117 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         return t;
     }
 
+    case NODE_TUPLE: {
+        TupleNode *tn = (TupleNode *)node;
+        return lower_expr(tn->lowered, s);
+    }
+
+    case NODE_TRY: {
+        TryNode *tr = (TryNode *)node;
+        /* Evaluate the call, test its error, and either return that error from
+           this function (running defers like any other return) or carry on
+           with the value. */
+        int tval = lower_expr(tr->operand, s);
+        int terr;
+        if (tr->mode == 1) {
+            terr = alloc_temp(s);
+            char fname[16];
+            snprintf(fname, sizeof fname, "_%d", tr->operand_count - 1);
+            IRInstr *gf = ir_emit(s->mod, IR_GET_FIELD);
+            gf->dest = irop_temp(terr);
+            gf->src1 = irop_temp(tval);
+            gf->str_extra = strdup(tr->operand_class);
+            gf->str_extra2 = strdup(fname);
+        } else {
+            terr = tval;
+        }
+        int lbl_ok = alloc_label(s);
+        { IRInstr *j = ir_emit(s->mod, IR_JUMP_UNLESS); j->src1 = irop_temp(terr); j->src2 = irop_label(lbl_ok); }
+        {
+            /* return <the error> in the shape this function returns */
+            TempRefNode eref = {0};
+            eref.base.type = NODE_TEMP_REF;
+            eref.base.resolved_type = make_simple_type("Error", 1);
+            eref.temp = terr;
+            ReturnNode ret = {0};
+            ret.base.type = NODE_RETURN;
+            if (tr->ret_class) {
+                StructLiteralNode sl = {0};
+                sl.base.type = NODE_STRUCT_LITERAL;
+                sl.class_name = tr->ret_class;
+                sl.field_count = tr->ret_count;
+                char *names[16]; char nbuf[16][8];
+                ASTNode *vals[16];
+                LiteralNode zeros[16];
+                for (int i = 0; i < tr->ret_count && i < 16; i++) {
+                    snprintf(nbuf[i], sizeof nbuf[i], "_%d", i);
+                    names[i] = nbuf[i];
+                    if (i == tr->ret_count - 1) {
+                        vals[i] = (ASTNode *)&eref;
+                    } else {
+                        memset(&zeros[i], 0, sizeof zeros[i]);
+                        zeros[i].base.type = NODE_LITERAL;
+                        zeros[i].base.resolved_type = make_simple_type("int", 0);
+                        zeros[i].value = "0";
+                        zeros[i].lit_type = LIT_INT;
+                        vals[i] = (ASTNode *)&zeros[i];
+                    }
+                }
+                sl.field_names = names;
+                sl.field_values = vals;
+                sl.base.resolved_type = make_simple_type(tr->ret_class, 0);
+                ret.value = (ASTNode *)&sl;
+                lower_stmt((ASTNode *)&ret, s);
+            } else {
+                ret.value = (ASTNode *)&eref;
+                lower_stmt((ASTNode *)&ret, s);
+            }
+        }
+        { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_ok); }
+        if (tr->mode == 1 && tr->result_class) {
+            /* 3+ elements: copy all but the error into a tuple of their own */
+            int n = tr->operand_count - 1;
+            TempRefNode refs[16];
+            char nbuf[16][8]; char *names[16]; ASTNode *vals[16];
+            for (int i = 0; i < n && i < 16; i++) {
+                int tv = alloc_temp(s);
+                snprintf(nbuf[i], sizeof nbuf[i], "_%d", i);
+                IRInstr *gf = ir_emit(s->mod, IR_GET_FIELD);
+                gf->dest = irop_temp(tv);
+                gf->src1 = irop_temp(tval);
+                gf->str_extra = strdup(tr->operand_class);
+                gf->str_extra2 = strdup(nbuf[i]);
+                memset(&refs[i], 0, sizeof refs[i]);
+                refs[i].base.type = NODE_TEMP_REF;
+                refs[i].temp = tv;
+                names[i] = nbuf[i];
+                vals[i] = (ASTNode *)&refs[i];
+            }
+            StructLiteralNode sl = {0};
+            sl.base.type = NODE_STRUCT_LITERAL;
+            sl.class_name = tr->result_class;
+            sl.field_count = n;
+            sl.field_names = names;
+            sl.field_values = vals;
+            sl.base.resolved_type = make_simple_type(tr->result_class, 0);
+            return lower_expr((ASTNode *)&sl, s);
+        }
+        if (tr->mode == 1) {
+            int tv = alloc_temp(s);
+            IRInstr *gf = ir_emit(s->mod, IR_GET_FIELD);
+            gf->dest = irop_temp(tv);
+            gf->src1 = irop_temp(tval);
+            gf->str_extra = strdup(tr->operand_class);
+            gf->str_extra2 = strdup("_0");
+            return tv;
+        }
+        int tz = alloc_temp(s);
+        IRInstr *z = ir_emit(s->mod, IR_CONST_INT);
+        z->dest = irop_temp(tz);
+        z->src1 = irop_const_int(0);
+        return tz;
+    }
+
     case NODE_STRUCT_LITERAL: {
         StructLiteralNode *sl = (StructLiteralNode *)node;
         /* Allocate a hidden named stack slot for the struct */
@@ -2278,7 +2563,28 @@ static int lower_expr(ASTNode *node, LowerState *s) {
         }
         /* Initialize each named field */
         for (int i = 0; i < sl->field_count; i++) {
-            int tval = lower_expr(sl->field_values[i], s);
+            ASTNode *fv = sl->field_values[i];
+            if (lower_is_value_struct(s, &fv->resolved_type)) {
+                /* nested struct field: copy the whole value in, not its address */
+                int width = 0; const char *ftype = NULL;
+                int off = ast_field_offset(s->mod->classes, s->mod->class_count,
+                                           sl->class_name, sl->field_names[i], &width, &ftype);
+                if (off >= 0) {
+                    int size = ast_class_byte_size(s->mod->classes, s->mod->class_count, fv->resolved_type.name);
+                    int tsrc = lower_struct_value_addr(fv, s);
+                    int tdst = taddr;
+                    if (off > 0) {
+                        tdst = alloc_temp(s);
+                        IRInstr *add = ir_emit(s->mod, IR_ADD);
+                        add->dest = irop_temp(tdst);
+                        add->src1 = irop_temp(taddr);
+                        add->src2 = irop_const_int((long)off);
+                    }
+                    lower_emit_memcpy(s, tdst, tsrc, size);
+                    continue;
+                }
+            }
+            int tval = lower_expr(fv, s);
             IRInstr *sf    = ir_emit(s->mod, IR_SET_FIELD);
             sf->src1       = irop_temp(taddr);
             sf->src2       = irop_temp(tval);

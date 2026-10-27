@@ -82,6 +82,8 @@ ClassNode *make_class(char *name, int is_public) {
     n->ctor_body = NULL; n->ctor_body_count = 0;
     n->has_ctor = 0;
     n->is_union = 0;
+    n->is_packed = 0;
+    n->type_params = NULL; n->type_param_count = 0;
     return n;
 }
 
@@ -92,6 +94,8 @@ MethodNode *make_method(Type return_type, char *name) {
     n->return_type = return_type; n->name = strdup(name);
     n->params = NULL; n->param_count = 0;
     n->body = NULL; n->body_count = 0;
+    n->is_naked = 0;
+    n->type_params = NULL; n->type_param_count = 0;
     return n;
 }
 
@@ -105,6 +109,7 @@ FuncNode *make_func(Type return_type, char *name) {
     n->is_naked = 0;
     n->is_public = 0;
     n->module_name = NULL;
+    n->type_params = NULL; n->type_param_count = 0;
     return n;
 }
 
@@ -258,6 +263,8 @@ MethodCallNode *make_method_call(ASTNode *obj, char *method) {
     n->object = obj; n->method = strdup(method);
     n->args = NULL; n->arg_count = 0;
     n->is_ufcs = 0;
+    n->type_args = NULL; n->type_arg_count = 0;
+    n->field_fn_type = NULL;
     return n;
 }
 
@@ -268,6 +275,8 @@ FuncCallNode *make_func_call(char *name) {
     n->name = strdup(name);
     n->args = NULL; n->arg_count = 0;
     n->is_indirect = 0;
+    n->implicit_self = 0;
+    n->callee_type = NULL; n->type_args = NULL; n->type_arg_count = 0;
     return n;
 }
 
@@ -277,6 +286,7 @@ NewNode *make_new(char *class_name) {
     zero_resolved_type(&n->base);
     n->class_name = strdup(class_name);
     n->args = NULL; n->arg_count = 0;
+    n->type_args = NULL; n->type_arg_count = 0;
     return n;
 }
 
@@ -321,6 +331,7 @@ Type make_simple_type(char *name, int nullable) {
     t.elem_type_count = 0;
     t.is_any = 0;
     t.fixed_size = 0;
+    t.is_fn = 0; t.fn_ret = NULL; t.type_args = NULL; t.type_arg_count = 0;
     return t;
 }
 
@@ -349,6 +360,7 @@ static void zero_resolved_type(ASTNode *n) {
     n->resolved_type.elem_type_count = 0;
     n->resolved_type.is_any = 0;
     n->resolved_type.fixed_size = 0;
+    n->resolved_type.is_fn = 0; n->resolved_type.fn_ret = NULL; n->resolved_type.type_args = NULL; n->resolved_type.type_arg_count = 0;
     if (g_loc_l1 > 0) {
         n->line = g_loc_l1; n->col = g_loc_c1;
         n->end_line = g_loc_l2; n->end_col = g_loc_c2;
@@ -368,6 +380,7 @@ Type make_array_type(Type elem, int fixed_size) {
     t.elem_type_count = 1;
     t.is_any = 0;
     t.fixed_size = fixed_size;
+    t.is_fn = 0; t.fn_ret = NULL; t.type_args = NULL; t.type_arg_count = 0;
     return t;
 }
 
@@ -378,6 +391,7 @@ Type make_multi_type(Type *elems, int count, int is_any, int fixed_size) {
     t.nullable = 0;
     t.is_any = is_any;
     t.fixed_size = fixed_size;
+    t.is_fn = 0; t.fn_ret = NULL; t.type_args = NULL; t.type_arg_count = 0;
     if (elems && count > 0) {
         t.elem_types = malloc(count * sizeof(Type));
         for (int i = 0; i < count; i++) t.elem_types[i] = elems[i];
@@ -443,13 +457,26 @@ IndexAssignNode *make_index_assign(ASTNode *object, ASTNode *index, ASTNode *val
     return n;
 }
 
+Type make_fn_type(Type *params, int count, Type ret) {
+    Type t = make_simple_type("usize", 0);
+    t.is_fn = 1;
+    if (count > 0) {
+        t.elem_types = malloc(count * sizeof(Type));
+        for (int i = 0; i < count; i++) t.elem_types[i] = params[i];
+        t.elem_type_count = count;
+    }
+    t.fn_ret = malloc(sizeof(Type));
+    *t.fn_ret = ret;
+    return t;
+}
+
 Type make_ref_type(Type inner) {
-    Type t; t.kind=TYPE_REF; t.name=NULL; t.nullable=0; t.is_any=0; t.fixed_size=0;
+    Type t; t.kind=TYPE_REF; t.name=NULL; t.nullable=0; t.is_any=0; t.fixed_size=0; t.is_fn=0; t.fn_ret=NULL; t.type_args=NULL; t.type_arg_count=0;
     t.elem_types=malloc(sizeof(Type)); t.elem_types[0]=inner; t.elem_type_count=1;
     return t;
 }
 Type make_rawptr_type(Type inner) {
-    Type t; t.kind=TYPE_RAWPTR; t.name=NULL; t.nullable=0; t.is_any=0; t.fixed_size=0;
+    Type t; t.kind=TYPE_RAWPTR; t.name=NULL; t.nullable=0; t.is_any=0; t.fixed_size=0; t.is_fn=0; t.fn_ret=NULL; t.type_args=NULL; t.type_arg_count=0;
     t.elem_types=malloc(sizeof(Type)); t.elem_types[0]=inner; t.elem_type_count=1;
     return t;
 }
@@ -464,6 +491,7 @@ ModuleNode *make_module(char *name) {
     n->base.resolved_type.elem_type_count = 0;
     n->base.resolved_type.is_any = 0;
     n->base.resolved_type.fixed_size = 0;
+    n->base.resolved_type.is_fn = 0; n->base.resolved_type.fn_ret = NULL; n->base.resolved_type.type_args = NULL; n->base.resolved_type.type_arg_count = 0;
     ast_stamp(&n->base);
     n->name = strdup(name);
     n->funcs = NULL;
@@ -615,6 +643,88 @@ int ast_sysv_aggregate(ClassNode **classes, int class_count, const char *name) {
     return (off << 2) | (off > 16 ? 0 : mask);
 }
 
+static int c_field_elem(FieldNode *f, const char **name) {
+    int fixed = f->field_type.kind == TYPE_ARRAY && f->field_type.fixed_size > 0;
+    if (fixed && f->field_type.elem_type_count > 0 && f->field_type.elem_types)
+        *name = f->field_type.elem_types[0].name;
+    else
+        *name = f->field_type.name ? f->field_type.name : "int";
+    return fixed ? f->field_type.fixed_size : 1;
+}
+
+static int c_align_of(ClassNode **classes, int class_count, ClassNode *cn, int depth) {
+    int al = 1;
+    if (depth > 8) return al;
+    for (int i = 0; i < cn->field_count; i++) {
+        FieldNode *f = cn->fields[i];
+        if (!f) continue;
+        const char *en;
+        c_field_elem(f, &en);
+        ClassNode *nested = ast_find_class(classes, class_count, en);
+        int a = nested ? c_align_of(classes, class_count, nested, depth + 1) : ast_prim_width(en);
+        if (a > al) al = a;
+    }
+    return al;
+}
+
+/* appends cn's leaves; hbase/cbase are where it starts in each layout.
+   Returns its C size (before tail padding), or -1 if it doesn't fit. */
+static int c_walk(ClassNode **classes, int class_count, ClassNode *cn, int hbase, int cbase,
+                  CLeaf *out, int max, int *n, int depth) {
+    if (depth > 8) return -1;
+    int hoff = hbase, coff = cbase, end = cbase;
+    for (int i = 0; i < cn->field_count; i++) {
+        FieldNode *f = cn->fields[i];
+        if (!f) continue;
+        const char *en;
+        int count = c_field_elem(f, &en);
+        ClassNode *nested = ast_find_class(classes, class_count, en);
+        if (cn->is_union) { hoff = hbase; coff = cbase; }
+        for (int k = 0; k < count; k++) {
+            if (nested && !nested->has_ctor && nested->field_count > 0) {
+                int al = c_align_of(classes, class_count, nested, depth + 1);
+                coff = (coff + al - 1) / al * al;
+                int sz = c_walk(classes, class_count, nested, hoff, coff, out, max, n, depth + 1);
+                if (sz < 0) return -1;
+                sz = (sz - coff + al - 1) / al * al;
+                coff += sz;
+                hoff += ast_class_byte_size(classes, class_count, en);
+            } else {
+                int w = ast_prim_width(en);
+                coff = (coff + w - 1) / w * w;
+                if (*n >= max) return -1;
+                int is_float = !cn->is_union && (!strcmp(en, "float") || !strcmp(en, "double") ||
+                               !strcmp(en, "float32") || !strcmp(en, "float64"));
+                out[(*n)++] = (CLeaf){ hoff, coff, w, is_float };
+                hoff += w; coff += w;
+            }
+            if (coff > end) end = coff;
+        }
+    }
+    return end;
+}
+
+int ast_c_layout(ClassNode **classes, int class_count, const char *name,
+                 CLeaf *out, int max, int *csize, int *desc) {
+    ClassNode *cn = ast_find_class(classes, class_count, name);
+    if (!cn || cn->has_ctor || cn->field_count == 0) return 0;
+    int n = 0;
+    int end = c_walk(classes, class_count, cn, 0, 0, out, max, &n, 0);
+    if (end <= 0 || n == 0) return 0;
+    int al = c_align_of(classes, class_count, cn, 0);
+    int size = (end + al - 1) / al * al;
+    int mask = 0, seen_int = 0;
+    for (int i = 0; i < n; i++) {
+        int eb = out[i].c_off / 8;
+        if (eb >= 2) continue;
+        if (out[i].is_float) { if (!(seen_int & (1 << eb))) mask |= 1 << eb; }
+        else                 { seen_int |= 1 << eb; mask &= ~(1 << eb); }
+    }
+    *csize = size;
+    *desc = (size << 2) | (size > 16 ? 0 : mask);
+    return n;
+}
+
 int ast_is_class(ClassNode **classes, int class_count, const char *name) {
     return ast_find_class(classes, class_count, name) != NULL;
 }
@@ -641,4 +751,29 @@ int ast_is_value_aggregate(ClassNode **classes, int class_count, const char *nam
 int ast_class_has_ctor(ClassNode **classes, int class_count, const char *name) {
     ClassNode *cn = ast_find_class(classes, class_count, name);
     return cn ? cn->has_ctor : 0;
+}
+
+
+TupleNode *make_tuple(ASTNode **elems, int count) {
+    TupleNode *n = calloc(1, sizeof(TupleNode));
+    n->base.type = NODE_TUPLE;
+    zero_resolved_type(&n->base);
+    n->elems = elems; n->elem_count = count;
+    return n;
+}
+
+TryNode *make_try(ASTNode *operand) {
+    TryNode *n = calloc(1, sizeof(TryNode));
+    n->base.type = NODE_TRY;
+    zero_resolved_type(&n->base);
+    n->operand = operand;
+    return n;
+}
+
+SpliceNode *make_splice(ASTNode **items, int count) {
+    SpliceNode *n = calloc(1, sizeof(SpliceNode));
+    n->base.type = NODE_SPLICE;
+    zero_resolved_type(&n->base);
+    n->items = items; n->count = count;
+    return n;
 }

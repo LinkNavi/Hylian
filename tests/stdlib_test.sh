@@ -106,7 +106,18 @@ run() {
 }
 
 run language ""
+run nested_struct ""
+run tuple_params ""
+run fn_ptr ""
+run fn_ptr_struct ""
+run tuples ""
+run generics ""
+run generic_vs_compare ""
+run generic_method ""
+run hashmap ""
+run sibling_calls ""
 run ffi_float "-lm"
+run ffi_nested ""
 run math ""
 run str_eq ""
 run assert_fail ""

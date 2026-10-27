@@ -32,6 +32,7 @@
 - [assert](stdlib/assert.md) — runtime assertions
 - [bytes](stdlib/bytes.md) — binary-safe byte buffers
 - [map](stdlib/map.md) — string-keyed hash map
+- [hashmap](stdlib/hashmap.md) — typed `HashMap<V>` built on generics, with `(V, Error?)` lookups
 - [net](stdlib/net.md) — raw IPv4 TCP/UDP sockets
 - [dns](stdlib/dns.md) — hostname resolution
 - [http](stdlib/http.md) — HTTP/1.1 client

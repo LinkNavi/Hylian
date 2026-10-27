@@ -848,10 +848,16 @@ MIRModule *lower_ir_to_mir(const IRModule *ir) {
                 /* indirect call: src1 is the function address */
                 MIRValue fp = lower_operand(&ins->src1, &env, mod, fn);
                 MIRValue *iargs = lower_args(ins->args, ins->arg_count, &env, mod, fn);
+                /* extra_int is the pointer's declared result kind (see tc_type_return_flags) */
+                MIRType irt = (ins->extra_int & 2) ? MIR_F64 : (ins->extra_int & 4) ? MIR_F32 : MIR_I64;
+                if (irt == MIR_I64 && (ins->extra_int >> 3) >= 1 && (ins->extra_int >> 3) <= 6) {
+                    static const MIRType inarrow[] = {MIR_I8, MIR_U8, MIR_I16, MIR_U16, MIR_I32, MIR_U32};
+                    irt = inarrow[(ins->extra_int >> 3) - 1];
+                }
                 MIRInstr *m = mir_build_call(fn, NULL, iargs, ins->arg_count,
-                                             mir_vreg(ins->dest.temp_id, MIR_I64));
+                                             mir_vreg(ins->dest.temp_id, irt));
                 m->src1 = fp;
-                tenv_set_temp(&env, ins->dest.temp_id, MIR_I64);
+                tenv_set_temp(&env, ins->dest.temp_id, irt);
                 break;
             }
             if (ins->str_extra && strcmp(ins->str_extra, "syscall") == 0) {

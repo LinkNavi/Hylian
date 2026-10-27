@@ -1,0 +1,8 @@
+add: 7
+mul: 12
+apply: 30
+half: 2.5
+scale: 6.0
+tbl[1](5) = 10
+h.run(5) = 6
+direct = 6

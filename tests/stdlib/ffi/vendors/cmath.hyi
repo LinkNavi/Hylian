@@ -1,0 +1,63 @@
+// Test fixture for ffi_float.hy: libm plus the helpers in ffi_float.c.
+module vendors.cmath
+
+pkg "cmath"
+
+struct Vec2 {
+    float32  x
+    float32  y
+}
+struct Col {
+    uint8  r
+    uint8  g
+    uint8  b
+    uint8  a
+}
+struct Rect {
+    int32  x
+    int32  y
+    int32  w
+    int32  h
+}
+struct Vec3 {
+    float32  x
+    float32  y
+    float32  z
+}
+struct Big {
+    int32  a
+    int32  b
+    int32  c
+    int32  d
+    int32  e
+}
+struct Mix {
+    float  d
+    int64  l
+}
+
+fn sqrt(x: float) -> float
+fn pow(x: float, y: float) -> float
+fn floor(x: float) -> float
+fn fabs(x: float) -> float
+fn ldexp(x: float, e: int32) -> float
+fn hypot(x: float, y: float) -> float
+fn fmaf(x: float32, y: float32, z: float32) -> float32
+fn snprintf(buf: str, n: int, fmt: str, x: float, y: int) -> int
+
+fn c_mix(a: float, n: int32, b: float, f: float32) -> float
+fn c_call_back(x: float) -> float
+fn c_neg(x: int32) -> int32
+fn c_u32(v: uint32) -> uint32
+fn c_halff(v: float32) -> float32
+fn c_apply(f: fn(int64, int64) -> int64, a: int64, b: int64) -> int64
+fn c_v2_add(a: Vec2, b: Vec2) -> Vec2
+fn c_col_dim(c: Col, k: float32) -> Col
+fn c_rect_area(r: Rect) -> int32
+fn c_rect_grow(r: Rect, n: int32) -> Rect
+fn c_v3_len2(v: Vec3) -> float32
+fn c_v3_scale(v: Vec3, k: float32) -> Vec3
+fn c_big_sum(b: Big) -> int32
+fn c_big_make(base: int32) -> Big
+fn c_mix_swap(m: Mix) -> Mix
+fn c_spill(a: int32, b: int32, c: int32, d: int32, e: int32, r: Rect) -> int32

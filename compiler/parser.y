@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include "ast.h"
 #include "diag.h"
+#include "mono.h"
 
 extern int yylex();
 extern int yylineno;
@@ -305,6 +306,56 @@ void typelist_add(TypeList* l, Type t) {
     }
     l->items[l->count++] = t;
 }
+
+/* ── generics / tuples helpers ───────────────────────────────────────────── */
+
+static void set_type_params(char ***out, int *count, void *list) {
+    NodeList *l = (NodeList *)list;
+    *out = malloc((l->count ? l->count : 1) * sizeof(char *));
+    for (int i = 0; i < l->count; i++) (*out)[i] = ((IdentifierNode *)l->items[i])->name;
+    *count = l->count;
+    free(l->items); free(l);
+}
+
+static Type generic_type(char *name, void *targs) {
+    TypeList *tl = (TypeList *)targs;
+    Type t = make_simple_type(name, 0);
+    t.type_args = tl->items; t.type_arg_count = tl->count;
+    free(tl);
+    mono_note_use();
+    return t;
+}
+
+static Type tuple_type_of(void *elems) {
+    TypeList *tl = (TypeList *)elems;
+    Type t = make_simple_type("__tuple", 0);
+    t.type_args = tl->items; t.type_arg_count = tl->count;
+    free(tl);
+    mono_note_use();
+    return t;
+}
+
+static FuncNode *build_func(Type ret, char *name, void *params, void *body) {
+    FuncNode *f = make_func(ret, name);
+    if (params) { NodeList *pl = (NodeList *)params; f->params = pl->items; f->param_count = pl->count; free(pl); }
+    NodeList *sl = (NodeList *)body; f->body = sl->items; f->body_count = sl->count; free(sl);
+    return f;
+}
+
+static MethodNode *build_method(Type ret, char *name, void *params, void *body) {
+    MethodNode *m = make_method(ret, name);
+    if (params) { NodeList *pl = (NodeList *)params; m->params = pl->items; m->param_count = pl->count; free(pl); }
+    NodeList *sl = (NodeList *)body; m->body = sl->items; m->body_count = sl->count; free(sl);
+    return m;
+}
+
+/* the class name a type spells, instantiating a generic one: `Box<int>` -> Box_of_int */
+static char *type_class_name(Type *t) {
+    if (t->type_arg_count > 0) { mono_request(t); return mono_mangle_type(t); }
+    return t->name ? strdup(t->name) : strdup("");
+}
+
+static int destructure_counter = 0;
 %}
 
 %code requires { #include "ast.h" }
@@ -351,7 +402,7 @@ void typelist_add(TypeList* l, Type t) {
 %token DO DEFER TYPEDEF DOTDOT DOTDOTEQ
 %token AND OR NOT
 %token GE LE EQ NE GT LT
-%token ADDROF_FN
+%token ADDROF_FN FN ARROW TRY GLT
 %token PLUS MINUS STAR SLASH MOD
 %token CCPINCLUDE VOID
 %token ARRAY MULTI ANY_KW PIPE
@@ -368,9 +419,9 @@ void typelist_add(TypeList* l, Type t) {
 %type <method_node> method_decl
 %type <func_node> func_decl
 %type <field_node> field_decl
-%type <type_node> type
+%type <type_node> type tuple_type type_item
 %type <node> expr stmt return_stmt var_decl member_decl for_init ctor_decl
-%type <node_list> class_body stmt_list param_list params arg_list args union_types include_list switch_arms field_init_list
+%type <node_list> type_list tparams ident_list class_body stmt_list param_list params arg_list args union_types include_list switch_arms field_init_list
 %type <node> include_path
 %type <node> if_stmt
 %type <str> assign_op
@@ -636,7 +687,19 @@ static_var_decl:
    the heap/arena type created with `new`. That split is what lets kernel-ABI
    layouts like Timespec and SockAddrIn be expressed directly.  */
 struct_decl:
-    STRUCT IDENTIFIER LBRACE class_body RBRACE {
+    STRUCT IDENTIFIER GLT tparams GT LBRACE class_body RBRACE {
+        $$ = make_class($2, 0);
+        absorb_type_body($$, $7, 0);
+        set_type_params(&$$->type_params, &$$->type_param_count, $4);
+        mono_note_use();
+    }
+    | PUBLIC STRUCT IDENTIFIER GLT tparams GT LBRACE class_body RBRACE {
+        $$ = make_class($3, 1);
+        absorb_type_body($$, $8, 0);
+        set_type_params(&$$->type_params, &$$->type_param_count, $5);
+        mono_note_use();
+    }
+    | STRUCT IDENTIFIER LBRACE class_body RBRACE {
         $$ = make_class($2, 0);
         absorb_type_body($$, $4, 0);
     }
@@ -660,7 +723,19 @@ struct_decl:
     ;
 
 class_decl:
-    PUBLIC CLASS IDENTIFIER LBRACE class_body RBRACE {
+    CLASS IDENTIFIER GLT tparams GT LBRACE class_body RBRACE {
+        $$ = make_class($2, 0);
+        absorb_type_body($$, $7, 1);
+        set_type_params(&$$->type_params, &$$->type_param_count, $4);
+        mono_note_use();
+    }
+    | PUBLIC CLASS IDENTIFIER GLT tparams GT LBRACE class_body RBRACE {
+        $$ = make_class($3, 1);
+        absorb_type_body($$, $8, 1);
+        set_type_params(&$$->type_params, &$$->type_param_count, $5);
+        mono_note_use();
+    }
+    | PUBLIC CLASS IDENTIFIER LBRACE class_body RBRACE {
         $$ = make_class($3, 1);
         NodeList* body = (NodeList*)$5;
         for (int i = 0; i < body->count; i++) {
@@ -945,6 +1020,20 @@ func_decl:
         if ($5) { NodeList* pl=(NodeList*)$5; $$->params=pl->items; $$->param_count=pl->count; free(pl); }
         NodeList* sl=(NodeList*)$8; $$->body=sl->items; $$->body_count=sl->count; free(sl);
     }
+    /* generic function: T max<T>(T a, T b) { ... } */
+    | type IDENTIFIER GLT tparams GT LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
+        $$ = build_func($1, $2, $7, $10);
+        set_type_params(&$$->type_params, &$$->type_param_count, $4);
+        mono_note_use();
+    }
+    /* tuple result: (int, Error?) parse(str s) { ... } */
+    | tuple_type IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
+        $$ = build_func($1, $2, $4, $7);
+    }
+    | tuple_type IDENTIFIER GLT tparams GT LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
+        $$ = build_func($1, $2, $7, $10);
+        set_type_params(&$$->type_params, &$$->type_param_count, $4);
+    }
     /* naked variants */
     | NAKED type IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
         $$ = make_func($2, $3);
@@ -986,6 +1075,7 @@ field_decl:
     PRIVATE type IDENTIFIER SEMICOLON { $$ = make_field($2, $3, 0); }
     | PUBLIC type IDENTIFIER SEMICOLON  { $$ = make_field($2, $3, 1); }
     | type IDENTIFIER SEMICOLON         { $$ = make_field($1, $2, 0); }
+    | tuple_type IDENTIFIER SEMICOLON   { $$ = make_field($1, $2, 0); }
     /* Fixed-size array field, e.g. `uint64 id[4];` — ast_field_byte_width()/
        ast_field_offset() in ast.c already understand TYPE_ARRAY fields with
        fixed_size > 0 (addressed as a whole block, sized as width*count) -
@@ -1009,11 +1099,20 @@ method_decl:
         if ($4) { NodeList* pl=(NodeList*)$4; $$->params=pl->items; $$->param_count=pl->count; free(pl); }
         NodeList* sl=(NodeList*)$7; $$->body=sl->items; $$->body_count=sl->count; free(sl);
     }
+    /* generic method: T map<U>(fn(T) -> U f) { ... } */
+    | type IDENTIFIER GLT tparams GT LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
+        $$ = build_method($1, $2, $7, $10);
+        set_type_params(&$$->type_params, &$$->type_param_count, $4);
+        mono_note_use();
+    }
     | type QUESTION IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
         Type t=$1; t.nullable=1;
         $$ = make_method(t, $3);
         if ($5) { NodeList* pl=(NodeList*)$5; $$->params=pl->items; $$->param_count=pl->count; free(pl); }
         NodeList* sl=(NodeList*)$8; $$->body=sl->items; $$->body_count=sl->count; free(sl);
+    }
+    | tuple_type IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
+        $$ = build_method($1, $2, $4, $7);
     }
     | NAKED type IDENTIFIER LPAREN param_list RPAREN LBRACE stmt_list RBRACE {
         $$ = make_method($2, $3);
@@ -1040,7 +1139,17 @@ params:
         list_add(l,(ASTNode*)make_var_decl($1,$2,$4));
         $$=l;
     }
+    | tuple_type IDENTIFIER {
+        NodeList* l=list_new();
+        list_add(l,(ASTNode*)make_var_decl($1,$2,NULL));
+        $$=l;
+    }
     | params COMMA type IDENTIFIER {
+        NodeList* l=(NodeList*)$1;
+        list_add(l,(ASTNode*)make_var_decl($3,$4,NULL));
+        $$=l;
+    }
+    | params COMMA tuple_type IDENTIFIER {
         NodeList* l=(NodeList*)$1;
         list_add(l,(ASTNode*)make_var_decl($3,$4,NULL));
         $$=l;
@@ -1060,6 +1169,56 @@ arg_list:
 args:
     expr { NodeList* l=list_new(); list_add(l,$1); $$=l; }
     | args COMMA expr { NodeList* l=(NodeList*)$1; list_add(l,$3); $$=l; }
+    ;
+
+/* type_list: comma-separated types, for fn(A, B) -> R (a TypeList*, like union_types) */
+type_item:
+    type { $$ = $1; }
+    | type QUESTION { $$ = $1; $$.nullable = 1; }
+    ;
+
+type_list:
+    type_item {
+        TypeList* tl = typelist_new();
+        typelist_add(tl, $1);
+        $$ = (void*)tl;
+    }
+    | type_list COMMA type_item {
+        TypeList* tl = (TypeList*)$1;
+        typelist_add(tl, $3);
+        $$ = (void*)tl;
+    }
+    ;
+
+tparams:
+    IDENTIFIER {
+        NodeList* l = list_new();
+        list_add(l, (ASTNode*)make_identifier($1));
+        $$ = l;
+    }
+    | tparams COMMA IDENTIFIER {
+        NodeList* l = (NodeList*)$1;
+        list_add(l, (ASTNode*)make_identifier($3));
+        $$ = l;
+    }
+    ;
+
+ident_list:
+    IDENTIFIER {
+        NodeList* l = list_new();
+        list_add(l, (ASTNode*)make_identifier($1));
+        $$ = l;
+    }
+    | ident_list COMMA IDENTIFIER {
+        NodeList* l = (NodeList*)$1;
+        list_add(l, (ASTNode*)make_identifier($3));
+        $$ = l;
+    }
+    ;
+
+/* (A, B) - a tuple type, usable as a function's return type */
+tuple_type:
+    LPAREN type_list RPAREN { $$ = tuple_type_of($2); }
     ;
 
 /* union_types: pipe-separated list of types for multi<A | B | ...>
@@ -1088,6 +1247,15 @@ type:
 | STAR type  { $$ = make_rawptr_type($2); }
 | AMP  type  { $$ = make_ref_type($2); }
     | IDENTIFIER { $$ = resolve_type_name($1); }
+    /* generic instantiation: Box<int>, Pair<str, int> */
+    | IDENTIFIER GLT type_list GT { $$ = generic_type($1, $3); }
+    /* typed function pointer: fn(int, int) -> int */
+    | FN LPAREN RPAREN ARROW type { $$ = make_fn_type(NULL, 0, $5); }
+    | FN LPAREN type_list RPAREN ARROW type {
+        TypeList* tl = (TypeList*)$3;
+        $$ = make_fn_type(tl->items, tl->count, $6);
+        free(tl->items); free(tl);
+    }
     /* array<T> */
     | ARRAY LT type GT                      { $$ = make_array_type($3, 0); }
     /* array<array<T>>: the lexer reads the closing '>>' as one shift token */
@@ -1116,7 +1284,11 @@ stmt_list:
     /* empty */ { $$ = list_new(); }
     | stmt_list stmt {
         NodeList* l=(NodeList*)$1;
-        if ($2) list_add(l,$2);
+        if ($2 && $2->type == NODE_SPLICE) {
+            SpliceNode* sp = (SpliceNode*)$2;
+            for (int i = 0; i < sp->count; i++) list_add(l, sp->items[i]);
+            free(sp->items); free(sp);
+        } else if ($2) list_add(l,$2);
         $$=l;
     }
     ;
@@ -1174,6 +1346,8 @@ stmt:
         ab->base.resolved_type.elem_type_count = 0;
         ab->base.resolved_type.is_any = 0;
         ab->base.resolved_type.fixed_size = 0;
+        ab->base.resolved_type.is_fn = 0; ab->base.resolved_type.fn_ret = NULL;
+        ab->base.resolved_type.type_args = NULL; ab->base.resolved_type.type_arg_count = 0;
         ab->body = $1;
         $$ = (ASTNode*)ab;
     }
@@ -1201,6 +1375,25 @@ stmt:
     /* := declare-assign (type inferred as auto) */
     | IDENTIFIER DECLARE_ASSIGN expr SEMICOLON {
         $$ = (ASTNode*)make_var_decl(make_simple_type("auto", 0), $1, $3);
+    }
+    /* destructuring: `v, err := f();` declares one variable per tuple element
+       (a `_` skips one). Rewritten to a hidden tuple variable plus a := per name. */
+    | IDENTIFIER COMMA ident_list DECLARE_ASSIGN expr SEMICOLON {
+        char tmp[48]; snprintf(tmp, sizeof tmp, "__tup%d", destructure_counter++);
+        NodeList* names = (NodeList*)$3;
+        int total = names->count + 1;
+        ASTNode **items = malloc((total + 1) * sizeof(ASTNode*));
+        int n = 0;
+        items[n++] = (ASTNode*)make_var_decl(make_simple_type("auto", 0), strdup(tmp), $5);
+        for (int i = 0; i < total; i++) {
+            char *nm = i == 0 ? $1 : ((IdentifierNode*)names->items[i-1])->name;
+            if (strcmp(nm, "_") == 0) continue;
+            char field[16]; snprintf(field, sizeof field, "_%d", i);
+            ASTNode *acc = (ASTNode*)make_member_access((ASTNode*)make_identifier(strdup(tmp)), strdup(field));
+            items[n++] = (ASTNode*)make_var_decl(make_simple_type("auto", 0), nm, acc);
+        }
+        free(names->items); free(names);
+        $$ = (ASTNode*)make_splice(items, n);
     }
     /* simple assign */
     | IDENTIFIER ASSIGN expr SEMICOLON {
@@ -1359,7 +1552,9 @@ for_init:
     ;
 
 var_decl:
-    type IDENTIFIER ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_var_decl($1, $2, $4); }
+    tuple_type IDENTIFIER ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_var_decl($1, $2, $4); }
+    | tuple_type IDENTIFIER SEMICOLON           { $$ = (ASTNode*)make_var_decl($1, $2, NULL); }
+    | type IDENTIFIER ASSIGN expr SEMICOLON { $$ = (ASTNode*)make_var_decl($1, $2, $4); }
     | type IDENTIFIER SEMICOLON           { $$ = (ASTNode*)make_var_decl($1, $2, NULL); }
     /* struct literal with the type name inferred from the declared type:
        `Color bleh = { r: 1, ... };` instead of `Color bleh = Color { ... };` */
@@ -1367,7 +1562,7 @@ var_decl:
         StructLiteralNode *sl = calloc(1, sizeof(StructLiteralNode));
         sl->base.type = NODE_STRUCT_LITERAL; ast_stamp(&sl->base);
         memset(&sl->base.resolved_type, 0, sizeof(Type));
-        sl->class_name = strdup($1.name ? $1.name : "");
+        sl->class_name = type_class_name(&$1);
         NodeList *fl = (NodeList*)$5;
         sl->field_count  = fl->count / 2;
         sl->field_names  = malloc(sl->field_count * sizeof(char*));
@@ -1442,6 +1637,53 @@ expr:
         NodeList* al=(NodeList*)$3; c->args=al->items; c->arg_count=al->count; free(al);
         $$ = (ASTNode*)c;
     }
+    /* generic call with explicit type arguments: max<int>(a, b) */
+    | IDENTIFIER GLT type_list GT LPAREN arg_list RPAREN {
+        FuncCallNode* c = make_func_call($1);
+        NodeList* al=(NodeList*)$6; c->args=al->items; c->arg_count=al->count; free(al);
+        TypeList* tl=(TypeList*)$3; c->type_args=tl->items; c->type_arg_count=tl->count; free(tl);
+        mono_note_use();
+        $$ = (ASTNode*)c;
+    }
+    | NEW IDENTIFIER GLT type_list GT LPAREN arg_list RPAREN {
+        NewNode* n = make_new($2);
+        NodeList* al=(NodeList*)$7; n->args=al->items; n->arg_count=al->count; free(al);
+        TypeList* tl=(TypeList*)$4; n->type_args=tl->items; n->type_arg_count=tl->count; free(tl);
+        mono_note_use();
+        $$ = (ASTNode*)n;
+    }
+    /* tuple: (a, b) */
+    | LPAREN expr COMMA args RPAREN {
+        NodeList* rest = (NodeList*)$4;
+        ASTNode **elems = malloc((rest->count + 1) * sizeof(ASTNode*));
+        elems[0] = $2;
+        for (int i = 0; i < rest->count; i++) elems[i+1] = rest->items[i];
+        int cnt = rest->count + 1;
+        free(rest->items); free(rest);
+        mono_note_use();
+        $$ = (ASTNode*)make_tuple(elems, cnt);
+    }
+    /* try f(): unwrap a (T, Error?) result, or return the error from this function */
+    | TRY expr %prec UMINUS { $$ = (ASTNode*)make_try($2); }
+    /* generic struct literal: Pair<int, str> { first: 1, second: "x" } */
+    | IDENTIFIER GLT type_list GT LBRACE field_init_list RBRACE {
+        StructLiteralNode *sl = calloc(1, sizeof(StructLiteralNode));
+        sl->base.type = NODE_STRUCT_LITERAL; ast_stamp(&sl->base);
+        memset(&sl->base.resolved_type, 0, sizeof(Type));
+        sl->class_name = $1;
+        TypeList* tl=(TypeList*)$3; sl->type_args=tl->items; sl->type_arg_count=tl->count; free(tl);
+        mono_note_use();
+        NodeList *fl = (NodeList*)$6;
+        sl->field_count  = fl->count / 2;
+        sl->field_names  = malloc(sl->field_count * sizeof(char*));
+        sl->field_values = malloc(sl->field_count * sizeof(ASTNode*));
+        for (int i = 0; i < sl->field_count; i++) {
+            sl->field_names[i]  = ((IdentifierNode*)fl->items[i*2])->name;
+            sl->field_values[i] = fl->items[i*2+1];
+        }
+        free(fl->items); free(fl);
+        $$ = (ASTNode*)sl;
+    }
     /* new */
     | NEW IDENTIFIER LPAREN arg_list RPAREN {
         NewNode* n = make_new($2);
@@ -1455,8 +1697,21 @@ expr:
         NodeList* al=(NodeList*)$5; c->args=al->items; c->arg_count=al->count; free(al);
         $$ = (ASTNode*)c;
     }
+    /* generic method call with explicit type arguments: box.map<str>(f) */
+    | expr DOT IDENTIFIER GLT type_list GT LPAREN arg_list RPAREN {
+        MethodCallNode* c = make_method_call($1, $3);
+        NodeList* al=(NodeList*)$8; c->args=al->items; c->arg_count=al->count; free(al);
+        TypeList* tl=(TypeList*)$5; c->type_args=tl->items; c->type_arg_count=tl->count; free(tl);
+        mono_note_use();
+        $$ = (ASTNode*)c;
+    }
     /* member access */
     | expr DOT IDENTIFIER { $$ = (ASTNode*)make_member_access($1, $3); }
+    /* t.0 / t.1: element access on a tuple (its fields are _0, _1, ...) */
+    | expr DOT NUMBER {
+        char fname[24]; snprintf(fname, sizeof fname, "_%ld", $3);
+        $$ = (ASTNode*)make_member_access($1, strdup(fname));
+    }
     /* binary ops */
     | expr PLUS  expr { $$ = (ASTNode*)make_binary_op("+",  $1, $3); }
     | expr MINUS expr { $$ = (ASTNode*)make_binary_op("-",  $1, $3); }
@@ -1481,7 +1736,7 @@ expr:
     | TILDE expr      { $$ = (ASTNode*)make_unary_op("~", $2, 0); }
     /* `expr as Type` — postfix cast shorthand, same semantics as cast<T>(expr) */
     | expr AS type %prec AS {
-        char *tname = $3.name ? strdup($3.name) : strdup("void");
+        char *tname = $3.type_arg_count > 0 ? type_class_name(&$3) : ($3.name ? strdup($3.name) : strdup("void"));
         ASTNode *type_node = (ASTNode*)make_literal(tname, LIT_STRING);
         free(tname);
         $$ = (ASTNode*)make_binary_op("cast", $1, type_node);
@@ -1490,7 +1745,7 @@ expr:
     | CAST LT type GT LPAREN expr RPAREN {
         /* Represent as a unary op "cast" carrying the type name in a BinaryOpNode
            with a string literal as the right child (the type name). */
-        char *tname = $3.name ? strdup($3.name) : strdup("void");
+        char *tname = $3.type_arg_count > 0 ? type_class_name(&$3) : ($3.name ? strdup($3.name) : strdup("void"));
         ASTNode *type_node = (ASTNode*)make_literal(tname, LIT_STRING);
         free(tname);
         $$ = (ASTNode*)make_binary_op("cast", $6, type_node);
@@ -1503,7 +1758,8 @@ expr:
     | SIZE_OF LPAREN type RPAREN {
         FuncCallNode *c = make_func_call("__size_of__");
         c->args = malloc(sizeof(ASTNode*));
-        c->args[0] = (ASTNode*)make_identifier($3.name ? strdup($3.name) : strdup("usize"));
+        c->args[0] = (ASTNode*)make_identifier($3.type_arg_count > 0 ? type_class_name(&$3)
+                                               : ($3.name ? strdup($3.name) : strdup("usize")));
         c->arg_count = 1;
         $$ = (ASTNode*)c;
     }

@@ -86,6 +86,42 @@ expect "a caret line is printed under the source" \
 $'int main() {\n    return zzz;\n}\n' \
 "    return zzz;"
 
+expect "a typed function pointer checks its argument count" \
+$'int add(int a, int b) { return a + b; }\nint main() {\n    fn(int, int) -> int op = addrof_fn(add);\n    return op(1);\n}\n' \
+"takes 2 arguments, but 1 given"
+
+expect "a typed function pointer checks argument types" \
+$'int add(int a, int b) { return a + b; }\nint main() {\n    fn(int, int) -> int op = addrof_fn(add);\n    return op(1, "x");\n}\n' \
+"argument 2 of call through 'op' has type 'str', expected 'int'"
+
+expect "a function pointer that returns a float is not an int-returning pointer" \
+$'float half(int a) { return 0.5; }\nint call(fn(int) -> int f) { return f(1); }\nint main() {\n    return call(addrof_fn(half));\n}\n' \
+"it returns 'float', not 'int'"
+
+expect "a function pointer must match the declared signature" \
+$'float half(float x) { return x; }\nint main() {\n    fn(int, int) -> int op = addrof_fn(half);\n    return 0;\n}\n' \
+"function pointer type mismatch"
+
+expect "a generic function whose parameter cannot be inferred says so" \
+$'T none<T>() { return 0; }\nint main() {\n    int y = none();\n    return 0;\n}\n' \
+"cannot infer type parameter 'T' of 'none'"
+
+expect "generic arguments must agree" \
+$'T pick<T>(T a, T b) { return a; }\nint main() {\n    pick(1, "x");\n    return 0;\n}\n' \
+"argument 2 has type 'str'"
+
+expect "wrong number of type arguments" \
+$'class Box<T> { T v; }\nint main() {\n    Box<int, int> b;\n    return 0;\n}\n' \
+"'Box' takes 1 type argument, but 2 given"
+
+expect "try needs a function that can return the error" \
+$'(int, Error?) f() { return (1, nil); }\nint main() {\n    int x = try f();\n    return x;\n}\n' \
+"must return Error? or a tuple ending in Error?"
+
+expect "a tuple must match its declared type" \
+$'int main() {\n    (int, Error?) r = (1, 2, 3);\n    return 0;\n}\n' \
+"cannot initialize '(int, Error?)' with a value of type '(int, int, int)'"
+
 echo
 echo "diagnostics tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

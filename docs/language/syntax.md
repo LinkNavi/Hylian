@@ -497,6 +497,93 @@ int v = volatile *ptr;       // volatile read
   function: `usize fp = addrof_fn(add); fp(2, 3);`. It can also be passed to C as a
   callback, or kept in an array as a dispatch table.
 
+## Typed Function Pointers
+
+`fn(int, int) -> int` is the type of a pointer to a function with that signature.
+`addrof_fn(f)` has exactly `f`'s signature, so calls through it are checked and an indirect
+call returns the declared type (a `float` comes back as a float):
+
+```
+int add(int a, int b) { return a + b; }
+struct Handler { int id; fn(int) -> int run; }
+
+int apply(fn(int, int) -> int f, int a, int b) { return f(a, b); }
+
+fn(int, int) -> int op = addrof_fn(add);
+op(1, 2);                      // ok
+op(1);                         // error: takes 2 arguments, but 1 given
+array<fn(int) -> int> table = [addrof_fn(inc), addrof_fn(dbl)];
+Handler h = Handler { id: 1, run: addrof_fn(inc) };
+h.run(5);                      // call through a field
+```
+
+`f := addrof_fn(g)` keeps the signature. An untyped `usize` still works as before.
+
+## Generics
+
+Functions, classes and structs can take type parameters. They are monomorphized: every
+distinct set of type arguments produces an ordinary copy.
+
+```
+T max<T>(T a, T b) { if (a > b) { return a; } return b; }
+
+struct Pair<A, B> { A first; B second; }
+
+class Box<T> {
+    T value;
+    Box(T v) { value = v; }
+    T get() { return value; }
+}
+
+max(3, 9);                         // T inferred from the arguments
+max<float>(1.5, 2);                // or written out
+Box<int> b = new Box<int>(41);
+Pair<int, str> p = Pair<int, str> { first: 1, second: "one" };
+```
+
+A generic function infers its type arguments from the call, and a generic class from its
+constructor arguments (`new Box(41)` is a `Box<int>`); when a parameter does not appear in
+them (`new Empty()`), write the arguments.
+A class method can be generic too (`U map<U>(fn(T) -> U f)`); `b.map(addrof_fn(show))` infers `U`
+from the argument and `b.map<str>(...)` names it. Each instance is added to the class as `map_of_str`.
+`Box<int>` is stored under the name `Box_of_int`, which is what shows up in link-level
+names. `<` is read as a bracket only when it directly follows a name and encloses something
+that looks like a type list followed by `(`, `{` or a name, so `i<n` stays a comparison.
+
+## Tuples and `try`
+
+A function can return several values. Declare the result as a parenthesised type, build it with
+a tuple expression, and take it apart with a destructuring `:=`:
+
+```
+(int, Error?) parse(str s) {
+    if (length(s) == 0) { return (0, Err("empty", 1)); }
+    return (42, nil);
+}
+
+v, err := parse("7");            // declares v and err; `_` skips an element
+if (err != nil) { println(err.message()); }
+t := (1, 2);                      // t.0, t.1 (also t._0, t._1)
+```
+
+`try` unwraps a `(T, Error?)` (or an `Error?`) and returns the error from the enclosing
+function when there is one, so it must itself return `Error?` or a tuple ending in `Error?`:
+
+```
+(int, Error?) twice(str s) {
+    int v = try parse(s);        // on error: return (0, err)
+    return (v * 2, nil);
+}
+Error? check(str s) { try parse(s); return nil; }
+```
+
+On a tuple with more elements, `try` gives back the tuple of everything but the error:
+`t := try parts(n);` with `parts` returning `(int, str, Error?)` leaves `t` as `(int, str)`.
+
+A tuple type is a struct with fields `_0`, `_1`, ... passed and returned by value; two tuple
+types with the same element types are the same type. Tuple types are written in a function's
+return position and in local declarations (`(int, Error?) r = parse("7");`).
+
 ## `naked` Functions and Inline Assembly
 
 ```hylian
@@ -574,3 +661,6 @@ matching `}` (`error LBRACE stmt_list RBRACE`), a malformed class member is skip
 to the next `;`, and a malformed statement is likewise skipped up to the next `;`.
 These don't change what valid Hylian looks like; they just mean one bad declaration
 doesn't cascade into a wall of unrelated parse errors.
+
+Inside a method, a bare call to another method of the same class means `self.method(...)`, just as a
+bare field name means `self.field`: `int twice() { bump(); bump(); return get(); }`.

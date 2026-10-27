@@ -9,6 +9,11 @@ module.exports = grammar({
   word: ($) => $.identifier,
 
   conflicts: ($) => [
+    [$.generic_type, $.identifier_expr],
+    [$.identifier_expr, $.call_expr],
+    [$.identifier_expr, $.struct_literal_expr],
+    [$.fn_type, $.postfix_array_type],
+    [$.postfix_ref_type, $.fn_type],
     [$.func_decl, $.method_decl],
     [$.type, $.identifier_expr],
     [$.module_decl, $.func_decl],
@@ -18,6 +23,7 @@ module.exports = grammar({
     [$.ref_type, $.postfix_ref_type],
     [$.interface_decl, $.postfix_ref_type],
     [$.cast_expr, $.binary_expr],
+    [$.method_call_expr, $.member_expr],
   ],
 
   rules: {
@@ -97,6 +103,9 @@ module.exports = grammar({
             $.rawptr_type,
             $.ref_type,
             $.postfix_ref_type,
+            $.fn_type,
+            $.tuple_type,
+            $.generic_type,
             $.identifier,
           ),
           optional("?"),
@@ -109,10 +118,23 @@ module.exports = grammar({
     // Postfix reference type: int&  (equivalent to &int)
     postfix_ref_type: ($) => seq($.type, "&"),
 
-    // NOTE: there is deliberately no tuple_type here. Tuples were removed from
-    // the language (see compiler/ast.h - the tuple Type kind is gone), and a
-    // grammar that still accepted them made the editor happily highlight and
-    // fold syntax the compiler rejects outright.
+    // Generic instantiation: Box<int>, Pair<str, int>
+    generic_type: ($) => prec.dynamic(-1, seq($.identifier, "<", commaSep1($.type), ">")),
+
+    // Typed function pointer: fn(int, int) -> int
+    fn_type: ($) =>
+      seq("fn", "(", optional(commaSep1($.type)), ")", "->", $.type),
+
+    // Tuple type, written as a function's result: (int, Error?)
+    tuple_type: ($) => seq("(", $.type, ",", commaSep1($.type), ")"),
+
+    // Template parameters: <T, U>
+    type_params: ($) => seq("<", commaSep1($.identifier), ">"),
+
+    // Explicit type arguments on `new`: new Box<int>(1). (A bare call `max<int>(a, b)` is
+    // ambiguous with a comparison for a context-free LR parse; the compiler's lexer decides
+    // it, tree-sitter does not try.)
+    type_args: ($) => prec.dynamic(-1, seq("<", commaSep1($.type), ">")),
 
     primitive_type: (_) =>
       choice(
@@ -167,6 +189,7 @@ module.exports = grammar({
         optional("public"),
         "class",
         field("name", $.identifier),
+        optional($.type_params),
         "{",
         optional($.class_body),
         "}",
@@ -184,6 +207,7 @@ module.exports = grammar({
         optional("public"),
         "struct",
         field("name", $.identifier),
+        optional($.type_params),
         "{",
         optional($.class_body),
         "}",
@@ -240,6 +264,7 @@ module.exports = grammar({
         field("return_type", $.type),
         optional("?"),
         field("name", $.identifier),
+        optional($.type_params),
         "(",
         optional($.param_list),
         ")",
@@ -256,6 +281,7 @@ module.exports = grammar({
         field("return_type", $.type),
         optional("?"),
         field("name", $.identifier),
+        optional($.type_params),
         "(",
         optional($.param_list),
         ")",
@@ -279,6 +305,7 @@ module.exports = grammar({
       choice(
         $.var_decl_stmt,
         $.declare_assign_stmt,
+        $.destructure_stmt,
         $.assign_stmt,
         $.compound_assign_stmt,
         $.target_compound_assign_stmt,
@@ -318,6 +345,16 @@ module.exports = grammar({
 
     declare_assign_stmt: ($) =>
       seq(field("name", $.identifier), ":=", field("value", $.expression), ";"),
+
+    // `v, err := f();` - one name per tuple element (`_` skips one)
+    destructure_stmt: ($) =>
+      seq(
+        field("name", $.identifier),
+        repeat1(seq(",", field("name", $.identifier))),
+        ":=",
+        field("value", $.expression),
+        ";",
+      ),
 
     assign_stmt: ($) =>
       seq(field("name", $.identifier), "=", field("value", $.expression), ";"),
@@ -391,17 +428,8 @@ module.exports = grammar({
         ";",
       ),
 
-    return_stmt: ($) =>
-      seq(
-        "return",
-        optional(
-          choice(
-            seq($.expression, repeat1(seq(",", $.expression))),
-            $.expression,
-          ),
-        ),
-        ";",
-      ),
+    // One value only: several results go in a tuple expression, `return (a, b);`
+    return_stmt: ($) => seq("return", optional($.expression), ";"),
 
     if_stmt: ($) =>
       seq(
@@ -575,6 +603,8 @@ module.exports = grammar({
         $.nil_literal,
         $.identifier_expr,
         $.paren_expr,
+        $.tuple_expr,
+        $.try_expr,
         $.volatile_read_expr,
         $.cast_expr,
         $.as_cast_expr,
@@ -601,7 +631,12 @@ module.exports = grammar({
         ),
       ),
 
-    // NOTE: no tuple_expr either - see the tuple_type note above.
+    // (a, b) - a tuple value
+    tuple_expr: ($) =>
+      seq("(", $.expression, ",", commaSep1($.expression), ")"),
+
+    // try f() - unwrap a (T, Error?) or return the error from this function
+    try_expr: ($) => prec(7, seq("try", field("operand", $.expression))),
 
     binary_expr: ($) =>
       choice(
@@ -694,6 +729,7 @@ module.exports = grammar({
           field("object", $.expression),
           ".",
           field("method", $.identifier),
+          optional($.type_args),
           "(",
           field("args", optional($.arg_list)),
           ")",
@@ -703,7 +739,7 @@ module.exports = grammar({
     member_expr: ($) =>
       prec(
         9,
-        seq(field("object", $.expression), ".", field("member", $.identifier)),
+        seq(field("object", $.expression), ".", field("member", choice($.identifier, $.integer_literal))),
       ),
 
     index_expr: ($) =>
@@ -718,7 +754,7 @@ module.exports = grammar({
       ),
 
     new_expr: ($) =>
-      seq("new", field("class", $.identifier), "(", optional($.arg_list), ")"),
+      seq("new", field("class", $.identifier), optional($.type_args), "(", optional($.arg_list), ")"),
 
     struct_literal_expr: ($) =>
       prec(

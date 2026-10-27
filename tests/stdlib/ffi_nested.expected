@@ -1,0 +1,8 @@
+outer: 7.5
+outer make: 3.0 6.0 9
+padded: 7.5
+padded make: 7 0.5
+arr round trip: 8765 8
+tagged: 342
+quad: 36
+quad make: 10 11 12 1 4

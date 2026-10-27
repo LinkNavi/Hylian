@@ -30,8 +30,8 @@ fn snprintf(buf: str, n: int, fmt: str, x: float, y: int) -> int   // variadic i
   come out right automatically.
 - Structs pass and return **by value** per the SysV classification (`fn DrawCircleV(c: Vector2,
   r: float32, color: Color)`, `fn GetMousePosition() -> Vector2`): small structs travel in
-  registers, larger ones on the stack or through a hidden return pointer. The struct must
-  be flat - no nested structs, arrays, unions, or fields C would pad.
+  registers, larger ones on the stack or through a hidden return pointer. Nested
+  structs, fixed arrays, unions and padded fields are marshalled into C's layout for the call.
 - Function pointers: `addrof_fn(f)` gives a `usize` you can pass to a C callback parameter.
 - Both directions work: a Hylian `float f(float a, int n)` can be called from C as
   `double f(double, int)`. See `tests/stdlib/ffi_float.*` for a runnable example that calls

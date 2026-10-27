@@ -12,6 +12,8 @@
   "break"
   "continue"
   "defer"
+  "try"
+  "fn"
   "asm"
   "switch"
   "case"

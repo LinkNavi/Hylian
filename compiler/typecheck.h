@@ -15,6 +15,9 @@ void typecheck(ProgramNode *program, const char *filename);
 int tc_func_return_is_bool(const char *name);
 int tc_func_return_flags(const char *name);
 int tc_func_param_kind(const char *name, int i);
+/* The same two classifications for a bare type (a typed fn pointer's signature). */
+int tc_type_return_flags(const Type *t);
+int tc_type_param_kind(const Type *t);
 
 /* Returns 1 when the named function is a bodyless declaration that came from
    an include file. Generated .hyi declarations for C libraries have this

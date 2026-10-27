@@ -1,0 +1,49 @@
+// Test fixture for ffi_nested.hy: structs whose C layout differs from a flat one.
+module vendors.cnest
+
+pkg "cnest"
+
+struct In {
+    float32  x
+    float32  y
+}
+struct Outer {
+    In     p
+    int32  id
+}
+struct Padded {
+    int8    c
+    float   d
+}
+struct WithArr {
+    int32[3]  v
+    int32     n
+}
+union class Num {
+    int32    i
+    float32  f
+}
+struct Tagged {
+    int32  tag
+    Num    u
+}
+struct Rect2 {
+    int32  x
+    int32  y
+    int32  w
+    int32  h
+}
+struct Quad {
+    Rect2  a
+    Rect2  b
+}
+
+fn n_outer_sum(o: Outer) -> float32
+fn n_outer_make(x: float32, id: int32) -> Outer
+fn n_padded_sum(p: Padded) -> float
+fn n_padded_make(c: int32, d: float) -> Padded
+fn n_arr_sum(a: WithArr) -> int32
+fn n_arr_make(base: int32) -> WithArr
+fn n_tag_int(t: Tagged) -> int32
+fn n_quad_area(q: Quad) -> int32
+fn n_quad_make(k: int32) -> Quad

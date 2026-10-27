@@ -11,6 +11,7 @@ static int input(void);
    most recently returned (0-based column, length in bytes), which is the
    lookahead token when the parser reports a syntax error. Reset lex_col to 0
    before parsing a new buffer. */
+static int tok_is_ident = 0, prev_tok_is_ident = 0;
 int lex_col = 0, lex_tok_col = 0, lex_tok_len = 0, lex_tok_line = 1, lex_tok_first = 0;
 /* the token BEFORE the current one: where it ended and what it ended with */
 int lex_prev_line = 0, lex_prev_end_col = 0, lex_prev_last = 0;
@@ -30,9 +31,23 @@ static int cur_end_line = 0, cur_end_col = 0, cur_last = 0;
         lex_prev_line = cur_end_line; lex_prev_end_col = cur_end_col; lex_prev_last = cur_last; \
         lex_tok_col = _start; lex_tok_len = (int)yyleng; lex_tok_first = yytext[0]; \
         lex_tok_line = yylineno; \
+        prev_tok_is_ident = tok_is_ident; tok_is_ident = 0; \
         cur_end_line = yylineno; cur_end_col = lex_col; cur_last = yytext[yyleng - 1]; \
     } }
 extern const char *current_compile_target;
+
+/* ── generic angle brackets ───────────────────────────────────────────────────
+   `Box<int>` and `max<int>(a, b)` use '<' and '>' as brackets, which the
+   grammar cannot tell from comparison operators with one token of lookahead.
+   So the lexer decides: a '<' glued to the end of an identifier that opens a
+   balanced `<type, type>` made only of type-ish characters, and is followed by
+   something that continues a type or a call, is a GLT. Everything else stays
+   an ordinary less-than. generic_depth lets a closing '>>' be split in two. */
+static int generic_depth = 0;
+
+static int looks_like_generic_args(void);
+static int fn_type_follows(void);
+static int try_operand_follows(void);
 
 /* Skip tokens for a top-level declaration (function or class body).
    Called after @target(X) when X doesn't match the current target.
@@ -292,6 +307,13 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
 "null"              { return NIL; }
 "true"              { return TRUE_LIT; }
 "false"             { return FALSE_LIT; }
+"fn"         { char *w = strdup(yytext);   /* the lookahead's unput() clobbers yytext */
+                if (fn_type_follows()) { free(w); return FN; }
+                tok_is_ident = 1; yylval.str = w; return IDENTIFIER; }
+"->"         { return ARROW; }
+"try"        { char *w = strdup(yytext);
+                if (try_operand_follows()) { free(w); return TRY; }
+                tok_is_ident = 1; yylval.str = w; return IDENTIFIER; }
 "addrof_fn"  { return ADDROF_FN; }
 "adrof_fn"   { return ADDROF_FN; }
 "while"             { return WHILE; }
@@ -329,7 +351,7 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
 "cast"    { return CAST; }
 "as"      { return AS; }
 "size_of" { return SIZE_OF; }
-[a-zA-Z_][a-zA-Z0-9_]*  { yylval.str = strdup(yytext); return IDENTIFIER; }
+[a-zA-Z_][a-zA-Z0-9_]*  { yylval.str = strdup(yytext); tok_is_ident = 1; return IDENTIFIER; }
 [0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)?  { yylval.str = strip_underscores(yytext); return FLOAT_LITERAL; }
 [0-9][0-9_]*[eE][+-]?[0-9]+                  { yylval.str = strip_underscores(yytext); return FLOAT_LITERAL; }
 0[bB][01_]+  {
@@ -415,8 +437,10 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
 "&&"                { return AND; }
 "||"                { return OR; }
 "!"                 { return NOT; }
-">"                 { return GT; }
-"<"                 { return LT; }
+">"                 { if (generic_depth > 0) generic_depth--; return GT; }
+"<"                 { if (prev_tok_is_ident && lex_prev_line == yylineno && lex_prev_end_col == lex_tok_col &&
+                          looks_like_generic_args()) { generic_depth++; return GLT; }
+                      return LT; }
 "+"                 { return PLUS; }
 "-"                 { return MINUS; }
 "*"                 { return STAR; }
@@ -427,7 +451,7 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
 "&"                 { return AMP; }
 "~"                 { return TILDE; }
 "<<"                { return LSHIFT; }
-">>"                { return RSHIFT; }
+">>"                { if (generic_depth > 0) { lex_col--; cur_end_col--; yyless(1); generic_depth--; return GT; } return RSHIFT; }
 "^"                 { return XOR; }
 "$"                 { /* swallow stray $ (legacy prefix, no longer needed) */ }
 @target[ \t]*\([ \t]*[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\) {
@@ -447,3 +471,73 @@ static char *rewrite_interpolation(const char *body, size_t blen) {
 .                   { fprintf(stderr, "\033[1m%s:%d:\033[0m \033[1;31merror:\033[0m unexpected character '%s'\n", current_parse_file, yylineno, yytext); }
 
 %%
+
+static int looks_like_generic_args(void) {
+    char buf[200], post[16];
+    int n = 0, np = 0, depth = 1, c, closed = 0;
+    while (n < (int)sizeof(buf) - 1 && (c = input()) != EOF && c != 0) {
+        buf[n++] = (char)c;
+        if (c == '\n') break;
+        if (c == '<') depth++;
+        else if (c == '>') { if (--depth == 0) { closed = 1; break; } }
+        else if (!(c == ',' || c == ' ' || c == '*' || c == '?' || c == '_' ||
+                   (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) break;
+    }
+    int result = 0;
+    if (closed) {
+        int first = 0;
+        while (first < n && buf[first] == ' ') first++;
+        int starts_type = first < n && ((buf[first] >= 'a' && buf[first] <= 'z') ||
+                          (buf[first] >= 'A' && buf[first] <= 'Z') || buf[first] == '_');
+        /* the first non-blank character after the closing '>' */
+        int nc;
+        while (np < (int)sizeof(post) - 1 && ((nc = input()) == ' ' || nc == '\t')) post[np++] = (char)nc;
+        if (nc != EOF && nc != 0 && np < (int)sizeof(post)) post[np++] = (char)nc;
+        else nc = 0;
+        result = starts_type && (nc == '(' || nc == '{' || nc == ')' || nc == ',' || nc == ';' ||
+                 nc == '>' || nc == '?' || nc == '[' || nc == '_' ||
+                 (nc >= 'a' && nc <= 'z') || (nc >= 'A' && nc <= 'Z'));
+        for (int i = np - 1; i >= 0; i--) unput(post[i]);
+    }
+    for (int i = n - 1; i >= 0; i--) unput(buf[i]);
+    return result;
+}
+
+/* `fn` and `try` are keywords only where they can be: `fn(int) -> int` is a type,
+   so `fn(` must be followed by a balanced `)` and then `->`; `try expr` needs
+   something that starts an expression next. Anywhere else they stay ordinary
+   identifiers, so existing code that calls a variable `fn` keeps working. */
+static int fn_type_follows(void) {
+    char buf[300]; int n = 0, depth = 0, c, started = 0, result = 0;
+    while (n < (int)sizeof(buf) - 2 && (c = input()) != EOF && c != 0) {
+        buf[n++] = (char)c;
+        if (c == '\n') break;
+        if (!started) {
+            if (c == ' ' || c == '\t') continue;
+            if (c != '(') break;
+            started = 1; depth = 1; continue;
+        }
+        if (c == '(') depth++;
+        else if (c == ')' && --depth == 0) {
+            int d = 0;
+            while (n < (int)sizeof(buf) - 2 && ((d = input()) == ' ' || d == '\t')) buf[n++] = (char)d;
+            if (d != EOF && d != 0) buf[n++] = (char)d;
+            if (d == '-') {
+                int e = input();
+                if (e != EOF && e != 0) { buf[n++] = (char)e; result = (e == '>'); }
+            }
+            break;
+        }
+    }
+    for (int i = n - 1; i >= 0; i--) unput(buf[i]);
+    return result;
+}
+
+static int try_operand_follows(void) {
+    int c, n = 0; char buf[32];
+    while (n < (int)sizeof(buf) - 1 && ((c = input()) == ' ' || c == '\t')) buf[n++] = (char)c;
+    int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '(' || c == '"';
+    if (c != EOF && c != 0) unput(c);
+    for (int i = n - 1; i >= 0; i--) unput(buf[i]);
+    return ok;
+}

@@ -108,6 +108,7 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
       ../../compiler/ast.c \
       ../../compiler/diag.c \
       ../../compiler/typecheck.c \
+      ../../compiler/mono.c \
       ../../compiler/loader.c \
       lsp_diag.c \
       lsp_zora.c \
@@ -134,6 +135,7 @@ echo -e "${BOLD}  Building LSP server...${RESET}"
       lex_lsp.yy.c \
       parser_lsp.tab.c \
       ../../compiler/ast.c \
+      ../../compiler/mono.c \
       ../../compiler/diag.c \
       lsp_diag.c \
       ../tools/lsp_syntax_check.c \

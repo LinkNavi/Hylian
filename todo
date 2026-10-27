@@ -1,26 +1,34 @@
-Function pointers. You already have addrof_fn, so this is mostly a call-expression form that emits call *reg. It's small and unlocks callbacks, dispatch tables, and kernel handler tables.
-Stdlib cache staleness. Hash or mtime-check the cache against the stdlib source. It's about 30 minutes of work and prevents hours of confusion.
-Compound assignment double-evaluation. Evaluate the target address once into a temp, then load, op, store. It's a small codegen change that removes a silent bug.
-String == without include { string }. Auto-link equals, or at minimum emit a compile error instead of failing silently.
-**Structs by value** (raylib's `Vector2`/`Color`, SDL's `SDL_Rect`): they need their own SysV classification. That is the next blocker for the raylib goal.
-- **Function-pointer callbacks:** there's no way to pass them to C yet.
+TODO, in order (bugs, then features, then optimization)
 
-Revamp tree sitter to match current words
-Completely rewrite lsp_analysis.c to match current stdlib setup, class setup, and zora.toml
+BUGS
+ 1. DONE synced lsp/tree-sitter-hylian (pushed cafdae0 to LinkNavi/tree-sitter-hylian; gitlink updated).
+ 2. DONE nested struct literals copy the value (tests/stdlib/nested_struct.hy).
+ 3. DONE (lexer-level GLT in compiler/lexer.l; tests/stdlib/generic_vs_compare.hy) was: grammar cannot tell an explicit generic call `max<int>(a, b)` from a comparison.
+ 4. DONE in compiler/parser.y (tests/stdlib/tuple_params.hy); tree-sitter/LSP grammars still lack it.
 
-Optimize the language{
-move the compiler's opt.c to hygen so that optiization is backend sided (like llvm)
-Optimize language {
-        Skip arena_init/arena_free in functions that never use new, or allocate the arena lazily. This takes fib from ~30s to the milliseconds range.
-Lower a[i] and a[i]=v directly to MIR (bounds check plus a load or store) instead of calling into array.hy. matmul and sieve should improve a lot.
-Add mem2reg.
-Fix the codegen: fuse compare and branch, use immediate operands, and move args straight into registers.
-Add cross-module inlining.
-    }
+FEATURES
+ 5. DONE http/https no longer use map.hy (Response/Url structs, header arrays; a HashMap<V> can't
+    be returned inside a struct, class values don't survive that); (T, Error?) used throughout.
+    map.hy itself stays, with its test.
+ 6. PARTLY DONE http has real types (Response, Url). bytes Buffer is still a usize handle: a class
+    can't escape the function that creates it (inflate returns its buffer), so it needs the
+    language limitation lifted first.
+ 7. DONE (already current; rebuilt lsp, restored the missing tests/lsp fixture vendors/gfx/gfx.hyi, lsp_test.py all pass) was: rewrite lsp_analysis.c to match the current stdlib setup, class setup and zora.toml.
+ 8. DONE generic methods (`U map<U>(fn(T) -> U f)`, explicit or inferred type args): parser.y, mono.c
+    (mono_instantiate_method), typecheck.c, tree-sitter grammar; tests/stdlib/generic_method.hy.
+ 9. DONE function pointers returning a struct by value (lower_indirect_call; tests/stdlib/fn_ptr_struct.hy).
+10. DONE structs by value across the C ABI with nested structs, arrays, unions and padding
+    (ast_c_layout + lower_marshal; tests/stdlib/ffi_nested.hy). Not: bool fields, float unions.
+11. DONE .hyi accepts typed callbacks (`f: fn(int64, int64) -> int64`), the loader no longer splits them
+    at the inner comma, and a fn pointer whose int/float class differs is a type mismatch (tests/diag_test.sh).
+12. Closures.
+13. Trait-style bounds on generics.
 
-    codegen improvements
-}
-
+OPTIMIZATION
+14. Cross-module inlining of runtime.hy/array.hy/mem.hy (separate objects).
+15. Induction-variable strength reduction.
+16. Live-range splitting / shrink-wrapping.
+17. Literally any thing we can do so we are at least 2nd place or tied for 2nd in every test (allowed 2 test to be 3rd)
 
 first bench check (bench/run.py)
 

@@ -1,0 +1,8 @@
+total 40 true
+total failed: negative
+v = 14
+error: bad digit code 2
+check failed: empty
+check ok
+pair 2.5 4
+t 1 2

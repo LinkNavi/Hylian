@@ -5,15 +5,14 @@ include { https, }
 ```
 
 Source: `stdlib/https.hy`. [`http`](http.md) over TLS, plus a scheme-agnostic `fetch`. It
-returns the same response handle and uses the same accessors (`http_status`,
-`http_body`, `http_body_addr`, `http_free`, …), and follows redirects across schemes.
+returns the same `Response` and uses the same accessors (`r.status`,
+`http_body`, `r.body`, `http_free`, …), and follows redirects across schemes.
 
 | Function | Signature | Description |
 |---|---|---|
-| `https_get` / `fetch` | `usize https_get(str url)` | GET an `http://` **or** `https://` URL. |
-| `https_request` | `usize https_request(str method, str url, array<str> headers, str body)` | Any method. |
-| `https_download` | `bool https_download(str url, str path)` | GET and save a `200` response. |
-| `https_error` | `str https_error()` | Description of the last failure. |
+| `https_get` / `fetch` | `(Response, Error?) https_get(str url)` | GET an `http://` **or** `https://` URL. |
+| `https_request` | `(Response, Error?) https_request(str method, str url, array<str> headers, str body)` | Any method. |
+| `https_download` | `Error? https_download(str url, str path)` | GET and save a `200` response. |
 
 Certificates are verified — see [`tls`](tls.md). Linking this module needs OpenSSL:
 
@@ -27,8 +26,8 @@ system = "openssl"
 include { io, https, }
 
 int main() {
-    usize r = fetch("https://example.com/");
-    if (r == 0) { eprintln(https_error()); return 1; }
+    r, err := fetch("https://example.com/");
+    if (err != nil) { eprintln(err.message()); return 1; }
     println(http_body(r));
     return 0;
 }

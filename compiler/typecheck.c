@@ -1,6 +1,7 @@
 #include "typecheck.h"
 #include "diag.h"
 #include "ast.h"
+#include "mono.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -286,8 +287,140 @@ static const char *type_name(Type t) {
 }
 
 
+/* ── typed function pointers ─────────────────────────────────────────────── */
+
+/* Coarse category of a type, just enough to reject an obviously wrong argument
+   (a string where an int is wanted, one class for another) without second-
+   guessing the many implicit conversions the rest of the language allows. */
+enum { TC_CAT_UNKNOWN, TC_CAT_NUM, TC_CAT_STR, TC_CAT_CLASS, TC_CAT_ARRAY, TC_CAT_FN };
+
+static int tc_type_cat(const Type *t) {
+  if (!t) return TC_CAT_UNKNOWN;
+  if (t->kind == TYPE_ARRAY) return TC_CAT_ARRAY;
+  if (t->kind != TYPE_SIMPLE || !t->name) return TC_CAT_UNKNOWN;
+  if (t->is_fn) return TC_CAT_FN;
+  static const char *nums[] = { "int","int8","int16","int32","int64","uint8","uint16","uint32","uint64",
+    "usize","isize","float","float32","float64","double","bool","char", NULL };
+  for (int i = 0; nums[i]; i++) if (strcmp(t->name, nums[i]) == 0) return TC_CAT_NUM;
+  if (strcmp(t->name, "str") == 0) return t->nullable ? TC_CAT_UNKNOWN : TC_CAT_STR;
+  if (is_enum_type(t->name)) return TC_CAT_NUM;
+  for (int i = 0; i < tc_class_name_count; i++)
+    if (tc_class_names[i] && strcmp(tc_class_names[i], t->name) == 0) return TC_CAT_CLASS;
+  return TC_CAT_UNKNOWN;
+}
+
+static int tc_args_compatible(const Type *want, const Type *got) {
+  int a = tc_type_cat(want), b = tc_type_cat(got);
+  if (a == TC_CAT_UNKNOWN || b == TC_CAT_UNKNOWN) return 1;
+  if (a == TC_CAT_FN && b == TC_CAT_NUM) return 1;   /* an untyped address */
+  if (a == TC_CAT_NUM && b == TC_CAT_FN) return 1;
+  if (a != b) return 0;
+  if (a == TC_CAT_CLASS) return strcmp(want->name, got->name) == 0;
+  return 1;
+}
+
+static const char *tc_type_display(const Type *t);
+
+static void tc_fn_type_str(const Type *t, char *buf, size_t n) {
+  size_t o = (size_t)snprintf(buf, n, "fn(");
+  for (int i = 0; i < t->elem_type_count && o < n; i++)
+    o += (size_t)snprintf(buf + o, n - o, "%s%s", i ? ", " : "", tc_type_display(&t->elem_types[i]));
+  if (o < n)
+    snprintf(buf + o, n - o, ") -> %s", t->fn_ret ? tc_type_display(t->fn_ret) : "void");
+}
+
+static const char *tc_type_display(const Type *t) {
+  static char bufs[32][256];
+  static int k = 0;
+  char *buf = bufs[k++ & 31];
+  if (t->is_fn) { tc_fn_type_str(t, buf, 256); return buf; }
+  int tn = 0;
+  if (t->kind == TYPE_SIMPLE && t->name && !strncmp(t->name, "__tuple_of_", 11) && mono_tuple_info(t->name, &tn)) {
+    size_t o = (size_t)snprintf(buf, 256, "(");
+    for (int i = 0; i < tn && o < 255; i++) {
+      const Type *e = mono_tuple_elem(t->name, i);
+      o += (size_t)snprintf(buf + o, 256 - o, "%s%s%s", i ? ", " : "", tc_type_display(e), e->nullable ? "?" : "");
+    }
+    if (o < 255) snprintf(buf + o, 256 - o, ")");
+    return buf;
+  }
+  return type_name(*t);
+}
+
+int tc_type_param_kind(const Type *t);
+
+/* An int where a float is wanted (or float32 for float64) is not a harmless
+   conversion through a pointer: the value travels in a different register. */
+static int tc_fn_kinds_clash(const Type *want, const Type *got) {
+  if (want->kind != TYPE_SIMPLE || got->kind != TYPE_SIMPLE || want->is_fn || got->is_fn) return 0;
+  int a = tc_type_param_kind(want), b = tc_type_param_kind(got);
+  return a && b && a != b;
+}
+
+/* Do two fn pointer types have the same signature? Reports the first
+   difference through `why`. A param/return pair that is not provably
+   different counts as matching. */
+static int tc_fn_sigs_match(const Type *want, const Type *got, char *why, size_t n) {
+  if (want->elem_type_count != got->elem_type_count) {
+    snprintf(why, n, "it takes %d argument%s, not %d", got->elem_type_count,
+             got->elem_type_count == 1 ? "" : "s", want->elem_type_count);
+    return 0;
+  }
+  for (int i = 0; i < want->elem_type_count; i++)
+    if (tc_fn_kinds_clash(&want->elem_types[i], &got->elem_types[i]) ||
+        !tc_args_compatible(&want->elem_types[i], &got->elem_types[i])) {
+      snprintf(why, n, "parameter %d is '%s', not '%s'", i + 1,
+               tc_type_display(&got->elem_types[i]), tc_type_display(&want->elem_types[i]));
+      return 0;
+    }
+  if (want->fn_ret && got->fn_ret &&
+      (tc_fn_kinds_clash(want->fn_ret, got->fn_ret) || !tc_args_compatible(want->fn_ret, got->fn_ret))) {
+    snprintf(why, n, "it returns '%s', not '%s'", tc_type_display(got->fn_ret), tc_type_display(want->fn_ret));
+    return 0;
+  }
+  return 1;
+}
+
+/* `want = got` where `want` is a fn pointer type: a typed pointer must have the
+   same signature, an untyped usize address is accepted. */
+static void tc_check_fn_assign(const ASTNode *at, const Type *want, const Type *got) {
+  if (!want->is_fn) return;
+  if (!got->is_fn) {
+    if (tc_type_cat(got) == TC_CAT_STR || tc_type_cat(got) == TC_CAT_CLASS || tc_type_cat(got) == TC_CAT_ARRAY)
+      tc_error(at, "cannot use a '%s' as a '%s'", tc_type_display(got), tc_type_display(want));
+    return;
+  }
+  char why[200];
+  if (!tc_fn_sigs_match(want, got, why, sizeof why))
+    tc_error(at, "function pointer type mismatch: expected '%s', got '%s' (%s)",
+             tc_type_display(want), tc_type_display(got), why);
+}
+
+static Type *tc_clone_type(const Type *t) {
+  Type *c = malloc(sizeof(Type));
+  *c = *t;
+  return c;
+}
+
 static Type infer_expr(ASTNode *node);
 static void infer_stmt(ASTNode *node);
+
+/* The type the surrounding context wants the next expression to have; only a
+   tuple literal looks at it (so `return (1, nil)` builds the function's declared
+   (int, Error?) rather than guessing (int, void)). Read and cleared on entry
+   to infer_expr so it never reaches a nested expression. */
+static const Type *tc_expect = NULL;
+/* return type of the function being checked, for `return` and `try` */
+static Type tc_cur_ret;
+static int tc_have_ret = 0;
+/* class whose method body is being checked (NULL outside methods) */
+static const char *tc_cur_class = NULL;
+
+static int tc_is_tuple_name(const char *n) { return n && strncmp(n, "__tuple_of_", 11) == 0; }
+
+static int tc_is_error_type(const Type *t) {
+  return t && t->kind == TYPE_SIMPLE && t->name && strcmp(t->name, "Error") == 0;
+}
 
 
 
@@ -400,8 +533,114 @@ static Type infer_expr(ASTNode *node) {
     return unknown_type();
 
   Type result = unknown_type();
+  const Type *expect = tc_expect;
+  tc_expect = NULL;
 
   switch (node->type) {
+
+  case NODE_TUPLE: {
+    TupleNode *tn = (TupleNode *)node;
+    Type elems[16];
+    if (tn->elem_count > 16) { tc_error(node, "a tuple can have at most 16 elements"); break; }
+    int cnt = 0;
+    const char *cls = NULL;
+    if (expect && expect->kind == TYPE_SIMPLE && tc_is_tuple_name(expect->name) &&
+        mono_tuple_info(expect->name, &cnt) && cnt == tn->elem_count)
+      cls = expect->name;
+    for (int i = 0; i < tn->elem_count; i++) {
+      if (cls) tc_expect = mono_tuple_elem(cls, i);
+      elems[i] = infer_expr(tn->elems[i]);
+    }
+    if (!cls) {
+      for (int i = 0; i < tn->elem_count; i++)
+        if (!elems[i].name && elems[i].kind == TYPE_SIMPLE) {
+          tc_error(tn->elems[i], "cannot work out the type of tuple element %d; give the function a tuple return type or name the value first", i + 1);
+          result = unknown_type();
+          goto tuple_done;
+        } else if (elems[i].name && !strcmp(elems[i].name, "void")) {
+          tc_error(tn->elems[i], "cannot work out the type of tuple element %d (nil); use it where a tuple type is expected, e.g. in `return`", i + 1);
+          result = unknown_type();
+          goto tuple_done;
+        }
+      cls = mono_tuple_class(elems, tn->elem_count);
+    } else {
+      for (int i = 0; i < tn->elem_count; i++) {
+        const Type *want = mono_tuple_elem(cls, i);
+        if (want && !tc_args_compatible(want, &elems[i]))
+          tc_error(tn->elems[i], "tuple element %d has type '%s', expected '%s'", i + 1,
+                   tc_type_display(&elems[i]), tc_type_display(want));
+      }
+    }
+    {
+      StructLiteralNode *sl = calloc(1, sizeof(StructLiteralNode));
+      sl->base.type = NODE_STRUCT_LITERAL;
+      sl->base.line = node->line; sl->base.col = node->col;
+      sl->class_name = (char *)cls;
+      sl->field_count = tn->elem_count;
+      sl->field_names = malloc(tn->elem_count * sizeof(char *));
+      sl->field_values = malloc(tn->elem_count * sizeof(ASTNode *));
+      for (int i = 0; i < tn->elem_count; i++) {
+        char nm[16]; snprintf(nm, sizeof nm, "_%d", i);
+        sl->field_names[i] = strdup(nm);
+        sl->field_values[i] = tn->elems[i];
+      }
+      sl->base.resolved_type = make_simple_type((char *)cls, 0);
+      tn->lowered = (ASTNode *)sl;
+    }
+    result = make_simple_type((char *)cls, 0);
+  tuple_done:
+    break;
+  }
+
+  case NODE_TRY: {
+    TryNode *tr = (TryNode *)node;
+    Type ot = infer_expr(tr->operand);
+    int cnt = 0;
+    if (ot.kind == TYPE_SIMPLE && tc_is_tuple_name(ot.name) && mono_tuple_info(ot.name, &cnt)) {
+      if (!tc_is_error_type(mono_tuple_elem(ot.name, cnt - 1)) ||
+          !mono_tuple_elem(ot.name, cnt - 1)->nullable) {
+        tc_error(node, "'try' needs the last element of the tuple to be Error?");
+        break;
+      }
+      if (cnt > 16) { tc_error(node, "'try' on a tuple of more than 16 elements"); break; }
+      tr->mode = 1;
+      tr->operand_class = strdup(ot.name);
+      tr->operand_count = cnt;
+      if (cnt == 2) {
+        result = *mono_tuple_elem(ot.name, 0);
+      } else {
+        /* all but the error: (A, B, Error?) -> (A, B) */
+        Type lead[16];
+        for (int i = 0; i < cnt - 1; i++) lead[i] = *mono_tuple_elem(ot.name, i);
+        tr->result_class = strdup(mono_tuple_class(lead, cnt - 1));
+        result = make_simple_type(tr->result_class, 0);
+      }
+    } else if (tc_is_error_type(&ot) && ot.nullable) {
+      tr->mode = 2;
+      result = make_simple_type("void", 0);
+    } else if (ot.name || ot.kind != TYPE_SIMPLE) {
+      tc_error_hint(node, "the call must return (T, Error?) or Error?",
+                    "'try' cannot unwrap a value of type '%s'", tc_type_display(&ot));
+      break;
+    } else {
+      break;   /* unknown operand type: an error was already reported */
+    }
+    /* the early return needs a matching result type in this function */
+    if (!tc_have_ret) {
+      tc_error(node, "'try' can only be used inside a function");
+    } else if (tc_is_error_type(&tc_cur_ret) && tc_cur_ret.nullable) {
+      tr->ret_class = NULL;
+    } else if (tc_cur_ret.kind == TYPE_SIMPLE && tc_is_tuple_name(tc_cur_ret.name) &&
+               mono_tuple_info(tc_cur_ret.name, &tr->ret_count) &&
+               tc_is_error_type(mono_tuple_elem(tc_cur_ret.name, tr->ret_count - 1)) &&
+               mono_tuple_elem(tc_cur_ret.name, tr->ret_count - 1)->nullable) {
+      tr->ret_class = strdup(tc_cur_ret.name);
+    } else {
+      tc_error_hint(node, "declare it as `Error? f()` or `(T, Error?) f()`",
+                    "'try' returns the error from the enclosing function, which must return Error? or a tuple ending in Error?");
+    }
+    break;
+  }
 
   case NODE_LITERAL: {
     LiteralNode *ln = (LiteralNode *)node;
@@ -531,6 +770,15 @@ static Type infer_expr(ASTNode *node) {
        runtime. */
     for (int i = 0; i < nn->arg_count; i++)
       infer_expr(nn->args[i]);
+    if (mono_is_generic_class(nn->class_name)) {
+      Type argt[16];
+      int argc = nn->arg_count < 16 ? nn->arg_count : 16;
+      for (int i = 0; i < argc; i++) argt[i] = nn->args[i]->resolved_type;
+      char err[256] = "";
+      const char *inst = mono_instantiate_class_inferred(nn->class_name, argt, argc, err, sizeof err);
+      if (!inst) { tc_error(node, "%s", err[0] ? err : "cannot instantiate generic class"); break; }
+      nn->class_name = strdup(inst);
+    }
     result = make_simple_type(nn->class_name, 0);
     break;
   }
@@ -538,8 +786,15 @@ static Type infer_expr(ASTNode *node) {
   case NODE_FUNC_CALL: {
     FuncCallNode *fc = (FuncCallNode *)node;
     if (fc->name && strcmp(fc->name, "__addrof_fn__") == 0) {
-      /* The operand is a function symbol, not a variable reference. */
+      /* The operand is a function symbol, not a variable reference. When it
+         names a known function the result carries that signature, so calls
+         through it can be checked. */
       result = make_simple_type("usize", 0);
+      if (fc->arg_count >= 1 && fc->args[0] && fc->args[0]->type == NODE_IDENTIFIER) {
+        FuncInfo *target = func_lookup(((IdentifierNode *)fc->args[0])->name);
+        if (target && target->param_count <= 16)
+          result = make_fn_type(target->param_types, target->param_count, target->return_type);
+      }
       break;
     }
 
@@ -549,6 +804,31 @@ static Type infer_expr(ASTNode *node) {
     if (!(fc->name && strcmp(fc->name, "__size_of__") == 0)) {
       for (int i = 0; i < fc->arg_count; i++)
         infer_expr(fc->args[i]);
+    }
+    /* A call to a generic function that named no type arguments: work them
+       out from the argument types and call the instance instead. */
+    if (fc->name && !func_lookup(fc->name) && mono_is_generic_func(fc->name)) {
+      Type argt[16];
+      int argc = fc->arg_count < 16 ? fc->arg_count : 16;
+      for (int i = 0; i < argc; i++) argt[i] = fc->args[i]->resolved_type;
+      char err[256] = "";
+      const char *inst = mono_instantiate_inferred(fc->name, argt, argc, err, sizeof err);
+      if (!inst) {
+        tc_error(node, "%s", err[0] ? err : "cannot instantiate generic function");
+        break;
+      }
+      fc->name = strdup(inst);
+      FuncInfo *gi = func_lookup(fc->name);
+      if (gi) {
+        if (fc->arg_count != gi->param_count)
+          tc_error(node, "'%s' takes %d argument%s, but %d given", inst, gi->param_count,
+                   gi->param_count == 1 ? "" : "s", fc->arg_count);
+        else
+          for (int i = 0; i < fc->arg_count; i++)
+            if (!tc_args_compatible(&gi->param_types[i], &argt[i]))
+              tc_error(fc->args[i], "argument %d has type '%s', but this call of the generic function needs '%s'",
+                       i + 1, tc_type_display(&argt[i]), tc_type_display(&gi->param_types[i]));
+      }
     }
     /* Special built-ins that are not registered in the func table */
     if (fc->name && strcmp(fc->name, "hylian_array_zeros") == 0) {
@@ -666,17 +946,47 @@ static Type infer_expr(ASTNode *node) {
       result = make_simple_type("int", 0);
     } else if (fc->name && strcmp(fc->name, "syscall") == 0) {
       result = make_simple_type("int", 0);
+    } else if (fc->name && tc_cur_class && !func_lookup(fc->name) && !scope_lookup(fc->name) &&
+               !ext_find(fc->name, TC_EXT_FUNC) && !mono_is_generic_func(fc->name) &&
+               ({ char m_[256]; snprintf(m_, sizeof m_, "%s__%s", tc_cur_class, fc->name); func_lookup(m_) != NULL; })) {
+      /* `helper(x)` inside a method of a class that has a method `helper`: the
+         implicit-receiver call, same as a bare field name meaning self.field */
+      char m_[256];
+      snprintf(m_, sizeof m_, "%s__%s", tc_cur_class, fc->name);
+      fc->implicit_self = 1;
+      result = func_lookup(m_)->return_type;
     } else if (fc->name && !func_lookup(fc->name) && !ext_find(fc->name, TC_EXT_FUNC) &&
                scope_lookup(fc->name)) {
       /* `fp(args)` where fp is a variable: an indirect call through a
          function address (see addrof_fn). The result is int-sized. */
       fc->is_indirect = 1;
       result = make_simple_type("int", 0);
+      Type *vt = scope_lookup(fc->name);
+      if (vt && vt->is_fn) {
+        fc->callee_type = tc_clone_type(vt);
+        if (fc->arg_count != vt->elem_type_count) {
+          char sig[256];
+          tc_fn_type_str(vt, sig, sizeof sig);
+          tc_error(node, "'%s' is a %s and takes %d argument%s, but %d given",
+                   fc->name, sig, vt->elem_type_count, vt->elem_type_count == 1 ? "" : "s", fc->arg_count);
+        } else {
+          for (int i = 0; i < fc->arg_count; i++) {
+            Type at = fc->args[i]->resolved_type;
+            if (!tc_args_compatible(&vt->elem_types[i], &at))
+              tc_error(fc->args[i], "argument %d of call through '%s' has type '%s', expected '%s'",
+                       i + 1, fc->name, tc_type_display(&at), tc_type_display(&vt->elem_types[i]));
+          }
+        }
+        if (vt->fn_ret) result = *vt->fn_ret;
+      }
     } else if (fc->name) {
       FuncInfo *fi = func_lookup(fc->name);
       const TCExternal *ef = fi ? NULL : ext_find(fc->name, TC_EXT_FUNC);
       if (fi) {
         result = fi->return_type;
+        for (int i = 0; i < fc->arg_count && i < fi->param_count; i++)
+          if (fi->param_types[i].is_fn)
+            tc_check_fn_assign(fc->args[i], &fi->param_types[i], &fc->args[i]->resolved_type);
       } else if (ef) {
         result = ext_type(ef);
       } else {
@@ -734,11 +1044,41 @@ static Type infer_expr(ASTNode *node) {
                strcmp(mc->method, "code") == 0) {
       result = make_simple_type("int", 0);
     } else if (obj_type.name && mc->method) {
+      if (mono_is_generic_method(obj_type.name, mc->method)) {
+        Type argt[16];
+        int argc = mc->arg_count < 16 ? mc->arg_count : 16;
+        for (int i = 0; i < argc; i++) argt[i] = mc->args[i]->resolved_type;
+        char err[256] = "";
+        const char *inst = mono_instantiate_method(obj_type.name, mc->method, mc->type_args,
+                                                   mc->type_arg_count, argt, argc, err, sizeof err);
+        if (!inst) { tc_error(node, "%s", err[0] ? err : "cannot instantiate generic method"); break; }
+        mc->method = strdup(inst);
+        mc->type_args = NULL; mc->type_arg_count = 0;
+      }
       /* Look for mangled name ClassName__method */
       char mangled[256];
       snprintf(mangled, sizeof(mangled), "%s__%s", obj_type.name, mc->method);
       FuncInfo *fi = func_lookup(mangled);
-      if (fi) {
+      FieldEntry *fe = fi ? NULL : field_lookup(obj_type.name, mc->method);
+      if (fe && fe->field_type.is_fn) {
+        /* `obj.handler(args)`: call through a fn pointer stored in a field */
+        const Type *vt = &fe->field_type;
+        mc->field_fn_type = tc_clone_type(vt);
+        if (mc->arg_count != vt->elem_type_count) {
+          char sig[256];
+          tc_fn_type_str(vt, sig, sizeof sig);
+          tc_error(node, "field '%s' is a %s and takes %d argument%s, but %d given",
+                   mc->method, sig, vt->elem_type_count, vt->elem_type_count == 1 ? "" : "s", mc->arg_count);
+        } else {
+          for (int i = 0; i < mc->arg_count; i++) {
+            Type at = mc->args[i]->resolved_type;
+            if (!tc_args_compatible(&vt->elem_types[i], &at))
+              tc_error(mc->args[i], "argument %d of call through '%s' has type '%s', expected '%s'",
+                       i + 1, mc->method, tc_type_display(&at), tc_type_display(&vt->elem_types[i]));
+          }
+        }
+        result = vt->fn_ret ? *vt->fn_ret : make_simple_type("int", 0);
+      } else if (fi) {
         result = fi->return_type;
       } else {
         /* UFCS fallback: `x.method(args)` where `method` isn't a real
@@ -920,8 +1260,11 @@ static void infer_stmt(ASTNode *node) {
   case NODE_VAR_DECL: {
     VarDeclNode *vd = (VarDeclNode *)node;
     Type init_type = unknown_type();
-    if (vd->initializer)
+    if (vd->initializer) {
+      if (vd->var_type.kind == TYPE_SIMPLE && tc_is_tuple_name(vd->var_type.name))
+        tc_expect = &vd->var_type;
       init_type = infer_expr(vd->initializer);
+    }
     Type decl_type = vd->var_type;
     /* Warn when 'auto' type cannot be resolved from the initializer */
     if (decl_type.name && strcmp(decl_type.name, "auto") == 0 &&
@@ -935,6 +1278,31 @@ static void infer_stmt(ASTNode *node) {
       suggest_type(decl_type.name, hint, sizeof hint);
       tc_error_hint(node, hint[0] ? hint : NULL, "unknown type '%s'", decl_type.name);
     }
+    if (vd->initializer)
+      tc_check_fn_assign(node, &decl_type, &init_type);
+    if (vd->initializer && decl_type.kind == TYPE_SIMPLE && tc_is_tuple_name(decl_type.name) &&
+        init_type.name && strcmp(init_type.name, decl_type.name) != 0 && strcmp(init_type.name, "unknown") != 0)
+      tc_error(node, "cannot initialize '%s' with a value of type '%s'",
+               tc_type_display(&decl_type), tc_type_display(&init_type));
+    /* `f := addrof_fn(g)` keeps the signature */
+    int adopt = 0;
+    if (decl_type.name && strcmp(decl_type.name, "auto") == 0 && decl_type.kind == TYPE_SIMPLE &&
+        init_type.kind == TYPE_SIMPLE && init_type.name) {
+      if (init_type.is_fn || tc_is_tuple_name(init_type.name)) adopt = 1;
+      /* `b := new Box(1)` is `Box b = new Box(1)` */
+      else if (vd->initializer && vd->initializer->type == NODE_NEW) adopt = 1;
+      /* `v, err := f();` -> v := __tupN._0: give each name its element's type */
+      else if (vd->initializer && vd->initializer->type == NODE_MEMBER_ACCESS) {
+        ASTNode *o = ((MemberAccessNode *)vd->initializer)->object;
+        if (o && o->type == NODE_IDENTIFIER && !strncmp(((IdentifierNode *)o)->name, "__tup", 5) &&
+            strcmp(init_type.name, "unknown") != 0)
+          adopt = 1;
+      }
+    }
+    if (adopt) {
+      decl_type = init_type;
+      vd->var_type = init_type;
+    }
     scope_define(vd->var_name, decl_type);
     node->resolved_type = decl_type;
     break;
@@ -942,7 +1310,9 @@ static void infer_stmt(ASTNode *node) {
 
   case NODE_ASSIGN: {
     AssignNode *as = (AssignNode *)node;
-    infer_expr(as->value);
+    Type vt_ = infer_expr(as->value);
+    Type *dst = scope_lookup(as->var_name);
+    if (dst) tc_check_fn_assign(node, dst, &vt_);
     break;
   }
 
@@ -954,8 +1324,10 @@ static void infer_stmt(ASTNode *node) {
 
   case NODE_RETURN: {
     ReturnNode *ret = (ReturnNode *)node;
-    if (ret->value)
+    if (ret->value) {
+      if (tc_have_ret) tc_expect = &tc_cur_ret;
       infer_expr(ret->value);
+    }
     break;
   }
 
@@ -1121,6 +1493,9 @@ static void infer_function(ASTNode **params, int param_count, ASTNode **body,
         tc_error(params[i], "unknown type '%s' for parameter '%s'", pv->var_type.name, pv->var_name);
     }
   }
+  Type saved_ret = tc_cur_ret; int saved_have = tc_have_ret;
+  const char *saved_class = tc_cur_class; tc_cur_class = class_name;
+  tc_cur_ret = return_type; tc_have_ret = 1;
   scope_push();
   if (class_name) {
     scope_define("self", make_simple_type((char *)class_name, 0));
@@ -1145,12 +1520,13 @@ static void infer_function(ASTNode **params, int param_count, ASTNode **body,
   for (int i = 0; i < body_count; i++)
     infer_stmt(body[i]);
   scope_pop();
+  tc_cur_ret = saved_ret; tc_have_ret = saved_have; tc_cur_class = saved_class;
 }
 
 
 static void register_func(const char *name, Type return_type, ASTNode **params,
                           int param_count, int is_external_decl) {
-  if (func_count >= 256)
+  if (func_count >= 4096)
     return;
   FuncInfo *fi = &funcs[func_count++];
   fi->name = (char *)name;
@@ -1181,8 +1557,13 @@ int tc_func_return_is_bool(const char *name) {
 int tc_func_return_flags(const char *name) {
   if (!name) return 0;
   FuncInfo *fi = func_lookup(name);
-  if (!fi || fi->return_type.kind != TYPE_SIMPLE || !fi->return_type.name) return 0;
-  const char *n = fi->return_type.name;
+  if (!fi) return 0;
+  return tc_type_return_flags(&fi->return_type);
+}
+
+int tc_type_return_flags(const Type *t) {
+  if (!t || t->kind != TYPE_SIMPLE || !t->name) return 0;
+  const char *n = t->name;
   if (strcmp(n, "bool") == 0) return 1;
   if (strcmp(n, "float") == 0 || strcmp(n, "double") == 0 || strcmp(n, "float64") == 0) return 2;
   if (strcmp(n, "float32") == 0) return 4;
@@ -1202,7 +1583,10 @@ int tc_func_param_kind(const char *name, int i) {
   if (!name || i < 0) return 0;
   FuncInfo *fi = func_lookup(name);
   if (!fi || i >= fi->param_count) return 0;
-  const Type *t = &fi->param_types[i];
+  return tc_type_param_kind(&fi->param_types[i]);
+}
+
+int tc_type_param_kind(const Type *t) {
   if (t->kind != TYPE_SIMPLE || !t->name) return 0;
   const char *n = t->name;
   if (strcmp(n, "float") == 0 || strcmp(n, "double") == 0 || strcmp(n, "float64") == 0) return 2;
@@ -1244,6 +1628,58 @@ static int is_known_primitive(const char *name) {
   return 0;
 }
 
+
+static void register_class_decl(ClassNode *cn) {
+  for (int f = 0; f < cn->field_count; f++) {
+    if (!cn->fields[f])
+      continue;
+    FieldNode *fld = cn->fields[f];
+    register_field(cn->name, fld->name, fld->field_type);
+  }
+  for (int m = 0; m < cn->method_count; m++) {
+    if (!cn->methods[m])
+      continue;
+    MethodNode *mn = cn->methods[m];
+    char mangled[256];
+    snprintf(mangled, sizeof(mangled), "%s__%s", cn->name, mn->name);
+    /* We need a stable heap copy of the mangled name */
+    char *mangled_copy = strdup(mangled);
+    register_func(mangled_copy, mn->return_type, mn->params,
+                  mn->param_count, 0);
+  }
+  if (cn->has_ctor) {
+    char ctor_mangled[256];
+    snprintf(ctor_mangled, sizeof(ctor_mangled), "%s__ctor", cn->name);
+    char *ctor_copy = strdup(ctor_mangled);
+    Type self_type = make_simple_type(cn->name, 0);
+    register_func(ctor_copy, self_type, cn->ctor_params,
+                  cn->ctor_param_count, 0);
+  }
+}
+
+/* A class or function instantiated while typechecking (a generic instance, a
+   tuple type): register it exactly as pass 1 does for a written declaration. */
+static void tc_hook_class(ClassNode *cn) {
+  if (tc_class_name_count < 1024) tc_class_names[tc_class_name_count++] = cn->name;
+  register_class_decl(cn);
+}
+static void tc_hook_func(FuncNode *fn) {
+  register_func(fn->name, fn->return_type, fn->params, fn->param_count, 0);
+}
+/* a generic method instantiated mid-check: register it now, check its body
+   once the declaration loop is done (the class may already be behind us) */
+static struct { ClassNode *cn; MethodNode *mn; } tc_pending_methods[256];
+static int tc_pending_method_count = 0;
+static void tc_hook_method(ClassNode *cn, MethodNode *mn) {
+  char mangled[256];
+  snprintf(mangled, sizeof(mangled), "%s__%s", cn->name, mn->name);
+  register_func(strdup(mangled), mn->return_type, mn->params, mn->param_count, 0);
+  if (tc_pending_method_count < 256) {
+    tc_pending_methods[tc_pending_method_count].cn = cn;
+    tc_pending_methods[tc_pending_method_count++].mn = mn;
+  }
+}
+
 void typecheck(ProgramNode *program, const char *filename) {
   current_tc_file = filename ? filename : "<unknown>";
 
@@ -1253,6 +1689,13 @@ void typecheck(ProgramNode *program, const char *filename) {
   field_count = 0;
   enum_type_count = 0;
   tc_module_count = 0;
+  tc_class_name_count = 0;
+  tc_have_ret = 0;
+  tc_expect = NULL;
+
+  /* Expand generics and tuple types into ordinary classes and functions. */
+  mono_set_hooks(NULL);
+  mono_run(program, current_tc_file);
 
   /* Pass 1: register all top-level functions, classes, and enums */
   for (int i = 0; i < program->decl_count; i++) {
@@ -1315,37 +1758,16 @@ void typecheck(ProgramNode *program, const char *filename) {
       }
     }
 
-    if (d->type == NODE_CLASS) {
-      ClassNode *cn = (ClassNode *)d;
-      for (int f = 0; f < cn->field_count; f++) {
-        if (!cn->fields[f])
-          continue;
-        FieldNode *fld = cn->fields[f];
-        register_field(cn->name, fld->name, fld->field_type);
-      }
-      for (int m = 0; m < cn->method_count; m++) {
-        if (!cn->methods[m])
-          continue;
-        MethodNode *mn = cn->methods[m];
-        char mangled[256];
-        snprintf(mangled, sizeof(mangled), "%s__%s", cn->name, mn->name);
-        /* We need a stable heap copy of the mangled name */
-        char *mangled_copy = strdup(mangled);
-        register_func(mangled_copy, mn->return_type, mn->params,
-                      mn->param_count, 0);
-      }
-      if (cn->has_ctor) {
-        char ctor_mangled[256];
-        snprintf(ctor_mangled, sizeof(ctor_mangled), "%s__ctor", cn->name);
-        char *ctor_copy = strdup(ctor_mangled);
-        Type self_type = make_simple_type(cn->name, 0);
-        register_func(ctor_copy, self_type, cn->ctor_params,
-                      cn->ctor_param_count, 0);
-      }
-    }
+    if (d->type == NODE_CLASS)
+      register_class_decl((ClassNode *)d);
   }
 
-  /* Pass 2: infer function and class bodies */
+  /* Pass 2: infer function and class bodies. Instances created from here on
+     (inferred generic calls, tuple literals) register themselves and are
+     appended to the program, so the loop below reaches them too. */
+  MonoHooks hooks = { tc_hook_class, tc_hook_func, tc_hook_method };
+  tc_pending_method_count = 0;
+  mono_set_hooks(&hooks);
   for (int i = 0; i < program->decl_count; i++) {
     ASTNode *d = program->declarations[i];
     if (!d)
@@ -1391,4 +1813,10 @@ void typecheck(ProgramNode *program, const char *filename) {
       tc_current_module = NULL;
     }
   }
+  for (int i = 0; i < tc_pending_method_count; i++) {
+    MethodNode *mn = tc_pending_methods[i].mn;
+    infer_function(mn->params, mn->param_count, mn->body, mn->body_count,
+                   mn->return_type, tc_pending_methods[i].cn->name);
+  }
+  mono_set_hooks(NULL);
 }

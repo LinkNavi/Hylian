@@ -11,10 +11,10 @@ now; the regression tests for them live in `tests/stdlib/language.hy`.
 
 ## Language
 
-### Nested generics, other than `array<array<T>>`, need a space
+### Nested angle brackets
 
-`array<array<int>>` and `cast<array<T>>(x)` parse, but the lexer reads `>>` as a shift
-operator everywhere else. Write `multi<int | array<int> >` with a space.
+`array<array<int>>`, `cast<array<T>>(x)` and user generics such as `Box<Box<int>>` all close
+with `>>`. `multi<int | array<int> >` still needs the space.
 
 ### A bare ternary *statement* is read as a nullable declaration
 
@@ -27,7 +27,7 @@ fine anywhere inside an expression, which is the only place it's useful.
 A `class` local holds its object directly rather than a pointer to a heap block, so
 `cast<MyClass>(raw_alloc(n))` does not give you a heap object that survives being returned
 from a function. `new` objects are fine; the stdlib modules that need a heap-allocated
-handle (`map`, `bytes` buffers, `http` responses) use an opaque `usize` pointing at a raw
+handle (`map`, `bytes` buffers) use an opaque `usize` pointing at a raw
 word block instead.
 
 ### A range loop's end is re-evaluated each iteration
@@ -56,23 +56,38 @@ buffer use `static uint8 buf[64];` or `bytes_alloc`.
 Quotes inside `{{ }}` must be escaped (`"{{ok ? \"y\" : \"n\"}}"`), and a string that uses
 interpolation can't also contain a literal `{{`.
 
-### No multi-return / tuples
+### Tuples: at most 16 elements
 
-Functions return exactly one value.
+A tuple *type* can be a return type, a local, a parameter or a struct/class field. (The
+tree-sitter and LSP grammars do not yet accept the parameter and field forms.) A tuple is an
+ordinary by-value struct underneath, so the limits of struct values apply.
 
-### Function pointers are untyped
+### Generics are expanded, not checked
 
-`usize fp = addrof_fn(f); fp(1, 2)` calls through the address, and the address can be
-handed to C as a callback. The pointer carries no signature, so nothing checks the
-arguments, and the result of an indirect call is always integer-sized (a function
-returning `float` through a pointer will not come back in the right register).
+`T max<T>(T a, T b)` and `class Box<T>` are monomorphized: each use with new type arguments
+compiles another copy, and the body is only type-checked per copy (so an unused template is
+never checked, and an error in one is reported against the instance). There are no bounds
+(`T: Ord`); an operator the argument type lacks is simply an error in that copy. A generic class infers its arguments from its constructor (`new Box(41)`), and must have them
+written when no constructor parameter mentions them.
+The standard library's `map` and `bytes` still use opaque `usize` handles; `std.hashmap`
+is the generic alternative to `map`.
+
+### Function pointers: only for named functions
+
+`fn(int, int) -> int` is checked at calls, assignments and `addrof_fn`, and the result of a
+typed call comes back in the right register (a `float` result, a narrow integer). The
+checks are shallow: an argument is rejected only when it is plainly the wrong kind (a `str`
+for an `int`, one class for another). An untyped `usize` address is still accepted anywhere a
+typed pointer is wanted. An indirect call that returns a struct by value works for Hylian functions (hidden result buffer); a pointer to a C function returning a struct is not supported.
 
 ## Floating point
 
 - Calls follow the SysV x86-64 ABI, so `float` / `double` / `float32` arguments and results
-  travel in `xmm` registers and mix freely with C. Flat structs pass and return **by value**
-  to C (raylib's `Vector2` / `Color`, SDL's `SDL_Rect`). Not handled: `long double`, and
-  structs containing nested structs, arrays, unions or padding.
+  travel in `xmm` registers and mix freely with C. Structs pass and return **by value**
+  to C (raylib's `Vector2` / `Color`, SDL's `SDL_Rect`); nested structs, fixed arrays, unions
+  and fields C would pad are copied into a C-layout buffer around the call. Not handled:
+  `long double`, `bool` fields (8 bytes here, 1 in C), and a union of floats (classified as
+  integer bytes).
 - Only scalar arithmetic and comparisons exist, and `math.hy`'s transcendental functions are
   ~1e-12 accurate, not libm-exact (call libm through an FFI declaration when you need it).
 - `array<float>` stores each element as a raw 8-byte word; indexing, `pop()` and `for (e in arr)` reinterpret it as a float.
