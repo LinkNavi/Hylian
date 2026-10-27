@@ -550,6 +550,32 @@ from the argument and `b.map<str>(...)` names it. Each instance is added to the 
 names. `<` is read as a bracket only when it directly follows a name and encloses something
 that looks like a type list followed by `(`, `{` or a name, so `i<n` stays a comparison.
 
+## Closures
+
+`fn(int x) -> int { return x + n; }` is an expression of type `fn(int) -> int`, the same
+type as `addrof_fn(f)` for a plain function, so the two are interchangeable anywhere a typed
+function pointer goes (variables, parameters, fields, arrays, return values).
+
+```hylian
+fn(int) -> int make_adder(int n) {
+    return fn(int x) -> int { return x + n; };
+}
+fn(int) -> int add7 = make_adder(7);
+println("{{add7(1)}}");   // 8
+```
+
+Captured variables are **copied** when the closure is made, so later changes on either side
+are not seen. A closure that is only called by the local it is bound to lives on the stack;
+anything else (passed, returned, stored) is allocated from a process-lifetime arena and is
+never freed. Captures can be integers, pointers, strings and objects, not floats or arrays yet.
+A closure with no captures is just a function, so it can be given to C; one that captures
+cannot (compile error), and a captured closure held in a variable and passed to C would lose
+its environment.
+
+Representation: a typed fn value is a code address, or a closure record's address plus 1
+(`{code, captures...}`). A call unwraps it and parks the record in a runtime slot
+(`hylian_clo_set`) that the closure's prologue reads first thing.
+
 ## Tuples and `try`
 
 A function can return several values. Declare the result as a parenthesised type, build it with

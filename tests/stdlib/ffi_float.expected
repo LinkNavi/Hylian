@@ -7,6 +7,7 @@ callback=1014.5
 3.142/42
 c ints: -5 7 0 2.5
 callback ptr=43
+callback closure=43
 vec2: 1.75 6.0
 col: 100 50 25 255
 rect: 120 -1 0 34 8

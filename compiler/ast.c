@@ -110,7 +110,82 @@ FuncNode *make_func(Type return_type, char *name) {
     n->is_public = 0;
     n->module_name = NULL;
     n->type_params = NULL; n->type_param_count = 0;
+    n->is_lambda = 0; n->cap_names = NULL; n->cap_types = NULL; n->cap_count = 0;
     return n;
+}
+
+LambdaNode *make_lambda(ASTNode **params, int param_count, Type ret, ASTNode **body, int body_count) {
+    LambdaNode *n = calloc(1, sizeof(LambdaNode));
+    n->base.type = NODE_LAMBDA;
+    zero_resolved_type(&n->base);
+    ast_stamp(&n->base);
+    n->params = params; n->param_count = param_count;
+    n->ret = ret;
+    n->body = body; n->body_count = body_count;
+    n->heap = 1;
+    return n;
+}
+
+static void walk_list(ASTNode **l, int n, void (*v)(ASTNode *, void *), void *ud) {
+    for (int i = 0; i < n; i++) ast_walk(l[i], v, ud);
+}
+
+void ast_walk(ASTNode *n, void (*v)(ASTNode *, void *), void *ud) {
+    if (!n) return;
+    v(n, ud);
+    switch (n->type) {
+    case NODE_VAR_DECL:      ast_walk(((VarDeclNode *)n)->initializer, v, ud); break;
+    case NODE_RETURN:        ast_walk(((ReturnNode *)n)->value, v, ud); break;
+    case NODE_BINARY_OP:     ast_walk(((BinaryOpNode *)n)->left, v, ud); ast_walk(((BinaryOpNode *)n)->right, v, ud); break;
+    case NODE_UNARY_OP:      ast_walk(((UnaryOpNode *)n)->operand, v, ud); break;
+    case NODE_MEMBER_ACCESS: ast_walk(((MemberAccessNode *)n)->object, v, ud); break;
+    case NODE_MEMBER_ASSIGN: ast_walk(((MemberAssignNode *)n)->object, v, ud); ast_walk(((MemberAssignNode *)n)->value, v, ud); break;
+    case NODE_METHOD_CALL:   ast_walk(((MethodCallNode *)n)->object, v, ud); walk_list(((MethodCallNode *)n)->args, ((MethodCallNode *)n)->arg_count, v, ud); break;
+    case NODE_FUNC_CALL:     walk_list(((FuncCallNode *)n)->args, ((FuncCallNode *)n)->arg_count, v, ud); break;
+    case NODE_NEW:           walk_list(((NewNode *)n)->args, ((NewNode *)n)->arg_count, v, ud); break;
+    case NODE_IF: {
+        IfNode *x = (IfNode *)n;
+        ast_walk(x->condition, v, ud); walk_list(x->then_body, x->then_count, v, ud); walk_list(x->else_body, x->else_count, v, ud);
+        break;
+    }
+    case NODE_WHILE:  ast_walk(((WhileNode *)n)->condition, v, ud); walk_list(((WhileNode *)n)->body, ((WhileNode *)n)->body_count, v, ud); break;
+    case NODE_FOR: {
+        ForNode *x = (ForNode *)n;
+        ast_walk(x->init, v, ud); ast_walk(x->condition, v, ud); ast_walk(x->post, v, ud); walk_list(x->body, x->body_count, v, ud);
+        break;
+    }
+    case NODE_FOR_IN: ast_walk(((ForInNode *)n)->collection, v, ud); walk_list(((ForInNode *)n)->body, ((ForInNode *)n)->body_count, v, ud); break;
+    case NODE_ASSIGN:          ast_walk(((AssignNode *)n)->value, v, ud); break;
+    case NODE_COMPOUND_ASSIGN: ast_walk(((CompoundAssignNode *)n)->value, v, ud); break;
+    case NODE_ARRAY_LITERAL:   walk_list(((ArrayLiteralNode *)n)->elements, ((ArrayLiteralNode *)n)->elem_count, v, ud); break;
+    case NODE_INDEX:           ast_walk(((IndexNode *)n)->object, v, ud); ast_walk(((IndexNode *)n)->index, v, ud); break;
+    case NODE_INDEX_ASSIGN: {
+        IndexAssignNode *x = (IndexAssignNode *)n;
+        ast_walk(x->object, v, ud); ast_walk(x->index, v, ud); ast_walk(x->value, v, ud);
+        break;
+    }
+    case NODE_UNSAFE: walk_list(((UnsafeBlockNode *)n)->body, ((UnsafeBlockNode *)n)->body_count, v, ud); break;
+    case NODE_DEFER:  walk_list(((DeferNode *)n)->body, ((DeferNode *)n)->body_count, v, ud); break;
+    case NODE_SWITCH: {
+        SwitchNode *x = (SwitchNode *)n;
+        ast_walk(x->subject, v, ud);
+        for (int i = 0; i < x->case_count; i++) ast_walk((ASTNode *)x->cases[i], v, ud);
+        break;
+    }
+    case NODE_CASE: ast_walk(((SwitchCaseNode *)n)->value, v, ud); walk_list(((SwitchCaseNode *)n)->body, ((SwitchCaseNode *)n)->body_count, v, ud); break;
+    case NODE_STRUCT_LITERAL: walk_list(((StructLiteralNode *)n)->field_values, ((StructLiteralNode *)n)->field_count, v, ud); break;
+    case NODE_TERNARY: {
+        TernaryNode *x = (TernaryNode *)n;
+        ast_walk(x->cond, v, ud); ast_walk(x->then_expr, v, ud); ast_walk(x->else_expr, v, ud);
+        break;
+    }
+    case NODE_TUPLE:  walk_list(((TupleNode *)n)->elems, ((TupleNode *)n)->elem_count, v, ud); break;
+    case NODE_TRY:    ast_walk(((TryNode *)n)->operand, v, ud); break;
+    case NODE_SPLICE: walk_list(((SpliceNode *)n)->items, ((SpliceNode *)n)->count, v, ud); break;
+    case NODE_LAMBDA: walk_list(((LambdaNode *)n)->params, ((LambdaNode *)n)->param_count, v, ud);
+                      walk_list(((LambdaNode *)n)->body, ((LambdaNode *)n)->body_count, v, ud); break;
+    default: break;
+    }
 }
 
 FieldNode *make_field(Type field_type, char *name, int is_public) {

@@ -66,6 +66,8 @@ typedef struct {
     /* Arena / unsafe tracking */
     int         in_unsafe;          /* 1 when inside an unsafe { } block    */
     int         has_arena;          /* 1 when current function owns an arena */
+    ASTNode   **cur_body;           /* body of the function being lowered (closure escape check) */
+    int         cur_body_count;
     const char *pending_sret;       /* struct type the NEXT lower_func_body returns by value */
     const char *fn_sret;            /* ...and the one being lowered now (hidden __sret param) */
     const Type *pending_ret;        /* declared return type of the NEXT lower_func_body */
@@ -986,10 +988,87 @@ static int lower_hoist_compound(ASTNode *node, LowerState *s, int *result, int a
     return 1;
 }
 
+/* ── closures ────────────────────────────────────────────────────────────────
+   A typed fn value is a bare code address, or a closure record's address + 1
+   (record = {code, captured words...}, 8-aligned). See stdlib/mem.hy. */
+
+static int lower_call_named(LowerState *s, const char *fn, int *args, int nargs) {
+    int t = alloc_temp(s);
+    IROperand *ops = nargs ? malloc(nargs * sizeof(IROperand)) : NULL;
+    for (int i = 0; i < nargs; i++) ops[i] = irop_temp(args[i]);
+    IRInstr *c = ir_emit(s->mod, IR_CALL);
+    c->dest = irop_temp(t); c->str_extra = strdup(fn); c->args = ops; c->arg_count = nargs;
+    return t;
+}
+
+static int lower_binop(LowerState *s, IROpcode op, int a, int b) {
+    int t = alloc_temp(s);
+    IRInstr *i = ir_emit(s->mod, op);
+    i->dest = irop_temp(t); i->src1 = irop_temp(a); i->src2 = irop_temp(b);
+    return t;
+}
+
+static int lower_const(LowerState *s, long v) {
+    int t = alloc_temp(s);
+    IRInstr *i = ir_emit(s->mod, IR_CONST_INT);
+    i->dest = irop_temp(t); i->src1 = irop_const_int(v);
+    return t;
+}
+
+/* The code address to call for a typed fn value `tf`, and (via *rec) the record
+   to hand the callee: tag = tf & 1; rec = tf - tag; code = tag ? *rec : tf.
+   Reading *rec is harmless for a bare address (it is readable code). */
+static int lower_closure_code(LowerState *s, int tf, int *rec) {
+    int tag  = lower_binop(s, IR_BITAND, tf, lower_const(s, 1));
+    int r    = lower_binop(s, IR_SUB, tf, tag);
+    int ld   = alloc_temp(s);
+    IRInstr *l = ir_emit(s->mod, IR_LOAD_PTR);
+    l->dest = irop_temp(ld); l->src1 = irop_temp(r); l->str_extra = strdup("int");
+    /* tf + tag * (loaded - tf) */
+    int diff = lower_binop(s, IR_SUB, ld, tf);
+    int code = lower_binop(s, IR_ADD, tf, lower_binop(s, IR_MUL, tag, diff));
+    if (rec) *rec = r;
+    return code;
+}
+
+/* ── does a closure bound to local `name` stay in this function? ─────────── */
+typedef struct { const char *name; int escapes; } LamEsc;
+static void lam_mention(ASTNode *n, void *ud) {
+    LamEsc *e = ud;
+    if (n->type == NODE_IDENTIFIER && !strcmp(((IdentifierNode *)n)->name, e->name)) e->escapes = 1;
+    else if (n->type == NODE_FUNC_CALL && ((FuncCallNode *)n)->name && !strcmp(((FuncCallNode *)n)->name, e->name)) e->escapes = 1;
+    else if (n->type == NODE_INTERP_STRING) {
+        InterpStringNode *is = (InterpStringNode *)n;
+        for (int i = 0; i < is->seg_count; i++)
+            if (is->segments[i].is_expr && strstr(is->segments[i].text, e->name)) e->escapes = 1;
+    }
+}
+static void lam_use(ASTNode *n, void *ud) {
+    LamEsc *e = ud;
+    if (n->type == NODE_IDENTIFIER && !strcmp(((IdentifierNode *)n)->name, e->name)) e->escapes = 1;   /* passed, returned, stored */
+    else if (n->type == NODE_ASSIGN && !strcmp(((AssignNode *)n)->var_name, e->name)) e->escapes = 1;
+    else if (n->type == NODE_INTERP_STRING) lam_mention(n, ud);
+    else if (n->type == NODE_LAMBDA) {
+        /* captured by a nested closure: a copy of the record pointer */
+        LambdaNode *ln = (LambdaNode *)n;
+        for (int i = 0; i < ln->body_count; i++) ast_walk(ln->body[i], lam_mention, e);
+    }
+}
+static int lower_closure_escapes(LowerState *s, const char *name) {
+    LamEsc e = { name, 0 };
+    for (int i = 0; i < s->cur_body_count; i++) ast_walk(s->cur_body[i], lam_use, &e);
+    return e.escapes;
+}
+
 /* Emit an indirect call: `tf` holds the function address, `callee_type` (may be
    NULL for an untyped usize pointer) supplies parameter kinds and the result kind. */
 static int lower_indirect_call(int tf, ASTNode **args, int argc, const Type *callee_type, LowerState *s) {
     int t = alloc_temp(s);
+    if (callee_type && callee_type->is_fn) {
+        int rec;
+        tf = lower_closure_code(s, tf, &rec);
+        lower_call_named(s, "hylian_clo_set", &rec, 1);   /* the callee reads it first thing */
+    }
     IROperand *arg_ops = argc > 0 ? malloc(argc * sizeof(IROperand)) : NULL;
     for (int i = 0; i < argc; i++) {
         int ta = lower_call_arg(args[i], s);
@@ -1068,6 +1147,41 @@ static int lower_expr(ASTNode *node, LowerState *s) {
 
     case NODE_TEMP_REF:
         return ((TempRefNode *)node)->temp;
+
+    case NODE_LAMBDA: {
+        LambdaNode *ln = (LambdaNode *)node;
+        FuncNode *lf = ln->lifted;
+        int code = alloc_temp(s);
+        IRInstr *af = ir_emit(s->mod, IR_ADDROF_FN);
+        af->dest = irop_temp(code); af->str_extra = strdup(lf->name);
+        if (lf->cap_count == 0) return code;      /* nothing to carry: a bare function */
+        int size = 8 * (1 + lf->cap_count);
+        int rec;
+        if (ln->heap) {
+            int sz = lower_const(s, size);
+            rec = lower_call_named(s, "hylian_closure_alloc", &sz, 1);
+        } else {
+            const char *img = lower_image_class(s, size);
+            char nm[64];
+            snprintf(nm, sizeof nm, "__clo_%d", alloc_label(s));
+            emit_alloca(s, nm, img, TYPE_SIMPLE);
+            rec = alloc_temp(s);
+            IRInstr *a = ir_emit(s->mod, IR_ADDROF);
+            a->dest = irop_temp(rec); a->str_extra = strdup(nm);
+        }
+        IRInstr *st = ir_emit(s->mod, IR_STORE_PTR);
+        st->src1 = irop_temp(rec); st->src2 = irop_temp(code); st->str_extra = strdup("int");
+        for (int i = 0; i < lf->cap_count; i++) {
+            IdentifierNode id = {0};
+            id.base.type = NODE_IDENTIFIER; id.base.resolved_type = lf->cap_types[i];
+            id.name = lf->cap_names[i];
+            int v = lower_expr((ASTNode *)&id, s);
+            int slot = lower_binop(s, IR_ADD, rec, lower_const(s, 8 * (i + 1)));
+            IRInstr *sv = ir_emit(s->mod, IR_STORE_PTR);
+            sv->src1 = irop_temp(slot); sv->src2 = irop_temp(v); sv->str_extra = strdup("int");
+        }
+        return lower_binop(s, IR_ADD, rec, lower_const(s, 1));
+    }
 
     case NODE_LITERAL: {
         LiteralNode *lit = (LiteralNode *)node;
@@ -1751,6 +1865,16 @@ static int lower_expr(ASTNode *node, LowerState *s) {
             ins->src1 = irop_const_int(sz);
             return t;
         }
+        if (strcmp(call->name, "__clo_cap__") == 0 && call->arg_count == 2) {
+            int env = lower_expr(call->args[0], s);
+            int off = lower_const(s, 8 * (atoi(((LiteralNode *)call->args[1])->value) + 1));
+            int addr = lower_binop(s, IR_ADD, env, off);
+            int t = alloc_temp(s);
+            IRInstr *l = ir_emit(s->mod, IR_LOAD_PTR);
+            l->dest = irop_temp(t); l->src1 = irop_temp(addr);
+            l->str_extra = strdup("int");
+            return t;
+        }
         if (strcmp(call->name, "__addrof_fn__") == 0 && call->arg_count >= 1) {
             const char *fname = NULL;
             if (call->args[0]->type == NODE_IDENTIFIER)
@@ -1975,6 +2099,12 @@ static int lower_expr(ASTNode *node, LowerState *s) {
                     int ta = use_c_abi_args
                            ? lower_c_call_arg(call_args[i], s)
                            : lower_call_arg(call_args[i], s);
+                    /* C wants a bare code address: unwrap a closure value held in a variable */
+                    if (use_c_abi_args && call_args[i]->resolved_type.is_fn &&
+                        call_args[i]->type != NODE_LAMBDA &&
+                        !(call_args[i]->type == NODE_FUNC_CALL &&
+                          !strcmp(((FuncCallNode *)call_args[i])->name, "__addrof_fn__")))
+                        ta = lower_closure_code(s, ta, NULL);
                     /* Convert the argument to the declared parameter type when
                        one side is a float: `sqrt(2)` passes 2.0, a `double`
                        given to a `float32` parameter is narrowed, and a float
@@ -2639,6 +2769,8 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
 
     case NODE_VAR_DECL: {
         VarDeclNode *vd = (VarDeclNode *)node;
+        if (vd->initializer && vd->initializer->type == NODE_LAMBDA && !lower_closure_escapes(s, vd->var_name))
+            ((LambdaNode *)vd->initializer)->heap = 0;
         /* Choose a type_name string that codegen can use for dispatch */
         const char *tname =
             vd->var_type.kind == TYPE_SIMPLE ? vd->var_type.name :
@@ -3225,7 +3357,7 @@ static int is_arena_bootstrap_fn(const char *name) {
     static const char *names[] = {
         "arena_init", "arena_alloc", "arena_free", "_arena_new_block",
         "_mem_raw_alloc", "_mem_raw_free",
-        "hylian_multi_alloc", "hylian_make_err", "Error_message", "Error_code",
+        "hylian_multi_alloc", "hylian_closure_alloc", "hylian_clo_set", "hylian_clo_get", "hylian_make_err", "Error_message", "Error_code",
         "_arr_raw_alloc", "_arr_raw_free", "_arr_load", "_arr_store",
         "hylian_array_alloc", "hylian_array_free", "_arr_grow", "hylian_array_zeros",
         "hylian_array_push", "hylian_array_pop",
@@ -3271,6 +3403,7 @@ static void lower_func_body(
     } else {
         s->fn_sret = NULL;
     }
+    s->cur_body = body; s->cur_body_count = body_count;
     s->next_temp   = 0;
     s->class_name  = class_name;
     s->local_name_count = 0;          /* fresh local-name table per function */
@@ -3755,9 +3888,32 @@ IRModule *lower_program(ProgramNode *prog) {
             if (decl->from_include) ir_mark_weak_func(mod, fn->name);
             s.pending_sret = lower_is_value_struct(&s, &fn->return_type) ? fn->return_type.name : NULL;
             s.pending_ret = &fn->return_type;
+            ASTNode **fbody = fn->body; int fbody_count = fn->body_count;
+            if (fn->is_lambda && fn->cap_count > 0) {
+                /* a closure body starts by copying its captures out of the record */
+                fbody = malloc((fbody_count + fn->cap_count + 1) * sizeof(ASTNode *));
+                int n = 0;
+                Type ut = make_simple_type("usize", 0);
+                FuncCallNode *getenv_ = make_func_call("hylian_clo_get");
+                getenv_->base.resolved_type = ut;
+                fbody[n++] = (ASTNode *)make_var_decl(ut, "__env", (ASTNode *)getenv_);
+                for (int i = 0; i < fn->cap_count; i++) {
+                    FuncCallNode *cap = make_func_call("__clo_cap__");
+                    cap->args = malloc(2 * sizeof(ASTNode *));
+                    cap->args[0] = (ASTNode *)make_identifier("__env");
+                    cap->args[0]->resolved_type = ut;
+                    char idx[16]; snprintf(idx, sizeof idx, "%d", i);
+                    cap->args[1] = (ASTNode *)make_literal(strdup(idx), LIT_INT);
+                    cap->arg_count = 2;
+                    cap->base.resolved_type = fn->cap_types[i];
+                    fbody[n++] = (ASTNode *)make_var_decl(fn->cap_types[i], fn->cap_names[i], (ASTNode *)cap);
+                }
+                for (int i = 0; i < fn->body_count; i++) fbody[n++] = fn->body[i];
+                fbody_count = n;
+            }
             lower_func_body(fn->name,
                             fn->params, fn->param_count,
-                            fn->body,   fn->body_count,
+                            fbody,      fbody_count,
                             strcmp(fn->name, "main") == 0,
                             fn->is_naked,
                             0, NULL, &s);

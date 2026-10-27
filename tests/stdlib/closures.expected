@@ -1,0 +1,7 @@
+stack: 15
+arg: 40
+returned: 8 10
+bare: 42 16
+reassigned: 107
+by value: 1
+plain: 9

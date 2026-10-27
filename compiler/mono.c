@@ -319,6 +319,13 @@ static ASTNode *clone_node(ASTNode *n, const Sub *sub) {
         }
         return (ASTNode *)c;
     }
+    case NODE_LAMBDA: {
+        CLONE(LambdaNode);
+        c->params = clone_list(c->params, c->param_count, sub);
+        c->ret = clone_type(&c->ret, sub);
+        c->body = clone_list(c->body, c->body_count, sub);
+        return (ASTNode *)c;
+    }
     case NODE_NEW: {
         CLONE(NewNode);
         c->args = clone_list(c->args, c->arg_count, sub);

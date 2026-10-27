@@ -45,7 +45,8 @@ typedef enum {
     NODE_TEMP_REF,    /* lowering-only: an already-evaluated IR temp (see lower_hoist_compound) */
     NODE_TUPLE,       /* (a, b, ...) - becomes a struct literal of a generated __tuple class */
     NODE_TRY,         /* try f() - unwrap a (T, Error?) result or return the error early */
-    NODE_SPLICE,      /* parser-only: several statements standing in for one (see stmt_list) */
+    NODE_SPLICE,
+    NODE_LAMBDA,      /* fn(int x) -> int { ... } - a closure expression */      /* parser-only: several statements standing in for one (see stmt_list) */
 } NodeType;
 
 typedef enum {
@@ -135,7 +136,29 @@ typedef struct {
     char *module_name;  /* set when inside a module, NULL otherwise */
     char **type_params; /* T max<T>(T a, T b): the template's parameter names */
     int type_param_count;
+    int is_lambda;      /* a lifted closure body: reads its captures from the closure record */
+    char **cap_names;
+    Type *cap_types;
+    int cap_count;
 } FuncNode;
+
+/* fn(int x) -> int { ... }. Typecheck lifts the body into `lifted` (a FuncNode
+   appended to the program) and records what it captures; the value is a typed
+   fn pointer. `heap` says whether the closure record must outlive the function. */
+typedef struct {
+    ASTNode base;
+    ASTNode **params;
+    int param_count;
+    Type ret;
+    ASTNode **body;
+    int body_count;
+    FuncNode *lifted;
+    int heap;
+} LambdaNode;
+
+LambdaNode *make_lambda(ASTNode **params, int param_count, Type ret, ASTNode **body, int body_count);
+/* visit n and every node under it (descending into lambda bodies) */
+void ast_walk(ASTNode *n, void (*visit)(ASTNode *, void *), void *ud);
 
 typedef struct {
     ASTNode base;

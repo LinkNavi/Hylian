@@ -167,6 +167,33 @@ usize hylian_multi_alloc(usize tag, usize value) {
     return p;
 }
 
+// ── Closures ─────────────────────────────────────────────────────────────────
+//
+// A closure that escapes its function lives here: the same process-lifetime
+// arena as multis and Errors (it must outlive the creator's own arena), so it
+// leaks by design. A typed fn value is either a bare code address or a closure
+// record's address + 1 (the record is 8-aligned, code is 16-aligned); a record
+// is {code, captured words...}. The caller of a closure parks the record's
+// address in CLO_ENV just before the call and the closure's prologue reads it
+// back first thing, so nothing runs in between.
+static usize CLO_ENV = 0;
+
+usize hylian_closure_alloc(usize size) {
+    usize slot = cast<usize>(&MULTI_ARENA);
+    if (MULTI_ARENA == cast<usize>(0)) {
+        arena_init(slot);
+    }
+    return arena_alloc(slot, size);
+}
+
+void hylian_clo_set(usize env) {
+    CLO_ENV = env;
+}
+
+usize hylian_clo_get() {
+    return CLO_ENV;
+}
+
 // ── Error values ─────────────────────────────────────────────────────────────
 //
 // `Err("boom")` lowers to a call to hylian_make_err, and `e.message()` to a

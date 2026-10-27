@@ -2,6 +2,7 @@
 #include "diag.h"
 #include "ast.h"
 #include "mono.h"
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -403,6 +404,105 @@ static Type *tc_clone_type(const Type *t) {
 }
 
 static Type infer_expr(ASTNode *node);
+
+/* ── closures ────────────────────────────────────────────────────────────────
+   `fn(int x) -> int { ... }`: the body is lifted into its own function; what it
+   uses from the enclosing scopes is copied into the closure record when the
+   closure is made (capture by value). A name counts as captured when the
+   body mentions it, declares nothing of that name, and it is a local here. */
+typedef struct { char **uses; int nuses; char **decls; int ndecls; } LamScan;
+
+static void lam_add(char ***list, int *n, const char *name) {
+  if (!name) return;
+  for (int i = 0; i < *n; i++) if (!strcmp((*list)[i], name)) return;
+  *list = realloc(*list, (*n + 1) * sizeof(char *));
+  (*list)[(*n)++] = strdup(name);
+}
+
+static void lam_visit(ASTNode *n, void *ud) {
+  LamScan *sc = ud;
+  switch (n->type) {
+  case NODE_IDENTIFIER: lam_add(&sc->uses, &sc->nuses, ((IdentifierNode *)n)->name); break;
+  case NODE_FUNC_CALL: lam_add(&sc->uses, &sc->nuses, ((FuncCallNode *)n)->name); break;
+  case NODE_ASSIGN: lam_add(&sc->uses, &sc->nuses, ((AssignNode *)n)->var_name); break;
+  case NODE_COMPOUND_ASSIGN: lam_add(&sc->uses, &sc->nuses, ((CompoundAssignNode *)n)->var_name); break;
+  case NODE_VAR_DECL: lam_add(&sc->decls, &sc->ndecls, ((VarDeclNode *)n)->var_name); break;
+  case NODE_FOR_IN: lam_add(&sc->decls, &sc->ndecls, ((ForInNode *)n)->var_name); break;
+  case NODE_INTERP_STRING: {
+    InterpStringNode *is = (InterpStringNode *)n;
+    for (int i = 0; i < is->seg_count; i++) {
+      if (!is->segments[i].is_expr) continue;
+      const char *t = is->segments[i].text;
+      for (int j = 0; t[j]; ) {
+        if (isalpha((unsigned char)t[j]) || t[j] == '_') {
+          int k = j;
+          while (isalnum((unsigned char)t[k]) || t[k] == '_') k++;
+          char w[128]; snprintf(w, sizeof w, "%.*s", k - j < 127 ? k - j : 127, t + j);
+          lam_add(&sc->uses, &sc->nuses, w);
+          j = k;
+        } else j++;
+      }
+    }
+    break;
+  }
+  default: break;
+  }
+}
+
+static struct { FuncNode *fn; ASTNode **params; int nparams; } tc_pending_lambdas[512];
+static int tc_pending_lambda_count = 0;
+static ProgramNode *tc_prog = NULL;
+static int tc_lambda_counter = 0;
+static void register_func(const char *name, Type return_type, ASTNode **params, int param_count, int is_external_decl);
+
+static Type tc_lambda(LambdaNode *ln) {
+  LamScan sc = {0};
+  for (int i = 0; i < ln->body_count; i++) ast_walk(ln->body[i], lam_visit, &sc);
+  for (int i = 0; i < ln->param_count; i++) lam_add(&sc.decls, &sc.ndecls, ((VarDeclNode *)ln->params[i])->var_name);
+
+  char **cnames = NULL; Type *ctypes = NULL; int ncap = 0;
+  for (int i = 0; i < sc.nuses; i++) {
+    int declared = 0;
+    for (int j = 0; j < sc.ndecls; j++) if (!strcmp(sc.uses[i], sc.decls[j])) declared = 1;
+    if (declared) continue;
+    Type *vt = scope_lookup(sc.uses[i]);
+    if (!vt) continue;
+    if (vt->kind != TYPE_SIMPLE || tc_type_param_kind(vt) != 1) {
+      /* floats and arrays don't fit a record word */
+      tc_error((ASTNode *)ln, "a closure can't capture '%s' of type '%s' yet (only integers, pointers, strings and objects)",
+               sc.uses[i], tc_type_display(vt));
+      continue;
+    }
+    cnames = realloc(cnames, (ncap + 1) * sizeof(char *));
+    ctypes = realloc(ctypes, (ncap + 1) * sizeof(Type));
+    cnames[ncap] = strdup(sc.uses[i]); ctypes[ncap] = *vt; ncap++;
+  }
+
+  char lname[48];
+  snprintf(lname, sizeof lname, "__lambda_%d", tc_lambda_counter++);
+  FuncNode *lf = make_func(ln->ret, lname);
+  lf->params = ln->params; lf->param_count = ln->param_count;
+  lf->body = ln->body; lf->body_count = ln->body_count;
+  lf->is_lambda = 1; lf->cap_names = cnames; lf->cap_types = ctypes; lf->cap_count = ncap;
+  ln->lifted = lf;
+
+  /* typechecked later with the captures as extra locals (outside any scope) */
+  ASTNode **ext = malloc((ln->param_count + ncap + 1) * sizeof(ASTNode *));
+  for (int i = 0; i < ln->param_count; i++) ext[i] = ln->params[i];
+  for (int i = 0; i < ncap; i++) ext[ln->param_count + i] = (ASTNode *)make_var_decl(ctypes[i], strdup(cnames[i]), NULL);
+  if (tc_pending_lambda_count < 512) {
+    tc_pending_lambdas[tc_pending_lambda_count].fn = lf;
+    tc_pending_lambdas[tc_pending_lambda_count].params = ext;
+    tc_pending_lambdas[tc_pending_lambda_count++].nparams = ln->param_count + ncap;
+  }
+  register_func(lf->name, lf->return_type, lf->params, lf->param_count, 0);
+  tc_prog->declarations = realloc(tc_prog->declarations, (tc_prog->decl_count + 1) * sizeof(ASTNode *));
+  tc_prog->declarations[tc_prog->decl_count++] = (ASTNode *)lf;
+
+  Type *pts = malloc((ln->param_count + 1) * sizeof(Type));
+  for (int i = 0; i < ln->param_count; i++) pts[i] = ((VarDeclNode *)ln->params[i])->var_type;
+  return make_fn_type(pts, ln->param_count, ln->ret);
+}
 static void infer_stmt(ASTNode *node);
 
 /* The type the surrounding context wants the next expression to have; only a
@@ -984,9 +1084,13 @@ static Type infer_expr(ASTNode *node) {
       const TCExternal *ef = fi ? NULL : ext_find(fc->name, TC_EXT_FUNC);
       if (fi) {
         result = fi->return_type;
-        for (int i = 0; i < fc->arg_count && i < fi->param_count; i++)
+        for (int i = 0; i < fc->arg_count && i < fi->param_count; i++) {
           if (fi->param_types[i].is_fn)
             tc_check_fn_assign(fc->args[i], &fi->param_types[i], &fc->args[i]->resolved_type);
+          if (fi->is_external_decl && fc->args[i]->type == NODE_LAMBDA &&
+              ((LambdaNode *)fc->args[i])->lifted && ((LambdaNode *)fc->args[i])->lifted->cap_count > 0)
+            tc_error(fc->args[i], "a closure that captures variables can't be passed to C '%s' (C has nowhere to keep its environment); use a function or a closure with no captures", fc->name);
+        }
       } else if (ef) {
         result = ext_type(ef);
       } else {
@@ -1233,6 +1337,10 @@ static Type infer_expr(ASTNode *node) {
     result = (tt.name || tt.kind != TYPE_SIMPLE) ? tt : et;
     break;
   }
+
+  case NODE_LAMBDA:
+    result = tc_lambda((LambdaNode *)node);
+    break;
 
   case NODE_STRUCT_LITERAL: {
     StructLiteralNode *sl = (StructLiteralNode *)node;
@@ -1767,6 +1875,8 @@ void typecheck(ProgramNode *program, const char *filename) {
      appended to the program, so the loop below reaches them too. */
   MonoHooks hooks = { tc_hook_class, tc_hook_func, tc_hook_method };
   tc_pending_method_count = 0;
+  tc_pending_lambda_count = 0;
+  tc_prog = program;
   mono_set_hooks(&hooks);
   for (int i = 0; i < program->decl_count; i++) {
     ASTNode *d = program->declarations[i];
@@ -1780,7 +1890,7 @@ void typecheck(ProgramNode *program, const char *filename) {
       continue;
     }
 
-    if (d->type == NODE_FUNC) {
+    if (d->type == NODE_FUNC && !((FuncNode *)d)->is_lambda) {
       FuncNode *fn = (FuncNode *)d;
       infer_function(fn->params, fn->param_count, fn->body, fn->body_count,
                      fn->return_type, NULL);
@@ -1813,10 +1923,20 @@ void typecheck(ProgramNode *program, const char *filename) {
       tc_current_module = NULL;
     }
   }
-  for (int i = 0; i < tc_pending_method_count; i++) {
-    MethodNode *mn = tc_pending_methods[i].mn;
-    infer_function(mn->params, mn->param_count, mn->body, mn->body_count,
-                   mn->return_type, tc_pending_methods[i].cn->name);
+  /* generic methods and closure bodies queued while checking; checking one
+     can queue more */
+  for (int i = 0, j = 0; i < tc_pending_method_count || j < tc_pending_lambda_count; ) {
+    if (i < tc_pending_method_count) {
+      MethodNode *mn = tc_pending_methods[i].mn;
+      infer_function(mn->params, mn->param_count, mn->body, mn->body_count,
+                     mn->return_type, tc_pending_methods[i].cn->name);
+      i++;
+    } else {
+      FuncNode *lf = tc_pending_lambdas[j].fn;
+      infer_function(tc_pending_lambdas[j].params, tc_pending_lambdas[j].nparams, lf->body,
+                     lf->body_count, lf->return_type, NULL);
+      j++;
+    }
   }
   mono_set_hooks(NULL);
 }

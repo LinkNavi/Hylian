@@ -122,6 +122,10 @@ module.exports = grammar({
     generic_type: ($) => prec.dynamic(-1, seq($.identifier, "<", commaSep1($.type), ">")),
 
     // Typed function pointer: fn(int, int) -> int
+    // closure: fn(int x) -> int { return x + n; }
+    lambda_expr: ($) =>
+      seq("fn", "(", optional($.param_list), ")", "->", $.type, $.block),
+
     fn_type: ($) =>
       seq("fn", "(", optional(commaSep1($.type)), ")", "->", $.type),
 
@@ -601,6 +605,7 @@ module.exports = grammar({
         $.char_literal,
         $.bool_literal,
         $.nil_literal,
+        $.lambda_expr,
         $.identifier_expr,
         $.paren_expr,
         $.tuple_expr,

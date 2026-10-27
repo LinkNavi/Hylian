@@ -576,6 +576,47 @@
         ]
       }
     },
+    "lambda_expr": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "fn"
+        },
+        {
+          "type": "STRING",
+          "value": "("
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "param_list"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "STRING",
+          "value": ")"
+        },
+        {
+          "type": "STRING",
+          "value": "->"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "block"
+        }
+      ]
+    },
     "fn_type": {
       "type": "SEQ",
       "members": [
@@ -3280,6 +3321,10 @@
         {
           "type": "SYMBOL",
           "name": "nil_literal"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "lambda_expr"
         },
         {
           "type": "SYMBOL",

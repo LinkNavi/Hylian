@@ -1652,6 +1652,14 @@ expr:
         mono_note_use();
         $$ = (ASTNode*)n;
     }
+    /* closure: fn(int x) -> int { return x + n; } */
+    | FN LPAREN param_list RPAREN ARROW type LBRACE stmt_list RBRACE {
+        NodeList* pl = (NodeList*)$3; NodeList* sl = (NodeList*)$8;
+        $$ = (ASTNode*)make_lambda(pl ? pl->items : NULL, pl ? pl->count : 0, $6, sl->items, sl->count);
+        if (pl) free(pl);
+        free(sl);
+        mono_note_use();
+    }
     /* tuple: (a, b) */
     | LPAREN expr COMMA args RPAREN {
         NodeList* rest = (NodeList*)$4;

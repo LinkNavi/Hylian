@@ -98,6 +98,10 @@ expect "a function pointer that returns a float is not an int-returning pointer"
 $'float half(int a) { return 0.5; }\nint call(fn(int) -> int f) { return f(1); }\nint main() {\n    return call(addrof_fn(half));\n}\n' \
 "it returns 'float', not 'int'"
 
+expect "a closure can't capture a float yet" \
+$'int main() {\n    float k = 1.5;\n    fn(int) -> int f = fn(int x) -> int { return x + cast<int>(k); };\n    return f(1);\n}\n' \
+"a closure can't capture 'k'"
+
 expect "a function pointer must match the declared signature" \
 $'float half(float x) { return x; }\nint main() {\n    fn(int, int) -> int op = addrof_fn(half);\n    return 0;\n}\n' \
 "function pointer type mismatch"

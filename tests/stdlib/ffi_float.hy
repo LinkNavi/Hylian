@@ -22,6 +22,7 @@ int main() {
     println("c ints: {{c_neg(5)}} {{c_neg(-7)}} {{c_u32(4294967295)}} {{c_halff(5.0)}}");
 
     println("callback ptr={{c_apply(addrof_fn(hy_sub), 50, 8)}}");
+    println("callback closure={{c_apply(fn(int64 a, int64 b) -> int64 { return a * b; }, 6, 7)}}");
 
     // structs by value: SysV classification, in and out
     Vec2 va; va.x = 1.5; va.y = 2.0;

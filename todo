@@ -21,7 +21,10 @@ FEATURES
     (ast_c_layout + lower_marshal; tests/stdlib/ffi_nested.hy). Not: bool fields, float unions.
 11. DONE .hyi accepts typed callbacks (`f: fn(int64, int64) -> int64`), the loader no longer splits them
     at the inner comma, and a fn pointer whose int/float class differs is a type mismatch (tests/diag_test.sh).
-12. Closures.
+12. DONE closures: `fn(int x) -> int { ... }`, capture by value, stack or arena storage by a simple
+    escape check (tests/stdlib/closures.hy). Deviation from the plan: the env travels in a runtime
+    slot (hylian_clo_set/get in mem.hy), not r10, and a typed fn is one tagged word, not a pair;
+    r10 is in the register allocator's pool, so using it means touching hygen. Heap closures leak.
 13. Trait-style bounds on generics.
 
 OPTIMIZATION
