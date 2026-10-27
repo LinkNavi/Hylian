@@ -29,10 +29,17 @@ FEATURES
     made (compiler/mono.c; tests/stdlib/generic_bounds.hy, tests/diag_test.sh).
 
 OPTIMIZATION
-14. Cross-module inlining of runtime.hy/array.hy/mem.hy (separate objects).
-15. Induction-variable strength reduction.
+14. Cross-module inlining of runtime.hy/array.hy/mem.hy (separate objects). LOOKED AT, NOT DONE: no
+    benchmark's hot loop calls into them (objdump: only hylian_int_to_str/println, once), so it cannot move
+    bench/run.py; worth doing only for code that calls array/string helpers in a loop.
+15. DONE induction-variable strength reduction (hyopt.c strength_reduce: t = i*K with i += c becomes a
+    second counter). Correct (opt_test + fuzz pass) but matmul stays 0.0165s: the imul was not the
+    bottleneck, the two bounds checks per iteration are. Next: hoist/version those checks out of the loop.
 16. Live-range splitting / shrink-wrapping.
-17. Literally any thing we can do so we are at least 2nd place or tied for 2nd in every test (allowed 2 test to be 3rd)
+17. (NOT MET; bench this session, rust not installed so C/C++/Go only)
+    fib 0.0066 vs c 0.004 go 0.011 | loop tie | sieve tie | mandel 0.0273 vs c 0.025 go 0.026 |
+    collatz 0.157 vs c 0.109 go 0.155 | matmul 0.0165 vs c 0.010 go 0.012.
+    Literally any thing we can do so we are at least 2nd place or tied for 2nd in every test (allowed 2 test to be 3rd)
 
 first bench check (bench/run.py)
 

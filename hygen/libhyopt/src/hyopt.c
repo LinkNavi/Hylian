@@ -3007,6 +3007,123 @@ static int licm(MIRFunc *fn) {
     return changed;
 }
 
+
+/* ---- induction-variable strength reduction ----
+   In a loop where `i` is bumped by a constant exactly once per iteration
+   (`i = i + c`), a `t = i * K` with constant K becomes a second counter:
+   s = i * K in the preheader, `s += c*K` right after the bump, and the multiply
+   turns into `t = s`. The invariant s == i*K holds at every point in between
+   because the two updates are adjacent. */
+typedef struct { int iv, s, mul_at; int64_t k; int add_at; int64_t step; MIRType ty; } SrCand;
+
+static int sr_loop(MIRFunc *fn, Dom *d, Loop *lp) {
+    Cfg *cfg = &d->cfg;
+    int h = lp->header, hstart = cfg->b[h].start;
+    if (fn->instrs[hstart].op != MIR_LABEL) return 0;
+    if (h > 0 && bs_get(lp->body, h - 1)) {
+        const MIRInstr *last = &fn->instrs[cfg->b[h - 1].end - 1];
+        if (!is_terminator(last->op) || last->op == MIR_JMP_IF || last->op == MIR_JMP_UNLESS) return 0;
+    }
+    int nv = max_vreg(fn);
+    int *defs = calloc(nv, sizeof(int)), *def_at = calloc(nv, sizeof(int));
+    for (int b = 0; b < cfg->n; b++) {
+        if (!bs_get(lp->body, b)) continue;
+        for (int i = cfg->b[b].start; i < cfg->b[b].end; i++) {
+            MIRValue *dv = def_of(&fn->instrs[i]);
+            if (dv) { defs[dv->vreg]++; def_at[dv->vreg] = i; }
+        }
+    }
+    SrCand cand[16]; int nc = 0;
+    int *mul_cand = malloc((fn->count + 1) * sizeof(int));
+    for (int i = 0; i <= fn->count; i++) mul_cand[i] = -1;
+    for (int b = 0; b < cfg->n && nc < 16; b++) {
+        if (!bs_get(lp->body, b)) continue;
+        for (int i = cfg->b[b].start; i < cfg->b[b].end && nc < 16; i++) {
+            const MIRInstr *m = &fn->instrs[i];
+            if (m->op != MIR_MUL || m->dest.kind != MIRV_VREG || m->dest.type != MIR_I64 || defs[m->dest.vreg] != 1) continue;
+            const MIRValue *iv = NULL; int64_t k = 0;
+            if (m->src1.kind == MIRV_VREG && m->src2.kind == MIRV_IMM_INT) { iv = &m->src1; k = m->src2.imm_int; }
+            else if (m->src2.kind == MIRV_VREG && m->src1.kind == MIRV_IMM_INT) { iv = &m->src2; k = m->src1.imm_int; }
+            if (!iv || defs[iv->vreg] != 1) continue;
+            const MIRInstr *inc = &fn->instrs[def_at[iv->vreg]];
+            int64_t step;
+            if (inc->op == MIR_ADD && inc->src1.kind == MIRV_VREG && inc->src1.vreg == iv->vreg && inc->src2.kind == MIRV_IMM_INT) step = inc->src2.imm_int;
+            else if (inc->op == MIR_SUB && inc->src1.kind == MIRV_VREG && inc->src1.vreg == iv->vreg && inc->src2.kind == MIRV_IMM_INT) step = -inc->src2.imm_int;
+            else continue;
+            if (inc->dest.type != MIR_I64) continue;
+            int found = -1;
+            for (int c = 0; c < nc; c++) if (cand[c].iv == iv->vreg && cand[c].k == k) found = c;
+            if (found < 0) {
+                cand[nc] = (SrCand){ iv->vreg, nv + nc, i, k, def_at[iv->vreg], step, m->dest.type };
+                found = nc++;
+            }
+            mul_cand[i] = found;
+        }
+    }
+    if (!nc) { free(defs); free(def_at); free(mul_cand); return 0; }
+
+    int hl = fn->instrs[hstart].dest.label_id;
+    int pre = max_label_id(fn) + 1;
+    InstrBuf out = {0};
+    for (int i = 0; i < fn->count; i++) {
+        if (i == hstart) {
+            MIRInstr lab; memset(&lab, 0, sizeof lab);
+            lab.op = MIR_LABEL; lab.dest = mir_label(pre); lab.src1 = mir_none(); lab.src2 = mir_none();
+            ib_push(&out, lab);
+            for (int c = 0; c < nc; c++) {
+                MIRInstr mu = fn->instrs[cand[c].mul_at];
+                mu.dest = mir_vreg(cand[c].s, cand[c].ty);
+                mu.src1 = mir_vreg(cand[c].iv, cand[c].ty);
+                mu.src2 = mir_imm_int(cand[c].k, cand[c].ty);
+                ib_push(&out, mu);
+            }
+        }
+        MIRInstr ins = fn->instrs[i];
+        if (mul_cand[i] >= 0) {
+            SrCand *c = &cand[mul_cand[i]];
+            MIRInstr mv = ins;
+            mv.op = MIR_MOV; mv.src1 = mir_vreg(c->s, c->ty); mv.src2 = mir_none(); mv.extra_int = 0;
+            ins = mv;
+        }
+        if ((ins.op == MIR_JMP || ins.op == MIR_JMP_IF || ins.op == MIR_JMP_UNLESS) &&
+            ins.dest.label_id == hl && !bs_get(lp->body, cfg->ib[i]))
+            ins.dest = mir_label(pre);
+        ib_push(&out, ins);
+        for (int c = 0; c < nc; c++)
+            if (cand[c].add_at == i) {
+                MIRInstr ad = fn->instrs[i];
+                ad.op = MIR_ADD;
+                ad.dest = mir_vreg(cand[c].s, cand[c].ty);
+                ad.src1 = mir_vreg(cand[c].s, cand[c].ty);
+                ad.src2 = mir_imm_int(cand[c].step * cand[c].k, cand[c].ty);
+                ib_push(&out, ad);
+            }
+    }
+    free(fn->instrs);
+    fn->instrs = out.v; fn->count = out.n; fn->cap = out.cap;
+    if (fn->vreg_count < nv + nc) fn->vreg_count = nv + nc;
+    free(defs); free(def_at); free(mul_cand);
+    return 1;
+}
+
+static int strength_reduce(MIRFunc *fn) {
+    int changed = 0;
+    for (int round = 0; round < 12; round++) {
+        Dom d = dom_build(fn);
+        Loop *loops = NULL;
+        int nl = d.valid ? find_loops(&d, &loops) : 0;
+        int did = 0;
+        if (nl && (size_t)d.cfg.n * BS_WORDS(max_vreg(fn)) > BITSET_BUDGET) nl = 0;
+        for (int k = 0; k < nl && !did; k++) did = sr_loop(fn, &d, &loops[k]);
+        for (int k = 0; k < nl; k++) free(loops[k].body);
+        free(loops);
+        dom_free(&d);
+        if (!did) break;
+        changed = 1;
+    }
+    return changed;
+}
+
 /* ======================================================================
  *  Driver
  * ====================================================================== */
@@ -3045,6 +3162,7 @@ void hyopt_func(MIRFunc *fn) {
         verify_after(fn, "materialize_consts");
         if (licm(fn)) { verify_after(fn, "licm"); scalar_fixpoint(fn); }
     }
+    if (!pass_off("sr") && strength_reduce(fn)) { verify_after(fn, "strength_reduce"); scalar_fixpoint(fn); }
 
     if (fn->count == 0 || !is_terminator(fn->instrs[fn->count - 1].op)) {
         MIRInstr *r = mir_emit(fn, MIR_RET);
