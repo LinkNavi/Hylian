@@ -209,6 +209,7 @@ IdentifierNode *make_identifier(char *name) {
     n->base.type = NODE_IDENTIFIER;
     zero_resolved_type(&n->base);
     n->name = strdup(name);
+    n->bound = NULL;
     return n;
 }
 

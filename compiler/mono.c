@@ -60,6 +60,100 @@ typedef struct {
 
 void mono_note_use(void) { g_used = 1; }
 
+/* ── bounds: T: Ord ──────────────────────────────────────────────────────── */
+
+typedef struct { char **names; char **bounds; } BoundSet;
+static BoundSet *g_bounds = NULL; static int g_bound_count = 0;
+
+void mono_set_bounds(char **names, char **bounds) {
+    g_bounds = realloc(g_bounds, (g_bound_count + 1) * sizeof(BoundSet));
+    g_bounds[g_bound_count++] = (BoundSet){ names, bounds };
+    g_used = 1;
+}
+
+static char **bounds_of(char **names) {
+    for (int i = 0; i < g_bound_count; i++) if (g_bounds[i].names == names) return g_bounds[i].bounds;
+    return NULL;
+}
+
+static int is_int_name(const char *n) {
+    static const char *t[] = { "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "usize", "char", NULL };
+    for (int i = 0; t[i]; i++) if (!strcmp(n, t[i])) return 1;
+    return 0;
+}
+static int is_float_name(const char *n) {
+    return !strcmp(n, "float") || !strcmp(n, "double") || !strcmp(n, "float32") || !strcmp(n, "float64");
+}
+
+static ClassNode *find_class_tmpl(const char *name);
+
+static ClassNode *find_decl_class(const char *name) {
+    if (!g_prog || !name) return NULL;
+    for (int i = 0; i < g_prog->decl_count; i++) {
+        ASTNode *d = g_prog->declarations[i];
+        if (d && d->type == NODE_CLASS && ((ClassNode *)d)->name && !strcmp(((ClassNode *)d)->name, name))
+            return (ClassNode *)d;
+    }
+    return NULL;
+}
+
+static ClassNode *find_any_class(const char *name) {
+    ClassNode *c = find_decl_class(name);
+    return c ? c : find_class_tmpl(name);
+}
+
+/* does the concrete type `t` meet `bound`? Built-ins: Eq, Ord, Num, Integer.
+   Anything else must name a class/struct; t then needs all of its fields and
+   methods (same names, same arity). */
+static int meets_bound(const Type *t, const char *bound, int *known) {
+    *known = 1;
+    int simple = t->kind == TYPE_SIMPLE && t->name && !t->is_fn;
+    int is_int = simple && is_int_name(t->name), is_flt = simple && is_float_name(t->name);
+    if (!strcmp(bound, "Integer")) return is_int;
+    if (!strcmp(bound, "Num") || !strcmp(bound, "Ord")) return is_int || is_flt;
+    if (!strcmp(bound, "Eq")) return simple;
+    ClassNode *want = find_any_class(bound);
+    if (!want) { *known = 0; return 0; }
+    if (!simple) return 0;
+    ClassNode *have = find_decl_class(t->name);
+    if (!have) return 0;
+    if (have == want) return 1;
+    for (int i = 0; i < want->field_count; i++) {
+        int ok = 0;
+        for (int j = 0; j < have->field_count; j++)
+            if (want->fields[i] && have->fields[j] && !strcmp(want->fields[i]->name, have->fields[j]->name)) ok = 1;
+        if (!ok) return 0;
+    }
+    for (int i = 0; i < want->method_count; i++) {
+        int ok = 0;
+        for (int j = 0; j < have->method_count; j++)
+            if (want->methods[i] && have->methods[j] && !strcmp(want->methods[i]->name, have->methods[j]->name) &&
+                want->methods[i]->param_count == have->methods[j]->param_count) ok = 1;
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* diagnose type arguments that break the template's bounds; returns 0 if any did */
+static int check_bounds(const char *what, char **tparams, int n, const Type *args, int line) {
+    char **b = bounds_of(tparams);
+    if (!b) return 1;
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        if (!b[i]) continue;
+        int known;
+        if (!meets_bound(&args[i], b[i], &known)) {
+            char *got = mono_mangle_type(&args[i]);
+            if (!known)
+                diag_emit(DIAG_ERROR, g_file, line, -1, NULL, "'%s' bounds %s by '%s', which is neither Eq, Ord, Num, Integer nor a class", what, tparams[i], b[i]);
+            else
+                diag_emit(DIAG_ERROR, g_file, line, -1, NULL, "type '%s' does not satisfy the bound '%s: %s' of '%s'", got, tparams[i], b[i], what);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
 void mono_set_hooks(const MonoHooks *h) {
     if (h) g_hooks = *h; else memset(&g_hooks, 0, sizeof g_hooks);
 }
@@ -506,6 +600,7 @@ static char *instantiate_class(const char *base, Type *args, int nargs) {
                   tmpl->type_param_count == 1 ? "" : "s", nargs);
         goto placeholder;
     }
+    check_bounds(base, tmpl->type_params, nargs, args, tmpl->base.line);
     add_instance(key, 0, tmpl, args, nargs);
     Sub sub = { tmpl->type_params, args, nargs };
     ClassNode *cn = (ClassNode *)clone_node((ASTNode *)tmpl, &sub);
@@ -541,6 +636,7 @@ static char *instantiate_func(const char *base, Type *args, int nargs) {
                   tmpl->type_param_count == 1 ? "" : "s", nargs);
         return strdup(base);
     }
+    check_bounds(base, tmpl->type_params, nargs, args, tmpl->base.line);
     add_instance(key, 1, tmpl, args, nargs);
     Sub sub = { tmpl->type_params, args, nargs };
     FuncNode *fn = clone_func(tmpl, &sub);
@@ -753,6 +849,7 @@ const char *mono_instantiate_method(const char *cls, const char *name, const Typ
     char key[600];
     snprintf(key, sizeof key, "%s__%s", cls, inst);
     if (find_instance(key)) return inst;
+    check_bounds(name, tm->type_params, tm->type_param_count, args, tm->base.line);
     add_instance(strdup(key), 1, tm, args, tm->type_param_count);
 
     /* the class's own substitution plus the method's */

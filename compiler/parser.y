@@ -312,7 +312,15 @@ void typelist_add(TypeList* l, Type t) {
 static void set_type_params(char ***out, int *count, void *list) {
     NodeList *l = (NodeList *)list;
     *out = malloc((l->count ? l->count : 1) * sizeof(char *));
-    for (int i = 0; i < l->count; i++) (*out)[i] = ((IdentifierNode *)l->items[i])->name;
+    char **bounds = NULL;
+    for (int i = 0; i < l->count; i++) {
+        (*out)[i] = ((IdentifierNode *)l->items[i])->name;
+        if (((IdentifierNode *)l->items[i])->bound) {
+            if (!bounds) bounds = calloc(l->count, sizeof(char *));
+            bounds[i] = ((IdentifierNode *)l->items[i])->bound;
+        }
+    }
+    if (bounds) mono_set_bounds(*out, bounds);
     *count = l->count;
     free(l->items); free(l);
 }
@@ -1199,6 +1207,19 @@ tparams:
     | tparams COMMA IDENTIFIER {
         NodeList* l = (NodeList*)$1;
         list_add(l, (ASTNode*)make_identifier($3));
+        $$ = l;
+    }
+    /* bounded: T: Ord */
+    | IDENTIFIER COLON IDENTIFIER {
+        NodeList* l = list_new();
+        IdentifierNode* id = make_identifier($1); id->bound = $3;
+        list_add(l, (ASTNode*)id);
+        $$ = l;
+    }
+    | tparams COMMA IDENTIFIER COLON IDENTIFIER {
+        NodeList* l = (NodeList*)$1;
+        IdentifierNode* id = make_identifier($3); id->bound = $5;
+        list_add(l, (ASTNode*)id);
         $$ = l;
     }
     ;

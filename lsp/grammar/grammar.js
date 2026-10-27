@@ -133,7 +133,7 @@ module.exports = grammar({
     tuple_type: ($) => seq("(", $.type, ",", commaSep1($.type), ")"),
 
     // Template parameters: <T, U>
-    type_params: ($) => seq("<", commaSep1($.identifier), ">"),
+    type_params: ($) => seq("<", commaSep1(seq($.identifier, optional(seq(":", $.identifier)))), ">"),
 
     // Explicit type arguments on `new`: new Box<int>(1). (A bare call `max<int>(a, b)` is
     // ambiguous with a comparison for a context-free LR parse; the compiler's lexer decides

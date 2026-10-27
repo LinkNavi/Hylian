@@ -102,6 +102,14 @@ expect "a closure can't capture a float yet" \
 $'int main() {\n    float k = 1.5;\n    fn(int) -> int f = fn(int x) -> int { return x + cast<int>(k); };\n    return f(1);\n}\n' \
 "a closure can't capture 'k'"
 
+expect "a type argument must meet the bound" \
+$'T biggest<T: Ord>(T a, T b) { if (a > b) { return a; } return b; }\nint main() {\n    str s = biggest("a", "b");\n    return 0;\n}\n' \
+"does not satisfy the bound 'T: Ord'"
+
+expect "a bound must name something" \
+$'T pick<T: Wibble>(T a) { return a; }\nint main() {\n    return pick(1);\n}\n' \
+"neither Eq, Ord, Num, Integer nor a class"
+
 expect "a function pointer must match the declared signature" \
 $'float half(float x) { return x; }\nint main() {\n    fn(int, int) -> int op = addrof_fn(half);\n    return 0;\n}\n' \
 "function pointer type mismatch"

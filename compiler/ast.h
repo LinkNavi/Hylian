@@ -334,7 +334,7 @@ typedef struct {
     enum { LIT_INT, LIT_STRING, LIT_NIL, LIT_BOOL, LIT_FLOAT } lit_type;
 } LiteralNode;
 
-typedef struct { ASTNode base; char *name; } IdentifierNode;
+typedef struct { ASTNode base; char *name; char *bound; /* `T: Ord` in a type parameter list, else NULL */ } IdentifierNode;
 
 /* (a, b): elements are checked against the expected or inferred tuple type,
    then `lowered` is the equivalent struct literal that lower.c emits. */

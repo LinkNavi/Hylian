@@ -66,8 +66,9 @@ ordinary by-value struct underneath, so the limits of struct values apply.
 
 `T max<T>(T a, T b)` and `class Box<T>` are monomorphized: each use with new type arguments
 compiles another copy, and the body is only type-checked per copy (so an unused template is
-never checked, and an error in one is reported against the instance). There are no bounds
-(`T: Ord`); an operator the argument type lacks is simply an error in that copy. A generic class infers its arguments from its constructor (`new Box(41)`), and must have them
+never checked, and an error in one is reported against the instance). Bounds are optional: `T: Ord`, `Eq`, `Num`, `Integer`, or a class name (the type
+argument then needs all of that class's fields and methods) are checked when an instance is
+made; without one, an operator the argument type lacks is simply an error in that copy. A generic class infers its arguments from its constructor (`new Box(41)`), and must have them
 written when no constructor parameter mentions them.
 The standard library's `map` and `bytes` still use opaque `usize` handles; `std.hashmap`
 is the generic alternative to `map`.

@@ -8,6 +8,9 @@
 /* Called by the parser whenever it builds generic syntax, so programs that use
    none skip the whole pass. */
 void mono_note_use(void);
+/* `T: Ord`: the bounds of a type-parameter list (parallel to `names`, NULL = none),
+   keyed by the names array the declaration keeps. */
+void mono_set_bounds(char **names, char **bounds);
 /* A use that only carries a type name (cast<Box<int>>, sizeof): make sure the
    instance exists. */
 void mono_request(const Type *t);

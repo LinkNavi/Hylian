@@ -480,7 +480,7 @@ static int looks_like_generic_args(void) {
         if (c == '\n') break;
         if (c == '<') depth++;
         else if (c == '>') { if (--depth == 0) { closed = 1; break; } }
-        else if (!(c == ',' || c == ' ' || c == '*' || c == '?' || c == '_' ||
+        else if (!(c == ',' || c == ' ' || c == '*' || c == '?' || c == '_' || c == ':' ||
                    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) break;
     }
     int result = 0;

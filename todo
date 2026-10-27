@@ -25,7 +25,8 @@ FEATURES
     escape check (tests/stdlib/closures.hy). Deviation from the plan: the env travels in a runtime
     slot (hylian_clo_set/get in mem.hy), not r10, and a typed fn is one tagged word, not a pair;
     r10 is in the register allocator's pool, so using it means touching hygen. Heap closures leak.
-13. Trait-style bounds on generics.
+13. DONE bounds on generics: `T: Ord` / Eq / Num / Integer / a class name, checked when an instance is
+    made (compiler/mono.c; tests/stdlib/generic_bounds.hy, tests/diag_test.sh).
 
 OPTIMIZATION
 14. Cross-module inlining of runtime.hy/array.hy/mem.hy (separate objects).
