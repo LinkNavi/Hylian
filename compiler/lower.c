@@ -1130,6 +1130,32 @@ static int lower_indirect_call(int tf, ASTNode **args, int argc, const Type *cal
     return t;
 }
 
+
+/* Branch on a condition without materialising a bool: `a && b` / `a || b` become chains of
+   jumps (so `while (i < n && x < 4.0)` is two compare-and-branch pairs). Same operand order
+   and short-circuiting as the value form in lower_expr. */
+static void lower_jump_if(ASTNode *c, int lbl, LowerState *s, int when_true) {
+    if (c && c->type == NODE_BINARY_OP) {
+        BinaryOpNode *b = (BinaryOpNode *)c;
+        int is_and = strcmp(b->op, "&&") == 0, is_or = strcmp(b->op, "||") == 0;
+        if (is_and || is_or) {
+            if (is_and == !when_true) {          /* (a&&b) jump-if-false, (a||b) jump-if-true: either leg goes to lbl */
+                lower_jump_if(b->left, lbl, s, when_true);
+                lower_jump_if(b->right, lbl, s, when_true);
+            } else {                             /* (a&&b) jump-if-true, (a||b) jump-if-false: the left leg can skip the rest */
+                int skip = alloc_label(s);
+                lower_jump_if(b->left, skip, s, !when_true);
+                lower_jump_if(b->right, lbl, s, when_true);
+                IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(skip);
+            }
+            return;
+        }
+    }
+    int tc = lower_expr(c, s);
+    IRInstr *j = ir_emit(s->mod, when_true ? IR_JUMP_IF : IR_JUMP_UNLESS);
+    j->src1 = irop_temp(tc); j->src2 = irop_label(lbl);
+}
+
 static int lower_expr(ASTNode *node, LowerState *s) {
     if (!node) {
         int t = alloc_temp(s);
@@ -3061,16 +3087,15 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         IfNode *nd = (IfNode *)node;
         int lbl_else = alloc_label(s);
         int lbl_end  = alloc_label(s);
-        int tc = lower_expr(nd->condition, s);
         if (nd->else_body && nd->else_count > 0) {
-            { IRInstr *j = ir_emit(s->mod, IR_JUMP_UNLESS); j->src1 = irop_temp(tc); j->src2 = irop_label(lbl_else); }
+            lower_jump_if(nd->condition, lbl_else, s, 0);
             lower_stmts(nd->then_body, nd->then_count, s);
             { IRInstr *j = ir_emit(s->mod, IR_JUMP); j->src1 = irop_label(lbl_end); }
             { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_else); }
             lower_stmts(nd->else_body, nd->else_count, s);
             { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_end); }
         } else {
-            { IRInstr *j = ir_emit(s->mod, IR_JUMP_UNLESS); j->src1 = irop_temp(tc); j->src2 = irop_label(lbl_end); }
+            lower_jump_if(nd->condition, lbl_end, s, 0);
             lower_stmts(nd->then_body, nd->then_count, s);
             { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_end); }
         }
@@ -3083,8 +3108,7 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         int lbl_end  = alloc_label(s);
         loop_push(s, lbl_end, lbl_loop);
         { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_loop); }
-        int tc = lower_expr(nd->condition, s);
-        { IRInstr *j = ir_emit(s->mod, IR_JUMP_UNLESS); j->src1 = irop_temp(tc); j->src2 = irop_label(lbl_end); }
+        lower_jump_if(nd->condition, lbl_end, s, 0);
         lower_stmts(nd->body, nd->body_count, s);
         { IRInstr *j = ir_emit(s->mod, IR_JUMP); j->src1 = irop_label(lbl_loop); }
         { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_end); }
@@ -3101,8 +3125,7 @@ static void lower_stmt(ASTNode *node, LowerState *s) {
         loop_push(s, lbl_end, lbl_post);
         { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_loop); }
         if (nd->condition) {
-            int tc = lower_expr(nd->condition, s);
-            IRInstr *j = ir_emit(s->mod, IR_JUMP_UNLESS); j->src1 = irop_temp(tc); j->src2 = irop_label(lbl_end);
+            lower_jump_if(nd->condition, lbl_end, s, 0);
         }
         lower_stmts(nd->body, nd->body_count, s);
         { IRInstr *lb = ir_emit(s->mod, IR_LABEL); lb->dest = irop_label(lbl_post); }

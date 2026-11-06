@@ -954,10 +954,32 @@ void x64_lower_func(const MIRFunc *fn_in, const RegAllocResult *ra,
         }
     }
 
+    /* Shrink-wrapping: hyopt tagged the label where the slow path begins (extra_int bit 2).
+       When nothing before it touches a callee-saved register, the pushes (and the call
+       alignment pad) move there and the early-return path is a bare `ret`. */
+    int wrap_at = -1;
+    if (frameless && ra->callee_saved_int_mask) {
+        for (int i = 0; i < fn->count && wrap_at < 0; i++)
+            if (fn->instrs[i].op == MIR_LABEL && (fn->instrs[i].extra_int & 4)) wrap_at = i;
+        for (int i = 0; i < wrap_at; i++) {
+            const MIRInstr *w = &fn->instrs[i];
+            const MIRValue *vs[3] = { &w->dest, &w->src1, &w->src2 };
+            for (int k = 0; k < 3; k++) {
+                if (vs[k]->kind != MIRV_VREG || mir_type_is_float(vs[k]->type)) continue;
+                MCLoc l = ra->vreg_locs[vs[k]->vreg];
+                if (l.kind != MCLOC_REG || (ra->callee_saved_int_mask & (1u << l.reg_id))) { wrap_at = -1; break; }
+            }
+            if (wrap_at < 0) break;
+            if (w->op == MIR_CALL) { wrap_at = -1; break; }
+        }
+    }
+
     if (frameless) {
-        for (int i = 0; i < ra->callee_saved_int_used; i++)
-            if (ra->callee_saved_int_mask & (1u << i)) enc_push(out_code, x64_int_reg_pool[i]);
-        if (fl_pad) enc_alu_ri(out_code, ALU_SUB, X64_RSP, fl_pad);
+        if (wrap_at < 0) {
+            for (int i = 0; i < ra->callee_saved_int_used; i++)
+                if (ra->callee_saved_int_mask & (1u << i)) enc_push(out_code, x64_int_reg_pool[i]);
+            if (fl_pad) enc_alu_ri(out_code, ALU_SUB, X64_RSP, fl_pad);
+        }
     } else if (!fn->is_naked) {
         enc_push(out_code, X64_RBP);
         enc_mov_rr(out_code, X64_RBP, X64_RSP);
@@ -1037,6 +1059,11 @@ void x64_lower_func(const MIRFunc *fn_in, const RegAllocResult *ra,
                 if (pad && pad <= 10) emit_nops(out_code, (int)pad);
             }
             ctx.label_offset[ins->dest.label_id] = (int)out_code->len;
+            if (i == wrap_at) {
+                for (int k = 0; k < ra->callee_saved_int_used; k++)
+                    if (ra->callee_saved_int_mask & (1u << k)) enc_push(out_code, x64_int_reg_pool[k]);
+                if (fl_pad) enc_alu_ri(out_code, ALU_SUB, X64_RSP, fl_pad);
+            }
             break;
 
         case MIR_MOV: {
@@ -1095,9 +1122,33 @@ void x64_lower_func(const MIRFunc *fn_in, const RegAllocResult *ra,
             break;
         }
 
-        case MIR_MUL:
+        case MIR_MUL: {
+            /* x*3|5|9 followed by +imm, with nothing else using the product: one lea
+               (3x+1 in collatz is 1 cycle on the critical path instead of 2) */
+            if (ins->dest.kind == MIRV_VREG && ins->dest.type == MIR_I64 && ctx.use_count[ins->dest.vreg] == 1 &&
+                ins->src2.kind == MIRV_IMM_INT && (ins->src2.imm_int == 3 || ins->src2.imm_int == 5 || ins->src2.imm_int == 9) &&
+                ins->src1.kind == MIRV_VREG) {
+                int n = next_real(fn, i + 1);
+                if (n < fn->count) {
+                    const MIRInstr *ad = &fn->instrs[n];
+                    if ((ad->op == MIR_ADD || ad->op == MIR_SUB) && ad->dest.kind == MIRV_VREG && ad->dest.type == MIR_I64 &&
+                        ad->src1.kind == MIRV_VREG && ad->src1.vreg == ins->dest.vreg &&
+                        ad->src2.kind == MIRV_IMM_INT && fits32(ad->src2.imm_int) && ad->src2.imm_int != INT32_MIN) {
+                        Opnd A = get_opnd(&ctx, ins->src1, X64_RAX);
+                        if (A.kind == OPK_REG) {
+                            X64Reg D = dest_reg(&ctx, ad->dest, X64_RAX);
+                            int32_t disp = (int32_t)(ad->op == MIR_ADD ? ad->src2.imm_int : -ad->src2.imm_int);
+                            enc_lea_m(out_code, D, x64_mem_idx(A.reg, A.reg, (int)(ins->src2.imm_int - 1), disp));
+                            finish_dest(&ctx, ad->dest, D);
+                            i = n;
+                            break;
+                        }
+                    }
+                }
+            }
             emit_mul(&ctx, ins->dest, ins->src1, ins->src2);
             break;
+        }
 
         case MIR_SDIV: case MIR_UDIV: case MIR_SMOD: case MIR_UMOD: {
             Opnd B = get_opnd(&ctx, ins->src2, X64_R11);
@@ -1691,7 +1742,9 @@ void x64_lower_func(const MIRFunc *fn_in, const RegAllocResult *ra,
                 Opnd A = get_opnd(&ctx, ins->src1, X64_RAX);
                 mov_opnd(&ctx, X64_RAX, A);
             }
-            if (frameless) {
+            if (frameless && wrap_at >= 0 && i < wrap_at) {
+                /* early return, before the prologue ran: nothing to restore */
+            } else if (frameless) {
                 if (fl_pad) enc_alu_ri(out_code, ALU_ADD, X64_RSP, fl_pad);
                 for (int cs = ra->callee_saved_int_used - 1; cs >= 0; cs--)
                     if (ra->callee_saved_int_mask & (1u << cs)) enc_pop(out_code, x64_int_reg_pool[cs]);

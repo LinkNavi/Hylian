@@ -1449,7 +1449,7 @@ static int gcse(MIRFunc *fn) {
     for (int i = 0; i < n; i++) {
         MIRInstr *ins = &fn->instrs[i];
         elem[i] = -1;
-        if (!cse_eligible(ins) || ins->dest.kind != MIRV_VREG || is_f(ins->dest.type)) continue;
+        if (!cse_eligible(ins) || ins->dest.kind != MIRV_VREG) continue;
         if ((ins->src1.kind == MIRV_VREG && ins->src1.vreg == ins->dest.vreg) ||
             (ins->src2.kind == MIRV_VREG && ins->src2.vreg == ins->dest.vreg)) continue;
         if (ins->op == MIR_LEA_LOCAL) continue;
@@ -2003,6 +2003,206 @@ static MIRInstr mk(MIROp op, MIRValue dest, MIRValue a, MIRValue b) {
     return m;
 }
 
+typedef struct { unsigned char *bad; } UseCtxMark;
+static void mark_use(MIRValue *v, void *ud) { ((UseCtxMark *)ud)->bad[v->vreg] = 1; }
+
+/* ----------------------------------------------------------------------
+ *  Fixed-size arrays: known length, and bounds checks proved by value ranges
+ * ---------------------------------------------------------------------- */
+
+/* `int a[N]` is hylian_array_zeros(N). When the header pointer is defined once, and only
+   ever read through ARR_LEN / ARR_DATA (it never reaches a call, a store or a copy, so
+   nothing can push/pop it), its length is N for the whole function. */
+static int known_arr_len(MIRFunc *fn) {
+    int nv = max_vreg(fn), n = fn->count, changed = 0;
+    int *ndef = calloc(nv + 1, sizeof(int)), *def_at = malloc((nv + 1) * sizeof(int));
+    unsigned char *bad = calloc(nv + 1, 1);
+    for (int i = 0; i < n; i++) {
+        MIRInstr *q = &fn->instrs[i];
+        MIRValue *d = def_of(q);
+        if (d) { ndef[d->vreg]++; def_at[d->vreg] = i; }
+        if (q->op == MIR_ARR_LEN || q->op == MIR_ARR_DATA) {
+            /* the only non-escaping uses; src1 is checked below by exclusion */
+            continue;
+        }
+        UseCtxMark um = { bad };
+        for_each_use(q, mark_use, &um);
+    }
+    for (int i = 0; i < n; i++) {
+        MIRInstr *q = &fn->instrs[i];
+        if (q->op != MIR_ARR_LEN || q->src1.kind != MIRV_VREG || q->dest.kind != MIRV_VREG) continue;
+        int a = q->src1.vreg;
+        if (ndef[a] != 1 || bad[a]) continue;
+        MIRInstr *c = &fn->instrs[def_at[a]];
+        if (c->op != MIR_CALL || !c->callee || strcmp(c->callee, "hylian_array_zeros") != 0 ||
+            c->arg_count != 1 || c->args[0].kind != MIRV_IMM_INT || c->args[0].imm_int < 0) continue;
+        make_mov(q, mir_imm_int(c->args[0].imm_int, q->dest.type));
+        changed = 1;
+    }
+    free(ndef); free(def_at); free(bad);
+    return changed;
+}
+
+typedef struct { int64_t lo, hi; int ok; } Rng;
+typedef struct { int v, head, add; int64_t lo, hi; } IVar;
+typedef struct { MIRFunc *fn; int *ndef, *def_at; IVar *iv; int niv; } RngCtx;
+
+static Rng rng_top(void) { Rng r = {0, 0, 0}; return r; }
+static Rng rng_c(int64_t a, int64_t b) { Rng r = {a, b, 1}; return r; }
+
+static Rng rng_val(RngCtx *c, const MIRValue *v, int pos, int depth);
+
+static Rng rng_binop(MIROp op, Rng a, Rng b) {
+    if (!a.ok || !b.ok) return rng_top();
+    int64_t x[4], lo, hi;
+    switch (op) {
+    case MIR_ADD:
+        if (__builtin_add_overflow(a.lo, b.lo, &lo) || __builtin_add_overflow(a.hi, b.hi, &hi)) return rng_top();
+        return rng_c(lo, hi);
+    case MIR_SUB:
+        if (__builtin_sub_overflow(a.lo, b.hi, &lo) || __builtin_sub_overflow(a.hi, b.lo, &hi)) return rng_top();
+        return rng_c(lo, hi);
+    case MIR_MUL:
+        if (__builtin_mul_overflow(a.lo, b.lo, &x[0]) || __builtin_mul_overflow(a.lo, b.hi, &x[1]) ||
+            __builtin_mul_overflow(a.hi, b.lo, &x[2]) || __builtin_mul_overflow(a.hi, b.hi, &x[3])) return rng_top();
+        lo = hi = x[0];
+        for (int k = 1; k < 4; k++) { if (x[k] < lo) lo = x[k]; if (x[k] > hi) hi = x[k]; }
+        return rng_c(lo, hi);
+    default: return rng_top();
+    }
+}
+
+/* the range `v` has when the instruction at `pos` reads it */
+static Rng rng_val(RngCtx *c, const MIRValue *v, int pos, int depth) {
+    if (v->kind == MIRV_IMM_INT) return rng_c(v->imm_int, v->imm_int);
+    if (v->kind != MIRV_VREG || depth > 10 || is_f(v->type)) return rng_top();
+    for (int k = 0; k < c->niv; k++)
+        if (c->iv[k].v == v->vreg && pos > c->iv[k].head && pos < c->iv[k].add) return rng_c(c->iv[k].lo, c->iv[k].hi);
+    if (c->ndef[v->vreg] != 1) return rng_top();
+    int di = c->def_at[v->vreg];
+    MIRInstr *d = &c->fn->instrs[di];
+    if (d->dest.type != MIR_I64) return rng_top();
+    switch (d->op) {
+    case MIR_MOV: return rng_val(c, &d->src1, di, depth + 1);
+    case MIR_ADD: case MIR_SUB: case MIR_MUL:
+        return rng_binop(d->op, rng_val(c, &d->src1, di, depth + 1), rng_val(c, &d->src2, di, depth + 1));
+    case MIR_AND:
+        if (d->src2.kind == MIRV_IMM_INT && d->src2.imm_int >= 0) return rng_c(0, d->src2.imm_int);
+        return rng_top();
+    default: return rng_top();
+    }
+}
+
+/* Recognise counted loops, rotated:  [mov v,c0] label L ... add v,v,s ; cmp_lt t,v,N ; jmp_if L,t
+   Anywhere between the label and the add, v is in [c0, N-1]. */
+static int find_ivs(RngCtx *c) {
+    MIRFunc *fn = c->fn; int n = fn->count;
+    c->iv = malloc((n / 3 + 1) * sizeof(IVar)); c->niv = 0;
+    for (int jb = 0; jb < n; jb++) {
+        MIRInstr *jm = &fn->instrs[jb];
+        if (jm->op != MIR_JMP_IF || jm->src1.kind != MIRV_VREG) continue;
+        int cm = jb - 1; while (cm >= 0 && fn->instrs[cm].op == MIR_NOP) cm--;
+        if (cm < 0) continue;
+        MIRInstr *cq = &fn->instrs[cm];
+        if (cq->op != MIR_CMP_LT || cq->dest.kind != MIRV_VREG || cq->dest.vreg != jm->src1.vreg ||
+            cq->src1.kind != MIRV_VREG || cq->src2.kind != MIRV_IMM_INT) continue;
+        int ad = cm - 1; while (ad >= 0 && fn->instrs[ad].op == MIR_NOP) ad--;
+        if (ad < 0) continue;
+        MIRInstr *aq = &fn->instrs[ad];
+        int v = cq->src1.vreg;
+        if (aq->op != MIR_ADD || aq->dest.kind != MIRV_VREG || aq->dest.vreg != v || aq->src1.kind != MIRV_VREG ||
+            aq->src1.vreg != v || aq->src2.kind != MIRV_IMM_INT || aq->src2.imm_int <= 0 || aq->dest.type != MIR_I64) continue;
+        int L = jm->dest.label_id, head = -1, refs = 0;
+        for (int i = 0; i < n; i++) {
+            MIRInstr *q = &fn->instrs[i];
+            if (q->op == MIR_LABEL && q->dest.label_id == L) head = i;
+            if ((q->op == MIR_JMP || q->op == MIR_JMP_IF || q->op == MIR_JMP_UNLESS) && q->dest.label_id == L) refs++;
+        }
+        if (head < 0 || head > ad || refs != 1) continue;
+        /* the entry value: the nearest def of v above the label, through nops and other movs */
+        int p = head - 1; int64_t c0 = 0, ok = 0;
+        for (; p >= 0; p--) {
+            MIRInstr *q = &fn->instrs[p];
+            if (q->op == MIR_NOP) continue;
+            if (q->op == MIR_MOV && q->dest.kind == MIRV_VREG && q->dest.vreg == v) {
+                if (q->src1.kind == MIRV_IMM_INT) { c0 = q->src1.imm_int; ok = 1; }
+                break;
+            }
+            if (q->op == MIR_MOV && q->src1.kind == MIRV_IMM_INT) continue;
+            break;
+        }
+        if (!ok) continue;
+        int64_t N = cq->src2.imm_int;
+        if (c0 >= N || c0 < INT32_MIN || N > INT32_MAX) continue;
+        /* v is not otherwise written inside the loop */
+        int clean = 1;
+        for (int i = head + 1; i < ad && clean; i++) {
+            MIRValue *d = def_of(&fn->instrs[i]);
+            if (d && d->vreg == v) clean = 0;
+        }
+        if (!clean) continue;
+        c->iv[c->niv++] = (IVar){ v, head, ad, c0, N - 1 };
+    }
+    return c->niv;
+}
+
+static int range_bce(MIRFunc *fn) {
+    int nv = max_vreg(fn), n = fn->count, changed = 0;
+    RngCtx c = { fn, calloc(nv + 1, sizeof(int)), malloc((nv + 1) * sizeof(int)), NULL, 0 };
+    for (int i = 0; i < n; i++) {
+        MIRValue *d = def_of(&fn->instrs[i]);
+        if (d) { c.ndef[d->vreg]++; c.def_at[d->vreg] = i; }
+    }
+    if (find_ivs(&c)) {
+        for (int i = 0; i < n; i++) {
+            MIRInstr *q = &fn->instrs[i];
+            if (q->op != MIR_UCMP_LT || q->dest.kind != MIRV_VREG) continue;
+            Rng x = rng_val(&c, &q->src1, i, 0), y = rng_val(&c, &q->src2, i, 0);
+            if (x.ok && y.ok && x.lo >= 0 && x.hi < y.lo) { make_mov(q, mir_imm_int(1, q->dest.type)); changed = 1; }
+        }
+    }
+    free(c.ndef); free(c.def_at); free(c.iv);
+    return changed;
+}
+
+/* `if (x % 2^k == 0) { ... x / 2^k ... }`: in the arm where the remainder test held, x is a
+   multiple of 2^k, so the signed divide needs no rounding fix-up and is a plain arithmetic
+   shift (collatz's x/2 drops from 4 dependent ops to 1). */
+static int div_exact_arm(MIRFunc *fn) {
+    int changed = 0, n = fn->count;
+    for (int i = 0; i < n; i++) {
+        MIRInstr *m = &fn->instrs[i];
+        if (m->op != MIR_SMOD || m->src1.kind != MIRV_VREG || m->dest.kind != MIRV_VREG ||
+            m->src2.kind != MIRV_IMM_INT || log2_exact(m->src2.imm_int) <= 0 || m->src2.imm_int < 0) continue;
+        int c = i + 1; while (c < n && fn->instrs[c].op == MIR_NOP) c++;
+        if (c >= n) continue;
+        MIRInstr *cm = &fn->instrs[c];
+        if ((cm->op != MIR_CMP_EQ && cm->op != MIR_CMP_NE) || cm->src1.kind != MIRV_VREG ||
+            cm->src1.vreg != m->dest.vreg || cm->src2.kind != MIRV_IMM_INT || cm->src2.imm_int != 0 ||
+            cm->dest.kind != MIRV_VREG) continue;
+        int b = c + 1; while (b < n && fn->instrs[b].op == MIR_NOP) b++;
+        if (b >= n) continue;
+        MIRInstr *br = &fn->instrs[b];
+        if ((br->op != MIR_JMP_IF && br->op != MIR_JMP_UNLESS) || br->src1.kind != MIRV_VREG ||
+            br->src1.vreg != cm->dest.vreg) continue;
+        int fall_zero = (cm->op == MIR_CMP_EQ) == (br->op == MIR_JMP_UNLESS);
+        if (!fall_zero) continue;
+        int X = m->src1.vreg; int64_t d = m->src2.imm_int; int k = log2_exact(d);
+        for (int j = b + 1; j < n; j++) {
+            MIRInstr *q = &fn->instrs[j];
+            if (q->op == MIR_LABEL || is_terminator(q->op)) break;
+            if (q->op == MIR_SDIV && q->src1.kind == MIRV_VREG && q->src1.vreg == X &&
+                q->src2.kind == MIRV_IMM_INT && q->src2.imm_int == d && q->dest.kind == MIRV_VREG &&
+                !is_f(q->dest.type)) {
+                q->op = MIR_SHR_A; q->src2 = mir_imm_int(k, MIR_I64);
+                changed = 1;
+            }
+            if (q->dest.kind == MIRV_VREG && q->dest.vreg == X) break;
+        }
+    }
+    return changed;
+}
+
 static int expand_div(MIRFunc *fn) {
     int nv = max_vreg(fn);
     int n = fn->count;
@@ -2256,6 +2456,16 @@ static int if_convert_one(MIRFunc *fn) {
             }
         }
         if (!shape) continue;
+        if (shape == 2) {
+            /* the else label is deleted with the arms: any other jump to it (an `a && b`
+               chain branches to it from two places) would be left dangling */
+            int refs = 0;
+            for (int x = 0; x < n; x++) {
+                MIROp o = fn->instrs[x].op;
+                if ((o == MIR_JMP || o == MIR_JMP_IF || o == MIR_JMP_UNLESS) && fn->instrs[x].dest.label_id == L1) refs++;
+            }
+            if (refs != 1) continue;
+        }
 
         /* V: vregs the arms define that are live at the join */
         int endblk = cfg.ib[end_idx];
@@ -2977,6 +3187,97 @@ static int licm_loop(MIRFunc *fn, Dom *d, Loop *lp, const Live *lv) {
     return 1;
 }
 
+/* ---- address splitting ----
+   `t = x + y; load [B + t*8]` where y and B don't change inside the innermost loop but x does
+   (a[i*n + k] in the k loop: y = i*n) becomes  b2 = B + y*8  (hoisted by LICM)  and
+   `load [b2 + x*8]`: one address add fewer per iteration, and the index register is now just
+   the induction variable, which strength reduction can turn into a counter. */
+static int split_index(MIRFunc *fn) {
+    Dom d = dom_build(fn);
+    if (!d.valid) { dom_free(&d); return 0; }
+    Loop *loops = NULL;
+    int nl = find_loops(&d, &loops);
+    int n = fn->count, nv = max_vreg(fn), changed = 0;
+    if (!nl) { dom_free(&d); free(loops); return 0; }
+    int *uses = calloc(nv + 1, sizeof(int)), *ndef = calloc(nv + 1, sizeof(int)), *def_at = calloc(nv + 1, sizeof(int));
+    CntCtx cc = { uses };
+    for (int i = 0; i < n; i++) {
+        for_each_use(&fn->instrs[i], cnt_use, &cc);
+        MIRValue *dv = def_of(&fn->instrs[i]);
+        if (dv) { ndef[dv->vreg]++; def_at[dv->vreg] = i; }
+    }
+    int maxins = n; (void)maxins;
+    InstrBuf out = {0};
+    unsigned char *drop = calloc(n + 1, 1);
+    InstrBuf *pre = calloc(n + 1, sizeof(InstrBuf));       /* instructions to insert before i */
+    int nvv = nv;
+    for (int i = 0; i < n; i++) {
+        MIRInstr *m = &fn->instrs[i];
+        if ((m->op != MIR_LOAD && m->op != MIR_STORE) || m->mem_scale == 0 || m->src2.kind != MIRV_VREG) continue;
+        MIRValue *base = m->op == MIR_LOAD ? &m->src1 : &m->dest;
+        if (base->kind != MIRV_VREG) continue;
+        int t = m->src2.vreg;
+        if (uses[t] != 1 || ndef[t] != 1) continue;
+        int di = def_at[t];
+        MIRInstr *a = &fn->instrs[di];
+        if (a->op != MIR_ADD || a->dest.type != MIR_I64 || a->src1.kind != MIRV_VREG || a->src2.kind != MIRV_VREG || drop[di]) continue;
+        if (d.cfg.ib[di] != d.cfg.ib[i] || di > i) continue;
+        /* innermost loop containing this block */
+        int best = -1;
+        for (int k = 0; k < nl; k++)
+            if (bs_get(loops[k].body, d.cfg.ib[i]) && (best < 0 || loops[k].nbody < loops[best].nbody)) best = k;
+        if (best < 0) continue;
+        Loop *lp = &loops[best];
+        int *dl = NULL; (void)dl;
+        /* is vreg v written inside the loop? */
+        #define IN_LOOP_DEF(v, res) do { res = 0; \
+            for (int b = 0; b < d.cfg.n && !res; b++) { if (!bs_get(lp->body, b)) continue; \
+              for (int q = d.cfg.b[b].start; q < d.cfg.b[b].end; q++) { MIRValue *dv2 = def_of(&fn->instrs[q]); \
+                if (dv2 && dv2->vreg == (v)) { res = 1; break; } } } } while (0)
+        int x = a->src1.vreg, y = a->src2.vreg, dx, dy, db;
+        IN_LOOP_DEF(x, dx); IN_LOOP_DEF(y, dy); IN_LOOP_DEF(base->vreg, db);
+        if (db) continue;
+        if (dx && dy) continue;
+        if (!dx && !dy) continue;                      /* all invariant: LICM hoists the add itself */
+        if (!dy) { /* y invariant, x varies */ } else { int tmp = x; x = y; y = tmp; }
+        /* x and y unchanged between the add and this access */
+        int ok = 1;
+        for (int q = di + 1; q < i && ok; q++) {
+            MIRValue *dv2 = def_of(&fn->instrs[q]);
+            if (dv2 && (dv2->vreg == a->src1.vreg || dv2->vreg == a->src2.vreg)) ok = 0;
+        }
+        if (!ok) continue;
+        int sh = m->mem_scale == 8 ? 3 : m->mem_scale == 4 ? 2 : m->mem_scale == 2 ? 1 : 0;
+        MIRValue yv = mir_vreg(y, MIR_I64);
+        if (sh) {
+            MIRValue u = mir_vreg(nvv++, MIR_I64);
+            ib_push(&pre[i], mk(MIR_SHL, u, yv, mir_imm_int(sh, MIR_I64)));
+            yv = u;
+        }
+        MIRValue b2 = mir_vreg(nvv++, MIR_I64);
+        ib_push(&pre[i], mk(MIR_ADD, b2, mir_vreg(base->vreg, MIR_I64), yv));
+        base->vreg = b2.vreg;
+        m->src2 = mir_vreg(x, MIR_I64);
+        drop[di] = 1;
+        changed = 1;
+        #undef IN_LOOP_DEF
+    }
+    if (changed) {
+        for (int i = 0; i < n; i++) {
+            for (int k = 0; k < pre[i].n; k++) ib_push(&out, pre[i].v[k]);
+            if (drop[i]) { MIRInstr nop; memset(&nop, 0, sizeof nop); nop.op = MIR_NOP; nop.dest = mir_none(); nop.src1 = mir_none(); nop.src2 = mir_none(); ib_push(&out, nop); }
+            else ib_push(&out, fn->instrs[i]);
+        }
+        free(fn->instrs); fn->instrs = out.v; fn->count = out.n; fn->cap = out.cap;
+        if (fn->vreg_count < nvv) fn->vreg_count = nvv;
+    }
+    for (int i = 0; i <= n; i++) free(pre[i].v);
+    free(pre); free(drop); free(uses); free(ndef); free(def_at);
+    for (int k = 0; k < nl; k++) free(loops[k].body);
+    free(loops); dom_free(&d);
+    return changed;
+}
+
 static int licm(MIRFunc *fn) {
     int changed = 0;
     for (int round = 0; round < 12; round++) {
@@ -3154,13 +3455,24 @@ void hyopt_func(MIRFunc *fn) {
     scalar_fixpoint(fn);
 
     if (!pass_off("sroa") && sroa(fn)) { verify_after(fn, "sroa"); scalar_fixpoint(fn); }
+    if (!pass_off("div") && div_exact_arm(fn)) { verify_after(fn, "div_exact_arm"); }
     if (!pass_off("div") && expand_div(fn)) { verify_after(fn, "expand_div"); scalar_fixpoint(fn); }
     if (!pass_off("ifcvt") && if_convert(fn)) { verify_after(fn, "if_convert"); scalar_fixpoint(fn); }
     if (!pass_off("loops") && rotate_loops(fn)) { verify_after(fn, "rotate_loops"); scalar_fixpoint(fn); }
+    if (!pass_off("bce")) {
+        int ch = known_arr_len(fn);
+        if (ch) { verify_after(fn, "known_arr_len"); scalar_fixpoint(fn); }
+        if (range_bce(fn)) { verify_after(fn, "range_bce"); scalar_fixpoint(fn); }
+    }
     if (!pass_off("licm")) {
         materialize_consts(fn);
         verify_after(fn, "materialize_consts");
         if (licm(fn)) { verify_after(fn, "licm"); scalar_fixpoint(fn); }
+        if (!pass_off("splitidx") && split_index(fn)) {
+            verify_after(fn, "split_index");
+            if (licm(fn)) verify_after(fn, "licm2");
+            scalar_fixpoint(fn);
+        }
     }
     if (!pass_off("sr") && strength_reduce(fn)) { verify_after(fn, "strength_reduce"); scalar_fixpoint(fn); }
 
@@ -3168,6 +3480,95 @@ void hyopt_func(MIRFunc *fn) {
         MIRInstr *r = mir_emit(fn, MIR_RET);
         (void)r;
     }
+}
+
+/* Shrink-wrapping, MIR half. A function that starts with a cheap test and returns early
+   (`if (n < 2) return n;`) should not pay for saving callee-saved registers on that path.
+   The parameters are copied into fresh vregs at the start of the slow path, so the fast
+   path's vregs never live across a call and get caller-saved registers; the slow path's
+   label is tagged (extra_int bit 2) and the x64 lowering emits the prologue there. */
+typedef struct { int *map; unsigned char *pre; int bad; } SwCtx;
+static void sw_use(MIRValue *v, void *ud) {
+    SwCtx *r = ud;
+    if (r->pre[v->vreg]) r->bad = 1;
+    else if (r->map[v->vreg] >= 0) v->vreg = r->map[v->vreg];
+}
+
+static int shrink_wrap_prep(MIRFunc *fn) {
+    int n = fn->count, i = 0;
+    while (i < n && fn->instrs[i].op == MIR_NOP) i++;
+    int ngp = 0;
+    while (i < n && (fn->instrs[i].op == MIR_GETPARAM || fn->instrs[i].op == MIR_NOP)) {
+        if (fn->instrs[i].op == MIR_GETPARAM) {
+            if (fn->instrs[i].dest.kind != MIRV_VREG || is_f(fn->instrs[i].dest.type)) return 0;
+            ngp++;
+        }
+        i++;
+    }
+    if (!ngp) return 0;
+    int b = -1;
+    for (int j = i; j < n; j++) {
+        MIRInstr *q = &fn->instrs[j];
+        if (q->op == MIR_NOP) continue;
+        if (q->op == MIR_JMP_IF || q->op == MIR_JMP_UNLESS) { b = j; break; }
+        if (!is_pure(q) || q->op == MIR_LOAD || is_f(q->dest.type)) return 0;
+    }
+    if (b < 0) return 0;
+    int lab = fn->instrs[b].dest.label_id, L = -1, sawret = 0;
+    for (int j = b + 1; j < n; j++) {
+        MIRInstr *q = &fn->instrs[j];
+        if (q->op == MIR_NOP) continue;
+        if (q->op == MIR_RET) { sawret = 1; continue; }
+        if (q->op == MIR_LABEL) { if (sawret && q->dest.label_id == lab) L = j; break; }
+        if (sawret || !is_pure(q) || q->op == MIR_LOAD || is_f(q->dest.type)) return 0;
+    }
+    if (L < 0) return 0;
+    for (int j = 0; j < n; j++) {
+        MIROp o = fn->instrs[j].op;
+        if (j != b && (o == MIR_JMP || o == MIR_JMP_IF || o == MIR_JMP_UNLESS) && fn->instrs[j].dest.label_id == lab) return 0;
+        if (j > b && j < L && o == MIR_LABEL) return 0;
+    }
+    int nv = max_vreg(fn);
+    int *map = malloc((nv + 1) * sizeof(int));
+    for (int v = 0; v <= nv; v++) map[v] = -1;
+    unsigned char *pre = calloc(nv + 1, 1);       /* vregs defined before the label, non-param */
+    InstrBuf mv = {0};
+    for (int j = 0; j < L; j++) {
+        MIRInstr *q = &fn->instrs[j];
+        if (q->op == MIR_NOP) continue;
+        MIRValue *d = def_of(q);
+        if (!d || d->kind != MIRV_VREG) continue;
+        if (q->op == MIR_GETPARAM) { map[d->vreg] = nv; ib_push(&mv, mk(MIR_MOV, mir_vreg(nv, d->type), *d, mir_none())); nv++; }
+        else pre[d->vreg] = 1;
+    }
+    SwCtx rc = { map, pre, 0 };
+    {   /* dry run: refuse if the slow path reads a prefix temp */
+        int *m2 = calloc(nv + 1, sizeof(int)); for (int v = 0; v <= nv; v++) m2[v] = -1;
+        SwCtx t = { m2, pre, 0 };
+        for (int j = L + 1; j < n; j++) if (fn->instrs[j].op != MIR_NOP) { MIRInstr c = fn->instrs[j]; for_each_use(&c, sw_use, &t); }
+        free(m2);
+        if (t.bad) { free(map); free(pre); free(mv.v); return 0; }
+    }
+    for (int j = L + 1; j < n; j++) {
+        MIRInstr *q = &fn->instrs[j];
+        if (q->op == MIR_NOP) continue;
+        MIRValue *d = def_of(q);
+        for_each_use(q, sw_use, &rc);
+        if (d && d->kind == MIRV_VREG && map[d->vreg] >= 0) d->vreg = map[d->vreg];
+    }
+    int ok = !rc.bad;
+    free(map); free(pre);
+    if (!ok || !mv.n) { free(mv.v); return 0; }
+    /* the moves go right after the label */
+    MIRInstr *ni = malloc((n + mv.n + 1) * sizeof(MIRInstr));
+    memcpy(ni, fn->instrs, (L + 1) * sizeof(MIRInstr));
+    memcpy(ni + L + 1, mv.v, mv.n * sizeof(MIRInstr));
+    memcpy(ni + L + 1 + mv.n, fn->instrs + L + 1, (n - L - 1) * sizeof(MIRInstr));
+    ni[L].extra_int |= 4;
+    free(fn->instrs); fn->instrs = ni; fn->count = n + mv.n; fn->cap = n + mv.n + 1;
+    if (fn->vreg_count < nv) fn->vreg_count = nv;
+    free(mv.v);
+    return 1;
 }
 
 /* ======================================================================
@@ -3397,4 +3798,8 @@ void hyopt_module(MIRModule *mod) {
         }
     }
     free(color); free(order); free(info);
+    if (!pass_off("shrinkwrap"))
+        for (int f = 0; f < nf; f++)
+            if (!mod->funcs[f]->is_naked && !has_asm(mod->funcs[f])) shrink_wrap_prep(mod->funcs[f]);
+    if (getenv("HYLIAN_DUMP_MIR")) mir_dump(mod, stderr);
 }

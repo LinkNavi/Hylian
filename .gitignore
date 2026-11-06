@@ -8,7 +8,7 @@ lsp/editors/nvim/
 lsp/vendor/tree-sitter/
 lsp/vendor/tree-sitter-c/
 lsp/tree-sitter-hylian
-
+Goose/
 # Build artefacts
 *.o
 *.out
