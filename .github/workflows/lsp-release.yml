@@ -1,0 +1,18 @@
+# Push a tag like `lsp-v0.1.0` to publish the hylian-lsp binary for Mason.
+name: LSP Release
+on:
+  push:
+    tags: ["lsp-v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends bison flex gcc
+      - run: bash lsp/build.sh
+      - run: tar -C lsp -czf hylian-lsp-linux-x64.tar.gz hylian-lsp
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" hylian-lsp-linux-x64.tar.gz --title "$GITHUB_REF_NAME" --notes "hylian-lsp for Mason"
