@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends bison flex gcc
+      # lexer.l includes parser.tab.h, which is gitignored; generate it first.
+      - run: cd compiler && bison -d parser.y
       - run: bash lsp/build.sh
       - run: tar -C lsp -czf hylian-lsp-linux-x64.tar.gz hylian-lsp
       - env:
